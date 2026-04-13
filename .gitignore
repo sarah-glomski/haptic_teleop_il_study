@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Data files
+demo_data/
+*.hdf5
+*.zarr
+*.h5
+
+# ROS logs
+*.bag
+*.db3
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
