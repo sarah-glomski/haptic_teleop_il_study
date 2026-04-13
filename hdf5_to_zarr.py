@@ -13,24 +13,26 @@ Source HDF5 schema (per episode_N.hdf5):
   observation/gripper  (T,)     float32
   observation/joint_states (T, 7) float32
   hololens/palm_pose   (T, 7)   float32
-  hololens/finger_tips (T, 15)  float32
-  hololens/hand_width  (T,)     float32
-  images/zed_front     (T, 3, H, W) uint8  CHW
-  images/rs_wrist      (T, 3, H, W) uint8  CHW
+  hololens/finger_tips    (T, 15)  float32
+  hololens/hand_width     (T,)     float32
+  piezense/pressure_input (T, 2)   float32  Pa — input channels 2 and 3
+  images/zed_front        (T, 3, H, W) uint8  CHW
+  images/rs_wrist         (T, 3, H, W) uint8  CHW
 
 Target zarr schema (UMI-style flat concatenation):
   output.zarr/
   ├── data/
-  │   ├── zed_front_rgb:      (N, H, W, 3)  uint8    HWC
-  │   ├── rs_wrist_rgb:       (N, H, W, 3)  uint8    HWC
-  │   ├── pose:               (N, 10)        float32  [x,y,z,rot6d(6),gripper]  obs
-  │   ├── action:             (N, 10)        float32  [x,y,z,rot6d(6),gripper]  act
-  │   ├── joint_states:       (N, 7)         float32  joint angles (rad)
-  │   ├── holo_palm_pose:     (N, 7)         float32  [xyz, qxyzw]
-  │   ├── holo_hand_width:    (N,)           float32
-  │   └── holo_finger_tips:   (N, 15)        float32
+  │   ├── zed_front_rgb:        (N, H, W, 3)  uint8    HWC
+  │   ├── rs_wrist_rgb:         (N, H, W, 3)  uint8    HWC
+  │   ├── pose:                 (N, 10)        float32  [x,y,z,rot6d(6),gripper]  obs
+  │   ├── action:               (N, 10)        float32  [x,y,z,rot6d(6),gripper]  act
+  │   ├── joint_states:         (N, 7)         float32  joint angles (rad)
+  │   ├── holo_palm_pose:       (N, 7)         float32  [xyz, qxyzw]
+  │   ├── holo_hand_width:      (N,)           float32
+  │   ├── holo_finger_tips:     (N, 15)        float32
+  │   └── piezense_pressure:    (N, 2)         float32  Pa — sensor input channels
   └── meta/
-      └── episode_ends:       (num_episodes,) int64  cumulative end indices
+      └── episode_ends:         (num_episodes,) int64  cumulative end indices
 
 Usage:
   python3 hdf5_to_zarr.py <input_dir> <output.zarr> [--max-episodes N]
@@ -79,11 +81,12 @@ def load_episode(h5_path: str) -> dict:
       pose              (T, 10)  float32  — observation TCP
       action            (T, 10)  float32  — commanded TCP
       joint_states      (T, 7)   float32
-      holo_palm_pose    (T, 7)   float32
-      holo_hand_width   (T,)     float32
-      holo_finger_tips  (T, 15)  float32
-      zed_front_rgb     (T, H, W, 3) uint8  — CHW→HWC
-      rs_wrist_rgb      (T, H, W, 3) uint8  — CHW→HWC
+      holo_palm_pose       (T, 7)   float32
+      holo_hand_width      (T,)     float32
+      holo_finger_tips     (T, 15)  float32
+      piezense_pressure    (T, 2)   float32  — input channel pressures (Pa)
+      zed_front_rgb        (T, H, W, 3) uint8  — CHW→HWC
+      rs_wrist_rgb         (T, H, W, 3) uint8  — CHW→HWC
     """
     data = {}
     with h5py.File(h5_path, 'r') as f:
@@ -107,6 +110,10 @@ def load_episode(h5_path: str) -> dict:
             data['holo_hand_width']  = f['hololens/hand_width'][()].astype(np.float32)
         if 'hololens/finger_tips' in f:
             data['holo_finger_tips'] = f['hololens/finger_tips'][()].astype(np.float32)
+
+        # ── Piezense pressure passthrough ─────────────────────────────────────
+        if 'piezense/pressure_input' in f:
+            data['piezense_pressure'] = f['piezense/pressure_input'][()].astype(np.float32)
 
         # ── Images: CHW (T,3,H,W) → HWC (T,H,W,3) ───────────────────────────
         img_map = {
