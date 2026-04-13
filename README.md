@@ -1,4 +1,4 @@
-# haptic_teleop_il_study
+# Haptic Teleop IL Study
 
 ROS2 data collection pipeline for robotic imitation learning.  
 A HoloLens 2 (hand tracking) teleoperates a Kinova Gen3 arm while synchronized  
