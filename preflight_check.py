@@ -130,12 +130,20 @@ def _bool_summary(msg):
     return f'{BOLD}{GREEN if msg.data else RED}{msg.data}{RESET}'
 
 
+def _piezense_summary(msg):
+    for sys in msg.system:
+        if sys.system_id == 0 and len(sys.pressure_pa) > 3:
+            return f'ch2={sys.pressure_pa[2]} Pa  ch3={sys.pressure_pa[3]} Pa'
+    return '(no system 0 data)'
+
+
 def check_topics(robot_ip: str, duration: float):
     import rclpy
     from rclpy.node import Node
     from rclpy.executors import SingleThreadedExecutor
     from geometry_msgs.msg import PoseStamped
     from std_msgs.msg import Bool, Float32
+    from piezense_interfaces.msg import PiezenseSystemArray
 
     print(hdr(f'ROS2 Topics  (listening {duration:.0f} s — make sure launch_teleop.py is running)'))
 
@@ -144,13 +152,14 @@ def check_topics(robot_ip: str, duration: float):
 
     # topic name → (probe, label, min_expected_hz)
     specs = [
-        ('/hololens/palm/right',   'HoloLens palm/right (raw)',       PoseStamped, _pose_summary,  10.0),
-        ('/hololens/thumb/right',  'HoloLens thumb/right (raw)',      PoseStamped, _pose_summary,   5.0),
-        ('/hololens/index/right',  'HoloLens index/right (raw)',      PoseStamped, _pose_summary,   5.0),
-        ('hand/pose',              'hand/pose (robot-frame)',          PoseStamped, _pose_summary,  10.0),
-        ('hand/gripper_cmd',       'hand/gripper_cmd  (0–1)',         Float32,     _float_summary,  5.0),
-        ('hand/tracking_active',   'hand/tracking_active',            Bool,        _bool_summary,   1.0),
-        ('robot_obs/pose',         'robot_obs/pose (kinova state)',   PoseStamped, _pose_summary,  25.0),
+        ('/hololens/palm/right',   'HoloLens palm/right (raw)',       PoseStamped,       _pose_summary,      10.0),
+        ('/hololens/thumb/right',  'HoloLens thumb/right (raw)',      PoseStamped,       _pose_summary,       5.0),
+        ('/hololens/index/right',  'HoloLens index/right (raw)',      PoseStamped,       _pose_summary,       5.0),
+        ('hand/pose',              'hand/pose (robot-frame)',          PoseStamped,       _pose_summary,      10.0),
+        ('hand/gripper_cmd',       'hand/gripper_cmd  (0–1)',         Float32,           _float_summary,      5.0),
+        ('hand/tracking_active',   'hand/tracking_active',            Bool,              _bool_summary,       1.0),
+        ('robot_obs/pose',         'robot_obs/pose (kinova state)',   PoseStamped,       _pose_summary,      25.0),
+        ('piezense/data',          'piezense/data (pressure input)',  PiezenseSystemArray, _piezense_summary, 10.0),
     ]
 
     probes = {}

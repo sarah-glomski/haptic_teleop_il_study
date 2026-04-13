@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HDF5 Data Collector — Haptic Teleop IL Study (HoloLens + Kinova Gen3)
+HDF5 Data Collector — Haptic Teleop IL Study (HoloLens + Kinova Gen3 + Piezense)
 
 Adapted from Robomimic/data_collection/hdf5_data_collector.py.
 Collects time-synchronized data from:
@@ -8,11 +8,13 @@ Collects time-synchronized data from:
   - HoloLens hand: palm pose in robot frame (hand/pose)
   - ZED M camera: front view (images/zed_front)
   - RealSense D435i: wrist-mounted camera (images/rs_wrist)
+  - Piezense: 2-channel pressure sensor input (piezense/data)
 
 Additional data captured as latest-value at each sync tick (not in sync filter):
   - robot_obs/joint_states
   - hand/gripper_cmd, hand/hand_width, hand/finger_tips
   - raw HoloLens: /hololens/palm/right, /hololens/thumb/right, /hololens/index/right, /hololens/gaze
+  - piezense/data (pressure_pa, 2 input channels)
 
 HDF5 schema (per episode):
   episode_N.hdf5
@@ -30,6 +32,8 @@ HDF5 schema (per episode):
   │   ├── gaze_pose:     (T, 7)  float32
   │   ├── finger_tips:   (T, 15) float32   [thumb(3), index(3), middle(3), ring(3), pinky(3)]
   │   └── hand_width:    (T,)    float32   thumb-index distance (m)
+  ├── piezense/
+  │   └── pressure_input: (T, 2) float32   input channel pressures (Pa)
   └── images/
       ├── zed_front:     (T, 3, H, W) uint8  LZF-compressed CHW
       └── rs_wrist:      (T, 3, H, W) uint8  LZF-compressed CHW
@@ -64,6 +68,7 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Bool, Float32, Float32MultiArray
+from piezense_interfaces.msg import PiezenseSystemArray
 
 
 # ── Camera topic configuration ─────────────────────────────────────────────────
@@ -74,6 +79,11 @@ CAMERA_STREAMS = {
 
 # Number of joint angles to record
 NUM_JOINTS = 7
+
+# Piezense: system 0, channels 2 and 3 are the two input sensors
+PIEZENSE_SYSTEM_ID      = 0
+PIEZENSE_INPUT_CHANNELS = 2
+PIEZENSE_INPUT_CHAN_IDS = [2, 3]   # channel indices within the system
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -160,6 +170,14 @@ class HDF5DataCollector(Node):
         self.create_subscription(PoseStamped, '/hololens/index/right', lambda m: setattr(self, '_latest_holo_index', m), 10)
         self.create_subscription(PoseStamped, '/hololens/gaze',        lambda m: setattr(self, '_latest_holo_gaze',  m), 10)
 
+        # Piezense pressure input (latest-value side channel)
+        self._latest_piezense_input = np.zeros(PIEZENSE_INPUT_CHANNELS, dtype=np.float32)
+        self._piezense_last_seen    = None
+        self._piezense_warned       = False
+        self.create_subscription(PiezenseSystemArray, 'piezense/data',
+                                 self._piezense_cb, qos_profile=sensor_qos)
+        self.create_timer(2.0, self._check_piezense_health)
+
         # ── Camera health monitoring ──────────────────────────────────────────
         self._cam_last_seen  = {k: None for k in CAMERA_STREAMS}
         self._cam_drop_warned = {k: False for k in CAMERA_STREAMS}
@@ -190,20 +208,21 @@ class HDF5DataCollector(Node):
 
     # ── Buffer management ─────────────────────────────────────────────────────
     def _reset_buffers(self):
-        self._buf_action_pose     = []
-        self._buf_action_gripper  = []
-        self._buf_obs_pose        = []
-        self._buf_obs_gripper     = []
-        self._buf_joint_states    = []
-        self._buf_hand_pose       = []   # robot-frame palm (from hand/pose)
-        self._buf_holo_palm_pose  = []   # raw Unity-frame palm
-        self._buf_holo_thumb_pose = []
-        self._buf_holo_index_pose = []
-        self._buf_holo_gaze_pose  = []
-        self._buf_finger_tips     = []
-        self._buf_hand_width      = []
-        self._buf_zed_front       = []
-        self._buf_rs_wrist        = []
+        self._buf_action_pose      = []
+        self._buf_action_gripper   = []
+        self._buf_obs_pose         = []
+        self._buf_obs_gripper      = []
+        self._buf_joint_states     = []
+        self._buf_hand_pose        = []   # robot-frame palm (from hand/pose)
+        self._buf_holo_palm_pose   = []   # raw Unity-frame palm
+        self._buf_holo_thumb_pose  = []
+        self._buf_holo_index_pose  = []
+        self._buf_holo_gaze_pose   = []
+        self._buf_finger_tips      = []
+        self._buf_hand_width       = []
+        self._buf_piezense_input   = []
+        self._buf_zed_front        = []
+        self._buf_rs_wrist         = []
 
     # ── Side-channel callbacks ────────────────────────────────────────────────
     def _joint_states_cb(self, msg: JointState):
@@ -218,6 +237,28 @@ class HDF5DataCollector(Node):
         data = list(msg.data)
         data += [0.0] * (15 - len(data))
         self._latest_finger_tips = np.array(data[:15], dtype=np.float32)
+
+    def _piezense_cb(self, msg: PiezenseSystemArray):
+        self._piezense_last_seen = time.monotonic()
+        self._piezense_warned    = False
+        for sys_msg in msg.system:
+            if sys_msg.system_id == PIEZENSE_SYSTEM_ID:
+                readings = list(sys_msg.pressure_pa)
+                self._latest_piezense_input = np.array(
+                    [float(readings[c]) if c < len(readings) else 0.0
+                     for c in PIEZENSE_INPUT_CHAN_IDS],
+                    dtype=np.float32,
+                )
+                break
+
+    def _check_piezense_health(self):
+        uptime = time.monotonic() - self._node_start_time
+        if self._piezense_last_seen is None:
+            if uptime > 5.0 and not self._piezense_warned:
+                self._piezense_warned = True
+                self.get_logger().warn(
+                    'Piezense: no data on piezense/data — is piezense_driver running?'
+                )
 
     # ── Core synced callback ──────────────────────────────────────────────────
     def _synced_callback(
@@ -248,6 +289,9 @@ class HDF5DataCollector(Node):
             self._buf_holo_gaze_pose.append(_pose_to_vec7_raw(self._latest_holo_gaze))
             self._buf_finger_tips.append(self._latest_finger_tips.copy())
             self._buf_hand_width.append(self._latest_hand_width)
+
+            # Piezense pressure input (latest-value)
+            self._buf_piezense_input.append(self._latest_piezense_input.copy())
 
             # Images
             self._buf_zed_front.append(self._decode_image(zed_front_msg))
@@ -379,10 +423,11 @@ class HDF5DataCollector(Node):
             holo_thumb      = np.array(self._buf_holo_thumb_pose, dtype=np.float32)
             holo_index      = np.array(self._buf_holo_index_pose, dtype=np.float32)
             holo_gaze       = np.array(self._buf_holo_gaze_pose,  dtype=np.float32)
-            finger_tips     = np.array(self._buf_finger_tips,     dtype=np.float32)
-            hand_width      = np.array(self._buf_hand_width,      dtype=np.float32)
-            zed_front       = np.array(self._buf_zed_front,       dtype=np.uint8)
-            rs_wrist        = np.array(self._buf_rs_wrist,        dtype=np.uint8)
+            finger_tips      = np.array(self._buf_finger_tips,      dtype=np.float32)
+            hand_width       = np.array(self._buf_hand_width,       dtype=np.float32)
+            piezense_input   = np.array(self._buf_piezense_input,   dtype=np.float32)
+            zed_front        = np.array(self._buf_zed_front,        dtype=np.uint8)
+            rs_wrist         = np.array(self._buf_rs_wrist,         dtype=np.uint8)
 
         os.makedirs(self._save_dir, exist_ok=True)
         filename = os.path.join(self._save_dir, f'episode_{self.demo_count}.hdf5')
@@ -406,6 +451,11 @@ class HDF5DataCollector(Node):
             hl.create_dataset('hand_width',  data=hand_width)
             # hand/pose (robot-frame palm) lives here too for easy access
             hl.create_dataset('hand_pose_robot_frame', data=hand_pose)
+
+            pz = f.create_group('piezense')
+            pz.create_dataset('pressure_input', data=piezense_input)
+            pz.attrs['channel_ids'] = PIEZENSE_INPUT_CHAN_IDS
+            pz.attrs['units'] = 'Pa'
 
             imgs = f.create_group('images')
             imgs.create_dataset('zed_front', data=zed_front, compression='lzf')
