@@ -97,9 +97,8 @@ def find_dji_usb() -> str | None:
 
 def _macos_camera_names() -> dict[int, str]:
     """
-    Return {index: name} for cameras visible to AVFoundation.
-    Uses system_profiler SPCameraDataType which lists UVC cameras by name.
-    Index assignment matches OpenCV's AVFoundation ordering (0-based).
+    Return {index: name} for cameras listed by system_profiler WITHOUT opening
+    any camera device. Index order matches AVFoundation / OpenCV ordering.
     """
     names = {}
     try:
@@ -109,8 +108,7 @@ def _macos_camera_names() -> dict[int, str]:
         idx = 0
         for line in out.splitlines():
             line = line.strip()
-            # Each camera entry starts with its name followed by a colon
-            if line.endswith(':') and line != 'Video Cameras:' and line != 'Cameras:':
+            if line.endswith(':') and line not in ('Video Cameras:', 'Cameras:'):
                 names[idx] = line.rstrip(':')
                 idx += 1
     except (FileNotFoundError, subprocess.CalledProcessError):
@@ -119,17 +117,14 @@ def _macos_camera_names() -> dict[int, str]:
 
 
 def list_camera_devices() -> dict[int, str]:
-    """Return {device_index: description} for all capture devices."""
+    """
+    Return {device_index: description} for all capture devices.
+    On macOS this uses system_profiler only — no camera is opened.
+    """
     if IS_MACOS:
-        # Probe indices 0–7 with AVFoundation; get names from system_profiler
-        names = _macos_camera_names()
-        devices = {}
-        for idx in range(8):
-            cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
-            if cap.isOpened():
-                cap.release()
-                devices[idx] = names.get(idx, f'Camera {idx}')
-        return devices
+        # Read names from system_profiler without touching any camera device
+        return _macos_camera_names()
+
     else:
         devices = {}
         try:
@@ -166,7 +161,10 @@ def find_dji_device_index(devices: dict[int, str]) -> int | None:
 
 
 def probe_device(index: int) -> tuple[bool, int, int, float]:
-    """Try to open a device and read one frame. Returns (success, w, h, fps)."""
+    """
+    Open a single specific device and read one frame. Returns (success, w, h, fps).
+    Only call this on the device the user has chosen to open — never during enumeration.
+    """
     cap = cv2.VideoCapture(index, _CV_BACKEND)
     if not cap.isOpened():
         return False, 0, 0, 0.0
@@ -208,13 +206,19 @@ def check_hardware(args) -> int | None:
             print( '      System Settings → Privacy & Security → Camera → Terminal ✓')
         return None
 
+    # Print device list — on macOS names come from system_profiler (no camera opened)
     for idx, name in sorted(devices.items()):
-        success, w, h, fps = probe_device(idx)
-        status = ok if success else warn
         label = f'/dev/video{idx}' if IS_LINUX else f'Camera {idx}'
-        cap_str = f'{w}×{h} @ {fps:.0f} fps' if success else 'not readable'
+        if IS_LINUX:
+            success, w, h, fps = probe_device(idx)
+            cap_str = f'{w}×{h} @ {fps:.0f} fps' if success else 'not readable (metadata node)'
+            status = ok if success else warn
+        else:
+            cap_str = 'listed by system_profiler'
+            status = ok
         print(f'  {status(f"{label}  —  {name}  ({cap_str})")}')
 
+    # Choose device — on macOS we never open a camera until run_preview()
     if args.device is not None:
         chosen = args.device
         if chosen not in devices:
@@ -229,14 +233,21 @@ def check_hardware(args) -> int | None:
         print(f'\n  {ok(f"Auto-detected DJI camera at {label}")}')
         return dji_idx
 
-    for idx in sorted(devices.keys()):
-        success, _, _, _ = probe_device(idx)
-        if success:
-            print(f'\n  {warn(f"DJI not auto-detected by name — falling back to Camera {idx}")}')
-            print( '    If this is the wrong camera, rerun with  --device N')
-            return idx
+    if IS_LINUX:
+        # On Linux we can safely probe to find the first readable device
+        for idx in sorted(devices.keys()):
+            success, _, _, _ = probe_device(idx)
+            if success:
+                print(f'\n  {warn(f"DJI not auto-detected by name — falling back to /dev/video{idx}")}')
+                print( '    If this is the wrong camera, rerun with  --device N')
+                return idx
+    elif devices:
+        # On macOS, never open a camera blindly — require explicit --device
+        print(f'\n  {warn("DJI camera not found by name in the list above.")}')
+        print( '    Rerun with  --device N  to specify which camera to open.')
+        return None
 
-    print(f'\n  {fail("Could not find a readable capture device")}')
+    print(f'\n  {fail("Could not find a DJI camera device")}')
     return None
 
 
