@@ -251,6 +251,32 @@ def check_hardware(args) -> int | None:
     return None
 
 
+# ── Camera open helper ───────────────────────────────────────────────────────
+
+def _open_camera(index: int):
+    """
+    Open a camera by index, returning an opened cv2.VideoCapture or None.
+
+    On macOS, system_profiler and OpenCV AVFoundation use different index
+    numbering (system_profiler may list the same physical camera under two
+    entries, e.g. 'Camera' and 'FaceTime HD Camera'). If CAP_AVFOUNDATION
+    fails, we fall back to CAP_ANY so OpenCV can negotiate a working backend.
+    """
+    cap = cv2.VideoCapture(index, _CV_BACKEND)
+    if cap.isOpened():
+        return cap
+    cap.release()
+
+    if IS_MACOS:
+        # CAP_AVFOUNDATION failed — try letting OpenCV pick the backend
+        cap = cv2.VideoCapture(index)
+        if cap.isOpened():
+            return cap
+        cap.release()
+
+    return None
+
+
 # ── Phase 2: live preview ─────────────────────────────────────────────────────
 
 def run_preview(device_index: int, width: int, height: int, use_ros: bool, ros_topic: str):
@@ -278,9 +304,21 @@ def run_preview(device_index: int, width: int, height: int, use_ros: bool, ros_t
 
     label = f'/dev/video{device_index}' if IS_LINUX else f'Camera {device_index}'
     print(hdr(f'Opening {label}  ({width}×{height})'))
-    cap = cv2.VideoCapture(device_index, _CV_BACKEND)
-    if not cap.isOpened():
+
+    cap = _open_camera(device_index)
+    if cap is None:
         print(f'  {fail(f"Failed to open {label}")}')
+        if IS_MACOS:
+            print()
+            print('  macOS index mismatch note:')
+            print('  system_profiler and OpenCV AVFoundation number cameras differently.')
+            print('  Your DJI is Camera 2 in system_profiler but OpenCV only sees 0–1.')
+            print('  This usually means the built-in webcam occupies two entries in')
+            print('  system_profiler (e.g. "Camera" + "FaceTime HD Camera") but only')
+            print('  one in OpenCV, shifting all indices after it by 1.')
+            print()
+            print('  Try:  python3 dji_camera_validate.py --device 1')
+            print('  If that opens the wrong camera, try --device 0')
         return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
