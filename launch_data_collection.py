@@ -10,20 +10,19 @@ Launches the full pipeline:
   5. kinova_hand_controller— Hand-tracking → Kinova velocity commands → robot_action/*
   6. hdf5_data_collector   — Synchronized data recording with pygame UI
   7. ZED M camera          — /zed_front/zed_node/left/image_rect_color
-  8. RealSense wrist cam   — /rs_wrist/rs_wrist/color/image_raw
+  8. DJI Osmo Action 4      — /rs_wrist/rs_wrist/color/image_raw (wrist camera)
 
 Prerequisites (install once):
   sudo apt install ros-$ROS_DISTRO-rosbridge-suite
   sudo apt install ros-$ROS_DISTRO-zed-ros2-wrapper   # or build from source
-  sudo apt install ros-$ROS_DISTRO-realsense2-camera
   pip install kortex-api natsort zarr h5py pygame opencv-python scipy
 
 Usage:
   python3 launch_data_collection.py [options]
 
   --robot-ip       ROBOT_IP       Kinova Gen3 IP (default 192.168.1.10)
-  --rs-wrist       SERIAL_NO      RealSense wrist camera serial (default '')
   --zed-serial     SERIAL_NO      ZED M serial number as string (default '')
+  --dji-device     N              V4L2 device index for DJI camera (default 0)
 
 Keyboard controls (in the pygame window):
   R - Reset robot to home
@@ -65,8 +64,8 @@ def _piezense_env():
 
 def generate_launch_description(
     robot_ip: str = '192.168.1.10',
-    rs_wrist_serial: str = '',
     zed_serial: str = '',
+    dji_device: int = 0,
 ) -> LaunchDescription:
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -168,26 +167,19 @@ def generate_launch_description(
             }],
         ),
 
-        # ── 8. RealSense D435i — wrist-mounted camera ─────────────────────────
-        # Update rs_wrist_serial to match your camera.
-        # Find it with: rs-enumerate-devices | grep Serial
-        Node(
-            package='realsense2_camera',
-            executable='realsense2_camera_node',
-            name='rs_wrist',
-            namespace='rs_wrist',
+        # ── 8. DJI Osmo Action 4 — wrist-mounted camera ──────────────────────
+        # Publishes on /rs_wrist/rs_wrist/color/image_raw to match what the
+        # HDF5 data collector expects. Set --dji-device if /dev/video0 is wrong
+        # (run dji_camera_validate.py first to confirm the device index).
+        ExecuteProcess(
+            cmd=[
+                _PYTHON, script('dji_camera_node.py'),
+                '--ros-args',
+                '-p', f'device_index:={dji_device}',
+                '-r', '/wrist_cam/image_raw:=/rs_wrist/rs_wrist/color/image_raw',
+            ],
+            name='dji_wrist_camera',
             output='screen',
-            parameters=[{
-                'serial_no':                  rs_wrist_serial,
-                'camera_name':                'rs_wrist',
-                'enable_color':               True,
-                'enable_depth':               False,
-                'enable_infra1':              False,
-                'enable_infra2':              False,
-                'enable_gyro':                False,
-                'enable_accel':               False,
-                'rgb_camera.color_profile':   '640x480x30',
-            }],
         ),
     ])
 
@@ -198,10 +190,11 @@ def main(argv=sys.argv[1:]):
     )
     parser.add_argument('--robot-ip',   default='192.168.1.10',
                         help='Kinova Gen3 IP address (default: 192.168.1.10)')
-    parser.add_argument('--rs-wrist',   default='',
-                        help='RealSense wrist camera serial number')
     parser.add_argument('--zed-serial', default='',
                         help='ZED M serial number (leave empty for first detected)')
+    parser.add_argument('--dji-device', type=int, default=0,
+                        help='V4L2 device index for DJI Osmo Action 4 (default: 0). '
+                             'Run dji_camera_validate.py first to confirm.')
     args, launch_argv = parser.parse_known_args(argv)
 
     print('=' * 60)
@@ -209,7 +202,7 @@ def main(argv=sys.argv[1:]):
     print('=' * 60)
     print(f'  Robot IP:       {args.robot_ip}')
     print(f'  ZED serial:     {args.zed_serial or "(auto-detect first found)"}')
-    print(f'  RS wrist serial:{args.rs_wrist   or "(auto-detect first found)"}')
+    print(f'  DJI wrist cam:  /dev/video{args.dji_device}')
     print()
     print('HoloLens:')
     print('  Make sure the HoloLens app is pointed at ws://<this-machine-ip>:9090')
@@ -221,8 +214,8 @@ def main(argv=sys.argv[1:]):
 
     ld = generate_launch_description(
         robot_ip=args.robot_ip,
-        rs_wrist_serial=args.rs_wrist,
         zed_serial=args.zed_serial,
+        dji_device=args.dji_device,
     )
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)

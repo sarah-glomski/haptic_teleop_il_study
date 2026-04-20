@@ -58,7 +58,7 @@ ROS2 Parameters:
   max_linear_speed_mps        float  0.10   m/s   hard velocity cap
   max_angular_speed_dps       float  15.0   deg/s hard angular cap
   vel_alpha                   float  0.4    velocity smoothing (0=very smooth)
-  workspace_x_min / x_max     float  0.30 / 0.35  m
+  workspace_x_min / x_max     float  0.40 / 0.50  m
   workspace_y_min / y_max     float -0.27 / 0.27  m
   workspace_z_min / z_max     float  0.025 / 0.30  m
   workspace_soft_margin_m     float  0.04   soft deceleration zone (m from wall)
