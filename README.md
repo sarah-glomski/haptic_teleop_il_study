@@ -386,7 +386,7 @@ misses ~6 ticks (node crash/freeze), the Kortex SDK stops the robot automaticall
 | Y | -0.27 | 0.27 |
 | Z | 0.025 | 0.30 |
 
-**Home position:** `(0.44, 0.00, 0.43)` m, `(180°, 0°, 0°)` Euler XYZ.
+**Home position:** `(0.474, 0.02, 0.107)` m, `(-179.3°, -0.4°, 89.3°)` Euler XYZ.
 
 ### 6.5 Piezense at Inference
 
