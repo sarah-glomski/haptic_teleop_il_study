@@ -62,10 +62,13 @@ def find_latest_checkpoint(search_dir: str) -> str:
     return max(ckpts, key=os.path.getmtime)
 
 
+ZED_SERIAL = "17875187"
+
+
 def generate_launch_description(
     model_path: str,
     robot_ip: str = "192.168.1.10",
-    zed_serial: str = "",
+    zed_serial: str = ZED_SERIAL,
     dji_device: int = 0,
     dt: float = 0.033,
     action_horizon: int = 6,
@@ -160,8 +163,8 @@ def main(argv=sys.argv[1:]):
                         help="Find and use the latest checkpoint in training/data/outputs/")
     parser.add_argument("--robot-ip",        type=str,   default="192.168.1.10",
                         help="Kinova Gen3 IP address (default: 192.168.1.10)")
-    parser.add_argument("--zed-serial",      type=str,   default="",
-                        help="ZED M serial number (empty = first detected)")
+    parser.add_argument("--zed-serial",      type=str,   default=ZED_SERIAL,
+                        help=f"ZED M serial number (default: {ZED_SERIAL})")
     parser.add_argument("--dji-device",      type=int,   default=0,
                         help="V4L2 device index for DJI wrist camera (default: 0)")
     parser.add_argument("--dt",              type=float, default=0.033,

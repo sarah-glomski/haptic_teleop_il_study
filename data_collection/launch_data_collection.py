@@ -62,9 +62,12 @@ def _piezense_env():
     return env
 
 
+ZED_SERIAL = '17875187'
+
+
 def generate_launch_description(
     robot_ip: str = '192.168.1.10',
-    zed_serial: str = '',
+    zed_serial: str = ZED_SERIAL,
     dji_device: int = 0,
 ) -> LaunchDescription:
 
@@ -190,8 +193,8 @@ def main(argv=sys.argv[1:]):
     )
     parser.add_argument('--robot-ip',   default='192.168.1.10',
                         help='Kinova Gen3 IP address (default: 192.168.1.10)')
-    parser.add_argument('--zed-serial', default='',
-                        help='ZED M serial number (leave empty for first detected)')
+    parser.add_argument('--zed-serial', default=ZED_SERIAL,
+                        help=f'ZED M serial number (default: {ZED_SERIAL})')
     parser.add_argument('--dji-device', type=int, default=0,
                         help='V4L2 device index for DJI Osmo Action 4 (default: 0). '
                              'Run dji_camera_validate.py first to confirm.')
