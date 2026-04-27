@@ -68,8 +68,8 @@ ROS2 Parameters:
   fixed_theta_z_offset_deg    float  0.0
   p_gain                      float  2.0
   ── Home position (m / deg) ──────────────────────────────────────────────
-  home_x / home_y / home_z    float  0.44 / 0.00 / 0.43
-  home_tx / home_ty / home_tz float  180.0 / 0.0 / 0.0
+  home_x / home_y / home_z    float  0.474 / 0.02 / 0.107
+  home_tx / home_ty / home_tz float  -179.3 / -0.4 / 89.3
 """
 
 import math
@@ -135,12 +135,12 @@ class KinovaHandController(Node):
         self.fixed_theta_z_offset = self.declare_parameter('fixed_theta_z_offset_deg',   0.0).value
         self.p_gain               = self.declare_parameter('p_gain',                    2.0).value
 
-        self.home_x  = self.declare_parameter('home_x',  0.44).value
-        self.home_y  = self.declare_parameter('home_y',  0.00).value
-        self.home_z  = self.declare_parameter('home_z',  0.43).value
-        self.home_tx = self.declare_parameter('home_tx', 180.0).value
-        self.home_ty = self.declare_parameter('home_ty',   0.0).value
-        self.home_tz = self.declare_parameter('home_tz',   0.0).value
+        self.home_x  = self.declare_parameter('home_x',   0.474).value
+        self.home_y  = self.declare_parameter('home_y',   0.02).value
+        self.home_z  = self.declare_parameter('home_z',   0.107).value
+        self.home_tx = self.declare_parameter('home_tx', -179.3).value
+        self.home_ty = self.declare_parameter('home_ty',   -0.4).value
+        self.home_tz = self.declare_parameter('home_tz',   89.3).value
 
         # ── Connect and configure robot ─────────────────────────────────────────
         self.get_logger().info(f'Connecting to Kinova Gen3 at {self.robot_ip} …')

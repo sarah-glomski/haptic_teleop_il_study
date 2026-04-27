@@ -86,8 +86,8 @@ WS_X = (0.40, 0.50)
 WS_Y = (-0.27, 0.27)
 WS_Z = (0.025, 0.30)
 
-HOME_X, HOME_Y, HOME_Z   = 0.44, 0.00, 0.43
-HOME_TX, HOME_TY, HOME_TZ = 180.0, 0.0, 0.0   # Euler XYZ degrees
+HOME_X, HOME_Y, HOME_Z   = 0.474, 0.02, 0.107
+HOME_TX, HOME_TY, HOME_TZ = -179.3, -0.4, 89.3   # Euler XYZ degrees
 
 MAX_LINEAR_SPEED  = 0.10   # m/s
 MAX_ANGULAR_SPEED = 15.0   # deg/s

@@ -157,6 +157,13 @@ def main(argv=sys.argv[1:]):
     print('  Ctrl-C stops all nodes and halts the robot.')
     print('=' * 60)
 
+    # Strip conda/miniforge from PATH so that executables with `#!/usr/bin/env python3`
+    # (e.g. rosbridge_websocket) resolve to the system Python 3.12, not conda's 3.13.
+    path_parts = os.environ.get('PATH', '').split(':')
+    os.environ['PATH'] = ':'.join(
+        p for p in path_parts if 'miniforge' not in p and 'conda' not in p
+    )
+
     ld = generate_launch_description(robot_ip=args.robot_ip)
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)
