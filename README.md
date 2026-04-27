@@ -397,7 +397,7 @@ must be running for tactile feedback to inform the policy.
 
 ---
 
-## 7. Key Parameters for Tuning Discussion
+## 7. Key Parameters for Tuning
 
 ### Latency / Responsiveness
 
