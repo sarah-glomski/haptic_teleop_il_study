@@ -1,8 +1,7 @@
 # Haptic Teleop IL — Diffusion Policy Pipeline
 
 This document describes the full data collection → training → inference pipeline
-for the HoloLens 2 + Kinova Gen3 imitation learning study. It is written for a
-researcher familiar with diffusion policy and robot learning systems.
+for the HoloLens 2 + Kinova Gen3 + PieZense imitation learning study. 
 
 ---
 
