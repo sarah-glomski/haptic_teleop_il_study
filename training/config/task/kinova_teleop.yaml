@@ -1,0 +1,48 @@
+low_dim_obs_horizon: 2
+img_obs_horizon: 2
+action_horizon: 16
+
+shape_meta: &shape_meta
+  obs:
+    zed_front_rgb:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${task.img_obs_horizon}
+      down_sample_steps: 1
+    rs_wrist_rgb:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${task.img_obs_horizon}
+      down_sample_steps: 1
+    pose:
+      shape: [10]
+      type: low_dim
+      horizon: ${task.low_dim_obs_horizon}
+      down_sample_steps: 1
+    piezense_pressure:
+      shape: [2]
+      type: low_dim
+      horizon: ${task.low_dim_obs_horizon}
+      down_sample_steps: 1
+  action:
+    shape: [10]
+    horizon: ${task.action_horizon}
+    down_sample_steps: 1
+
+name: kinova_teleop
+task_name: kinova_teleop
+dataset_path: ${oc.env:KINOVA_ZARR_PATH,kinova_teleop.zarr}
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: kinova_dataset.KinovaImageDataset
+  shape_meta: *shape_meta
+  zarr_path: ${task.dataset_path}
+  seed: 42
+  val_ratio: 0.05
+  horizon: 16
+  obs_horizon: ${task.low_dim_obs_horizon}
+  action_horizon: ${task.action_horizon}
+  preload: false

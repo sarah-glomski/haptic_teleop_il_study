@@ -112,17 +112,17 @@ def generate_launch_description(robot_ip: str) -> LaunchDescription:
         # ── Piezense pressure sensor driver ───────────────────────────────────
         # Publishes PiezenseSystemArray on piezense/data at 30 Hz.
         # Input sensors are on system 0, channels 2 and 3.
-        ExecuteProcess(
-            cmd=[
-                _PYTHON, _PIEZENSE_DRIVER,
-                '--ros-args',
-                '-p', 'systems:=[Piezense:4]',
-                '-p', 'hz:=30.0',
-            ],
-            name='piezense_driver',
-            output='screen',
-            additional_env=_piezense_env(),
-        ),
+        # ExecuteProcess(
+        #     cmd=[
+        #         _PYTHON, _PIEZENSE_DRIVER,
+        #         '--ros-args',
+        #         '-p', 'systems:=[Piezense:4]',
+        #         '-p', 'hz:=30.0',
+        #     ],
+        #     name='piezense_driver',
+        #     output='screen',
+        #     additional_env=_piezense_env(),
+        # ),
     ])
 
 

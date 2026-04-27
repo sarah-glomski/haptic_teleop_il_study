@@ -104,14 +104,14 @@ class KinovaStatePublisher(Node):
             now = self.get_clock().now().to_msg()
 
             # ── TCP pose ─────────────────────────────────────────────────────
-            # Kinova reports position in mm and orientation as Euler angles (deg)
+            # Kinova reports position in metres and orientation as Euler angles (deg)
             pose_msg = PoseStamped()
             pose_msg.header.stamp = now
             pose_msg.header.frame_id = 'base_link'
 
-            pose_msg.pose.position.x = feedback.base.tool_pose_x / 1000.0
-            pose_msg.pose.position.y = feedback.base.tool_pose_y / 1000.0
-            pose_msg.pose.position.z = feedback.base.tool_pose_z / 1000.0
+            pose_msg.pose.position.x = feedback.base.tool_pose_x
+            pose_msg.pose.position.y = feedback.base.tool_pose_y
+            pose_msg.pose.position.z = feedback.base.tool_pose_z
 
             quat = R.from_euler('xyz', [
                 math.radians(feedback.base.tool_pose_theta_x),

@@ -428,9 +428,9 @@ class KinovaHandController(Node):
         try:
             feedback = self._base_cyclic.RefreshFeedback()
             current_pos = np.array([
-                feedback.base.tool_pose_x / 1000.0,
-                feedback.base.tool_pose_y / 1000.0,
-                feedback.base.tool_pose_z / 1000.0,
+                feedback.base.tool_pose_x,
+                feedback.base.tool_pose_y,
+                feedback.base.tool_pose_z,
             ])
             current_theta_z = feedback.base.tool_pose_theta_z
 
