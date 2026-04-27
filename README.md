@@ -56,7 +56,7 @@ for the HoloLens 2 + Kinova Gen3 + PieZense imitation learning study.
 ```bash
 python3 data_collection/launch_data_collection.py \
     --robot-ip 192.168.1.10 \
-    --zed-serial <SERIAL> \
+    --zed-serial 17875187 \
     --dji-device 0
 ```
 
