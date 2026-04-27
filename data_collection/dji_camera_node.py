@@ -3,8 +3,7 @@
 DJI Osmo Action 4 Camera ROS2 Node
 
 Streams the DJI Osmo Action 4 (connected via USB-C in UVC/webcam mode) as a
-ROS2 sensor_msgs/Image topic. Designed as a drop-in replacement for the
-RealSense wrist-camera node used in the data collection pipeline.
+ROS2 sensor_msgs/Image topic for use in the data collection pipeline.
 
 Camera setup (do once on the DJI camera):
   Menu → Settings → Control Method → UVC Camera
@@ -26,8 +25,8 @@ Usage:
   # Override device index:
   /usr/bin/python3.12 dji_camera_node.py --ros-args -p device_index:=2
 
-  # Publish on the same topic as the RealSense (for data collector compatibility):
-  /usr/bin/python3.12 dji_camera_node.py --ros-args -r /wrist_cam/image_raw:=/rs_wrist/rs_wrist/color/image_raw
+  # Remap to the topic expected by the data collector:
+  /usr/bin/python3.12 dji_camera_node.py --ros-args -r /wrist_cam/image_raw:=/dji_wrist/dji_wrist/color/image_raw
 """
 
 import cv2

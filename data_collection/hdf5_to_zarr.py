@@ -17,13 +17,13 @@ Source HDF5 schema (per episode_N.hdf5):
   hololens/hand_width     (T,)     float32
   piezense/pressure_input (T, 2)   float32  Pa — input channels 2 and 3
   images/zed_front        (T, 3, H, W) uint8  CHW
-  images/rs_wrist         (T, 3, H, W) uint8  CHW
+  images/dji_wrist         (T, 3, H, W) uint8  CHW
 
 Target zarr schema (UMI-style flat concatenation):
   output.zarr/
   ├── data/
   │   ├── zed_front_rgb:        (N, H, W, 3)  uint8    HWC
-  │   ├── rs_wrist_rgb:         (N, H, W, 3)  uint8    HWC
+  │   ├── dji_wrist_rgb:         (N, H, W, 3)  uint8    HWC
   │   ├── pose:                 (N, 10)        float32  [x,y,z,rot6d(6),gripper]  obs
   │   ├── action:               (N, 10)        float32  [x,y,z,rot6d(6),gripper]  act
   │   ├── joint_states:         (N, 7)         float32  joint angles (rad)
@@ -86,7 +86,7 @@ def load_episode(h5_path: str) -> dict:
       holo_finger_tips     (T, 15)  float32
       piezense_pressure    (T, 2)   float32  — input channel pressures (Pa)
       zed_front_rgb        (T, H, W, 3) uint8  — CHW→HWC
-      rs_wrist_rgb         (T, H, W, 3) uint8  — CHW→HWC
+      dji_wrist_rgb         (T, H, W, 3) uint8  — CHW→HWC
     """
     data = {}
     with h5py.File(h5_path, 'r') as f:
@@ -118,7 +118,7 @@ def load_episode(h5_path: str) -> dict:
         # ── Images: CHW (T,3,H,W) → HWC (T,H,W,3) ───────────────────────────
         img_map = {
             'images/zed_front': 'zed_front_rgb',
-            'images/rs_wrist':  'rs_wrist_rgb',
+            'images/dji_wrist':  'dji_wrist_rgb',
         }
         for h5_key, zarr_key in img_map.items():
             if h5_key in f:

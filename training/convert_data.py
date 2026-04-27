@@ -14,7 +14,7 @@ Output zarr schema:
   output.zarr/
   ├── episode_0/
   │   ├── zed_front_rgb:      (T, 224, 224, 3)  uint8   HWC
-  │   ├── rs_wrist_rgb:       (T, 224, 224, 3)  uint8   HWC
+  │   ├── dji_wrist_rgb:       (T, 224, 224, 3)  uint8   HWC
   │   ├── pose:               (T, 10)            float32 [xyz, rot6d, gripper_obs]
   │   ├── action:             (T, 10)            float32 [xyz, rot6d, gripper_cmd]
   │   └── piezense_pressure:  (T, 2)             float32 input channel pressures (Pa)
@@ -41,7 +41,7 @@ IMG_SIZE = 224
 
 CAMERA_KEYS = {
     "images/zed_front": "zed_front_rgb",
-    "images/rs_wrist":  "rs_wrist_rgb",
+    "images/dji_wrist":  "dji_wrist_rgb",
 }
 
 

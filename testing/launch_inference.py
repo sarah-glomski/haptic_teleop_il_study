@@ -7,7 +7,7 @@ setup (ZED front camera + DJI wrist camera, Kortex velocity control).
 
 Starts all required nodes:
   1. ZED M camera            — /zed_front/zed_node/left/image_rect_color
-  2. DJI wrist camera        — /rs_wrist/rs_wrist/color/image_raw
+  2. DJI wrist camera        — /dji_wrist/dji_wrist/color/image_raw
   3. kinova_state_publisher  — robot_obs/pose, robot_obs/gripper
   4. piezense_driver         — piezense/data
   5. inference.py            — loads policy, runs predict_action(), controls robot
@@ -109,13 +109,13 @@ def generate_launch_description(
         ),
 
         # ── 2. DJI Osmo Action 4 — wrist camera ───────────────────────────────
-        # Remapped to /rs_wrist/rs_wrist/color/image_raw to match inference.py
+        # Remapped to /dji_wrist/dji_wrist/color/image_raw to match inference.py
         ExecuteProcess(
             cmd=[
                 _PYTHON, _DJI_CAMERA_NODE,
                 "--ros-args",
                 "-p", f"device_index:={dji_device}",
-                "-r", "/wrist_cam/image_raw:=/rs_wrist/rs_wrist/color/image_raw",
+                "-r", "/wrist_cam/image_raw:=/dji_wrist/dji_wrist/color/image_raw",
             ],
             name="dji_wrist_camera",
             output="screen",

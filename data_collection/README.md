@@ -16,7 +16,7 @@ Kinova Gen3 ◀── kinova_hand_controller ◀── hand/pose
             ──▶  kinova_state_publisher ──▶  robot_obs/pose
 
 ZED M (front)   ──▶  /zed_front/zed_node/left/image_rect_color
-RealSense D435i ──▶  /rs_wrist/rs_wrist/color/image_raw
+DJI Osmo Action 4 ──▶  /dji_wrist/dji_wrist/color/image_raw
 
 hdf5_data_collector  ──▶  episode_N.hdf5
 hdf5_to_zarr         ──▶  output.zarr  (for diffusion policy training)
@@ -29,7 +29,7 @@ hdf5_to_zarr         ──▶  output.zarr  (for diffusion policy training)
 | Headset | HoloLens 2 (MRTK hand tracking) |
 | Robot arm | Kinova Gen3 7-DoF |
 | Front camera | ZED M (ZED Mini stereo) |
-| Wrist camera | Intel RealSense D435i |
+| Wrist camera | DJI Osmo Action 4 (USB-C UVC mode) |
 | Host machine | Ubuntu 24.04, ROS2 Jazzy, RTX 4090 |
 
 ## Prerequisites
@@ -38,7 +38,7 @@ hdf5_to_zarr         ──▶  output.zarr  (for diffusion policy training)
 ```bash
 sudo apt install ros-jazzy-rosbridge-suite
 sudo apt install ros-jazzy-zed-ros2-wrapper   # or build from source
-sudo apt install ros-jazzy-realsense2-camera
+sudo apt install ros-jazzy-v4l2-camera  # or use dji_camera_node.py (bundled)
 ```
 
 ### Kinova Kortex API
@@ -144,7 +144,7 @@ episode_N.hdf5
 │   └── hand_width      (T,)     float32
 └── images/
     ├── zed_front  (T, 3, H, W)  uint8  LZF-compressed, CHW
-    └── rs_wrist   (T, 3, H, W)  uint8  LZF-compressed, CHW
+    └── dji_wrist   (T, 3, H, W)  uint8  LZF-compressed, CHW
 ```
 
 Metadata: `num_frames`, `collection_rate_hz=30`, `episode_index`
@@ -162,7 +162,7 @@ Zarr output (UMI-style flat concatenation):
 output.zarr/
 ├── data/
 │   ├── zed_front_rgb    (N, H, W, 3)  uint8   HWC
-│   ├── rs_wrist_rgb     (N, H, W, 3)  uint8   HWC
+│   ├── dji_wrist_rgb     (N, H, W, 3)  uint8   HWC
 │   ├── pose             (N, 10)       float32  [x,y,z, rot6d(6), gripper]
 │   ├── action           (N, 10)       float32
 │   ├── joint_states     (N, 7)        float32

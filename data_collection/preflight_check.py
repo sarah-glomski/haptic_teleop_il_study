@@ -61,11 +61,11 @@ def check_usb():
     else:
         print(f'  {fail("ZED M not detected — check USB cable / power")}')
 
-    # RealSense (Intel vendor 8086, product 0b3a/0b07 etc.)
-    if '8086:0b' in out or 'RealSense' in out:
-        print(f'  {ok("RealSense detected")}')
+    # DJI Osmo Action 4 appears as a generic UVC device; check by name
+    if 'DJI' in out or 'Osmo' in out or '2ca3:' in out:
+        print(f'  {ok("DJI wrist camera detected")}')
     else:
-        print(f'  {warn("RealSense not detected (optional for teleop-only)")}')
+        print(f'  {warn("DJI wrist camera not detected — check USB-C cable and UVC mode")}')
 
 
 # ── Phase 1: Robot TCP ping ────────────────────────────────────────────────────

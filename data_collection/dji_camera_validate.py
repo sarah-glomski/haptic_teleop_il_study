@@ -32,7 +32,7 @@ Usage:
   python3 dji_camera_validate.py --ros
 
   # Publish on the data-collector topic instead of the default:
-  python3 dji_camera_validate.py --ros --topic /rs_wrist/rs_wrist/color/image_raw
+  python3 dji_camera_validate.py --ros --topic /dji_wrist/dji_wrist/color/image_raw
 
 Press Q in the preview window to quit.
 """

@@ -10,7 +10,7 @@ Launches the full pipeline:
   5. kinova_hand_controller— Hand-tracking → Kinova velocity commands → robot_action/*
   6. hdf5_data_collector   — Synchronized data recording with pygame UI
   7. ZED M camera          — /zed_front/zed_node/left/image_rect_color
-  8. DJI Osmo Action 4      — /rs_wrist/rs_wrist/color/image_raw (wrist camera)
+  8. DJI Osmo Action 4      — /dji_wrist/dji_wrist/color/image_raw (wrist camera)
 
 Prerequisites (install once):
   sudo apt install ros-$ROS_DISTRO-rosbridge-suite
@@ -171,7 +171,7 @@ def generate_launch_description(
         ),
 
         # ── 8. DJI Osmo Action 4 — wrist-mounted camera ──────────────────────
-        # Publishes on /rs_wrist/rs_wrist/color/image_raw to match what the
+        # Publishes on /dji_wrist/dji_wrist/color/image_raw to match what the
         # HDF5 data collector expects. Set --dji-device if /dev/video0 is wrong
         # (run dji_camera_validate.py first to confirm the device index).
         ExecuteProcess(
@@ -179,7 +179,7 @@ def generate_launch_description(
                 _PYTHON, script('dji_camera_node.py'),
                 '--ros-args',
                 '-p', f'device_index:={dji_device}',
-                '-r', '/wrist_cam/image_raw:=/rs_wrist/rs_wrist/color/image_raw',
+                '-r', '/wrist_cam/image_raw:=/dji_wrist/dji_wrist/color/image_raw',
             ],
             name='dji_wrist_camera',
             output='screen',

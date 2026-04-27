@@ -44,7 +44,7 @@ for the HoloLens 2 + Kinova Gen3 + PieZense imitation learning study.
 | `hand/pose` | `PoseStamped` | hololens_hand_node | kinova_hand_controller, hdf5_data_collector |
 | `hand/gripper_cmd` | `Float32` | hololens_hand_node | kinova_hand_controller |
 | `/zed_front/zed_node/left/image_rect_color` | `Image` | zed_wrapper | hdf5_data_collector, inference |
-| `/rs_wrist/rs_wrist/color/image_raw` | `Image` | dji_camera_node | hdf5_data_collector, inference |
+| `/dji_wrist/dji_wrist/color/image_raw` | `Image` | dji_camera_node | hdf5_data_collector, inference |
 | `piezense/data` | `PiezenseSystemArray` | piezense_driver | hdf5_data_collector, inference |
 
 ---
@@ -69,7 +69,7 @@ Pygame window controls: **R** Reset · **S** Start · **D** Done/Save · **P** P
 - `robot_action/pose`, `robot_action/gripper`
 - `robot_obs/pose`, `robot_obs/gripper`
 - `hand/pose`
-- `/zed_front/...`, `/rs_wrist/...`
+- `/zed_front/...`, `/dji_wrist/...`
 
 **Slop:** 120 ms. This is intentionally wide because ZED, DJI, and Kinova poll on
 independent clocks. Tighten if synchronization quality is a concern.
@@ -102,7 +102,7 @@ episode_N.hdf5
 │   └── pressure_input:     (T, 2)   float32  Pa — channels 2 & 3 of system 0
 └── images/
     ├── zed_front:          (T, 3, H, W) uint8  CHW, LZF-compressed
-    └── rs_wrist:           (T, 3, H, W) uint8  CHW, LZF-compressed
+    └── dji_wrist:           (T, 3, H, W) uint8  CHW, LZF-compressed
 ```
 
 **Collection rate:** ~30 Hz (set by ApproximateTimeSynchronizer throughput).
@@ -155,7 +155,7 @@ euler_xyz_deg = Rotation.from_matrix([c1,c2,c3]).as_euler('xyz', degrees=True)
 kinova_teleop.zarr/
 ├── episode_0/
 │   ├── zed_front_rgb:      (T, 224, 224, 3)  uint8   HWC
-│   ├── rs_wrist_rgb:       (T, 224, 224, 3)  uint8   HWC
+│   ├── dji_wrist_rgb:       (T, 224, 224, 3)  uint8   HWC
 │   ├── pose:               (T, 10)            float32 [xyz, rot6d, gripper_obs]
 │   ├── action:             (T, 10)            float32 [xyz, rot6d, gripper_cmd]
 │   └── piezense_pressure:  (T, 2)             float32 Pa
@@ -202,7 +202,7 @@ Noisy action ──► 1D-UNet (temporal) ─────┘──► denoised a
 | Key | Shape | Role |
 |---|---|---|
 | `zed_front_rgb` | `(B, 2, 3, 224, 224)` | front camera, obs_horizon=2 |
-| `rs_wrist_rgb` | `(B, 2, 3, 224, 224)` | wrist camera, obs_horizon=2 |
+| `dji_wrist_rgb` | `(B, 2, 3, 224, 224)` | wrist camera, obs_horizon=2 |
 | `pose` | `(B, 2, 10)` | TCP pose history, obs_horizon=2 |
 | `piezense_pressure` | `(B, 2, 2)` | pressure history, obs_horizon=2 |
 
@@ -479,7 +479,7 @@ choose based on which training infrastructure you want to use.
 ```
 # ROS2 packages
 ros-jazzy-rosbridge-suite
-ros-jazzy-realsense2-camera   # not used currently; kept for reference
+ros-jazzy-v4l2-camera         # optional; dji_camera_node.py uses OpenCV directly
 zed-ros2-wrapper               # ZED M camera
 
 # Python

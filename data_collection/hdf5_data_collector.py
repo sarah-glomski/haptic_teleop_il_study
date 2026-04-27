@@ -7,7 +7,7 @@ Collects time-synchronized data from:
   - Kinova Gen3: commanded pose/gripper (robot_action/*) + observed pose/gripper (robot_obs/*)
   - HoloLens hand: palm pose in robot frame (hand/pose)
   - ZED M camera: front view (images/zed_front)
-  - RealSense D435i: wrist-mounted camera (images/rs_wrist)
+  - DJI Osmo Action 4: wrist-mounted camera (images/dji_wrist)
   - Piezense: 2-channel pressure sensor input (piezense/data)
 
 Additional data captured as latest-value at each sync tick (not in sync filter):
@@ -36,7 +36,7 @@ HDF5 schema (per episode):
   │   └── pressure_input: (T, 2) float32   input channel pressures (Pa)
   └── images/
       ├── zed_front:     (T, 3, H, W) uint8  LZF-compressed CHW
-      └── rs_wrist:      (T, 3, H, W) uint8  LZF-compressed CHW
+      └── dji_wrist:      (T, 3, H, W) uint8  LZF-compressed CHW
 
 Pygame keyboard controls:
   R — Reset robot to home position
@@ -74,7 +74,7 @@ from piezense_interfaces.msg import PiezenseSystemArray
 # ── Camera topic configuration ─────────────────────────────────────────────────
 CAMERA_STREAMS = {
     'zed_front': '/zed_front/zed_node/left/image_rect_color',
-    'rs_wrist':  '/rs_wrist/rs_wrist/color/image_raw',
+    'dji_wrist':  '/dji_wrist/dji_wrist/color/image_raw',
 }
 
 # Number of joint angles to record
@@ -128,7 +128,7 @@ class HDF5DataCollector(Node):
         self._sub_obs_gripper    = Subscriber(self, Float32,     'robot_obs/gripper',    qos_profile=sensor_qos)
         self._sub_hand_pose      = Subscriber(self, PoseStamped, 'hand/pose',            qos_profile=sensor_qos)
         self._sub_zed_front      = Subscriber(self, Image, CAMERA_STREAMS['zed_front'],  qos_profile=sensor_qos)
-        self._sub_rs_wrist       = Subscriber(self, Image, CAMERA_STREAMS['rs_wrist'],   qos_profile=sensor_qos)
+        self._sub_dji_wrist       = Subscriber(self, Image, CAMERA_STREAMS['dji_wrist'],   qos_profile=sensor_qos)
 
         self._sync = ApproximateTimeSynchronizer(
             [
@@ -138,7 +138,7 @@ class HDF5DataCollector(Node):
                 self._sub_obs_gripper,
                 self._sub_hand_pose,
                 self._sub_zed_front,
-                self._sub_rs_wrist,
+                self._sub_dji_wrist,
             ],
             queue_size=100,
             slop=0.12,
@@ -222,7 +222,7 @@ class HDF5DataCollector(Node):
         self._buf_hand_width       = []
         self._buf_piezense_input   = []
         self._buf_zed_front        = []
-        self._buf_rs_wrist         = []
+        self._buf_dji_wrist         = []
 
     # ── Side-channel callbacks ────────────────────────────────────────────────
     def _joint_states_cb(self, msg: JointState):
@@ -269,7 +269,7 @@ class HDF5DataCollector(Node):
         obs_gripper_msg: Float32,
         hand_pose_msg: PoseStamped,
         zed_front_msg: Image,
-        rs_wrist_msg: Image,
+        dji_wrist_msg: Image,
     ):
         if not self.is_collecting or self.is_paused:
             return
@@ -295,7 +295,7 @@ class HDF5DataCollector(Node):
 
             # Images
             self._buf_zed_front.append(self._decode_image(zed_front_msg))
-            self._buf_rs_wrist.append(self._decode_image(rs_wrist_msg))
+            self._buf_dji_wrist.append(self._decode_image(dji_wrist_msg))
 
         count = len(self._buf_action_pose)
         if count % 30 == 0:
@@ -427,7 +427,7 @@ class HDF5DataCollector(Node):
             hand_width       = np.array(self._buf_hand_width,       dtype=np.float32)
             piezense_input   = np.array(self._buf_piezense_input,   dtype=np.float32)
             zed_front        = np.array(self._buf_zed_front,        dtype=np.uint8)
-            rs_wrist         = np.array(self._buf_rs_wrist,         dtype=np.uint8)
+            dji_wrist         = np.array(self._buf_dji_wrist,         dtype=np.uint8)
 
         os.makedirs(self._save_dir, exist_ok=True)
         filename = os.path.join(self._save_dir, f'episode_{self.demo_count}.hdf5')
@@ -459,7 +459,7 @@ class HDF5DataCollector(Node):
 
             imgs = f.create_group('images')
             imgs.create_dataset('zed_front', data=zed_front, compression='lzf')
-            imgs.create_dataset('rs_wrist',  data=rs_wrist,  compression='lzf')
+            imgs.create_dataset('dji_wrist',  data=dji_wrist,  compression='lzf')
 
             f.attrs['num_frames']         = len(action_pose)
             f.attrs['collection_rate_hz'] = 30

@@ -9,7 +9,7 @@ shape_meta: &shape_meta
       type: rgb
       horizon: ${task.img_obs_horizon}
       down_sample_steps: 1
-    rs_wrist_rgb:
+    dji_wrist_rgb:
       shape: [3, 224, 224]
       type: rgb
       horizon: ${task.img_obs_horizon}

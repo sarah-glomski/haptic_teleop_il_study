@@ -7,7 +7,7 @@ sliding-window samples compatible with TrainDiffusionUnetImageWorkspace.
 Each __getitem__ returns:
   obs:
     zed_front_rgb:      (obs_horizon, 3, 224, 224)  float32  [0, 1]
-    rs_wrist_rgb:       (obs_horizon, 3, 224, 224)  float32  [0, 1]
+    dji_wrist_rgb:       (obs_horizon, 3, 224, 224)  float32  [0, 1]
     pose:               (obs_horizon, 10)            float32
     piezense_pressure:  (obs_horizon, 2)             float32  Pa
   action:               (action_horizon, 10)         float32
@@ -109,7 +109,7 @@ class KinovaImageDataset(Dataset):
 
         obs = {
             "zed_front_rgb":     load_img("zed_front_rgb"),
-            "rs_wrist_rgb":      load_img("rs_wrist_rgb"),
+            "dji_wrist_rgb":      load_img("dji_wrist_rgb"),
             "pose":              torch.from_numpy(load("pose", t_obs_start, t_obs_end).copy()).float(),
             "piezense_pressure": torch.from_numpy(load("piezense_pressure", t_obs_start, t_obs_end).copy()).float(),
         }

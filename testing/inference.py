@@ -72,7 +72,7 @@ from kortex_api.autogen.messages import Session_pb2, Base_pb2
 POSE_TOPIC      = "robot_obs/pose"
 GRIPPER_TOPIC   = "robot_obs/gripper"
 ZED_FRONT_TOPIC = "/zed_front/zed_node/left/image_rect_color"
-RS_WRIST_TOPIC  = "/rs_wrist/rs_wrist/color/image_raw"
+DJI_WRIST_TOPIC  = "/dji_wrist/dji_wrist/color/image_raw"
 PIEZENSE_TOPIC  = "piezense/data"
 
 PIEZENSE_SYSTEM_ID      = 0
@@ -98,10 +98,10 @@ TWIST_WATCHDOG_MS = 200    # ms — Kortex auto-stops if we miss this many ms
 IMG_SIZE     = 224
 OBS_HORIZON  = 2
 
-CAMERA_KEYS = ["zed_front_rgb", "rs_wrist_rgb"]
+CAMERA_KEYS = ["zed_front_rgb", "dji_wrist_rgb"]
 CAMERA_TOPICS = {
     "zed_front_rgb": ZED_FRONT_TOPIC,
-    "rs_wrist_rgb":  RS_WRIST_TOPIC,
+    "dji_wrist_rgb":  DJI_WRIST_TOPIC,
 }
 
 
@@ -198,7 +198,7 @@ class PolicyNode(Node):
         self.pose_sub     = message_filters.Subscriber(self, PoseStamped, POSE_TOPIC,      qos_profile=sensor_qos)
         self.gripper_sub  = message_filters.Subscriber(self, Float32,     GRIPPER_TOPIC,   qos_profile=sensor_qos)
         self.zed_sub      = message_filters.Subscriber(self, Image,       ZED_FRONT_TOPIC, qos_profile=sensor_qos)
-        self.wrist_sub    = message_filters.Subscriber(self, Image,       RS_WRIST_TOPIC,  qos_profile=sensor_qos)
+        self.wrist_sub    = message_filters.Subscriber(self, Image,       DJI_WRIST_TOPIC,  qos_profile=sensor_qos)
 
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [self.pose_sub, self.gripper_sub, self.zed_sub, self.wrist_sub],
@@ -277,7 +277,7 @@ class PolicyNode(Node):
             self.pose_buffer.pop(0)
 
         # Camera images
-        for cam_key, msg in [("zed_front_rgb", zed_msg), ("rs_wrist_rgb", wrist_msg)]:
+        for cam_key, msg in [("zed_front_rgb", zed_msg), ("dji_wrist_rgb", wrist_msg)]:
             img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
             img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
             img = img.astype(np.float32) / 255.0
