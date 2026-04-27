@@ -19,7 +19,7 @@ for the HoloLens 2 + Kinova Gen3 + PieZense imitation learning study.
 │                                                                  │
 │  Piezense (2-ch pressure sensor, system 0, channels 2 & 3)       │
 └───────────────────────────┬─────────────────────────────────────┘
-                            │ ROS2 (Humble)
+                            │ ROS2 (Jazzy)
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                   PIPELINE STAGES                                │
@@ -478,8 +478,8 @@ choose based on which training infrastructure you want to use.
 
 ```
 # ROS2 packages
-ros-humble-rosbridge-suite
-ros-humble-realsense2-camera   # not used currently; kept for reference
+ros-jazzy-rosbridge-suite
+ros-jazzy-realsense2-camera   # not used currently; kept for reference
 zed-ros2-wrapper               # ZED M camera
 
 # Python
