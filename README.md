@@ -463,7 +463,7 @@ haptic_teleop_il_study/
 │   ├── inference.py                 — policy rollout node (ROS2 + GPU process)
 │   └── launch_inference.py          — full inference pipeline launch
 │
-└── PIPELINE.md                      — this document
+└── README.md                        — this document
 ```
 
 **Note on `hdf5_to_zarr.py`:** This creates a *flat* (UMI-style ReplayBuffer) zarr
