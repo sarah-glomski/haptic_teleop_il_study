@@ -149,19 +149,23 @@ euler_xyz_deg = Rotation.from_matrix([c1,c2,c3]).as_euler('xyz', degrees=True)
 
 **Gripper:** normalized scalar from Kortex API. `0.0` = fully open, `1.0` = fully closed.
 
-### 4.2 Zarr Schema (per-episode groups)
+### 4.2 Zarr Schema (flat UMI-style)
 
 ```
 kinova_teleop.zarr/
-├── episode_0/
-│   ├── zed_front_rgb:      (T, 224, 224, 3)  uint8   HWC
-│   ├── dji_wrist_rgb:       (T, 224, 224, 3)  uint8   HWC
-│   ├── pose:               (T, 10)            float32 [xyz, rot6d, gripper_obs]
-│   ├── action:             (T, 10)            float32 [xyz, rot6d, gripper_cmd]
-│   └── piezense_pressure:  (T, 2)             float32 Pa
-├── episode_1/
-...
+├── data/
+│   ├── zed_front_rgb:      (N, 224, 224, 3)  uint8   HWC
+│   ├── dji_wrist_rgb:      (N, 224, 224, 3)  uint8   HWC
+│   ├── pose:               (N, 10)            float32 [xyz, rot6d, gripper_obs]
+│   ├── action:             (N, 10)            float32 [xyz, rot6d, gripper_cmd]
+│   └── piezense_pressure:  (N, 2)             float32 Pa
+└── meta/
+    └── episode_ends:       (E,)               int64   cumulative end indices
 ```
+
+`N` is the total number of frames across all episodes. `meta/episode_ends[i]` is the
+exclusive end index of episode `i` — e.g. `[120, 250, 390]` means episodes of length
+120, 130, and 140. Episode `i` spans `[episode_ends[i-1], episode_ends[i])`.
 
 Images are stored HWC (converted from CHW in HDF5) because the dataset loads them
 into `(obs_horizon, H, W, 3)` tensors and permutes to CHW for the encoder.
@@ -452,7 +456,7 @@ haptic_teleop_il_study/
 │   └── preflight_check.py           — topic/sensor health check
 │
 ├── training/
-│   ├── convert_data.py              — HDF5 → per-episode zarr (for training)
+│   ├── convert_data.py              — HDF5 → flat UMI-style zarr (for training)
 │   ├── kinova_dataset.py            — PyTorch Dataset class (KinovaImageDataset)
 │   ├── train.py                     — Hydra entry point
 │   └── config/
@@ -466,11 +470,12 @@ haptic_teleop_il_study/
 └── README.md                        — this document
 ```
 
-**Note on `hdf5_to_zarr.py`:** This creates a *flat* (UMI-style ReplayBuffer) zarr
-format with `data/` and `meta/episode_ends` — compatible with UMI training
-infrastructure. The `training/convert_data.py` creates a *per-episode* zarr
-format (compatible with `KinovaImageDataset`). Both represent the same data;
-choose based on which training infrastructure you want to use.
+**Note on zarr converters:** Both `data_collection/hdf5_to_zarr.py` and
+`training/convert_data.py` produce the same flat (UMI-style) zarr format with
+`data/` arrays and `meta/episode_ends`. `hdf5_to_zarr.py` writes additional
+passthrough keys (`joint_states`, `holo_palm_pose`, `holo_hand_width`,
+`holo_finger_tips`) useful for analysis; `convert_data.py` writes only the
+five keys needed for training.
 
 ---
 
