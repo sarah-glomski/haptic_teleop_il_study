@@ -38,26 +38,6 @@ from launch_ros.actions import Node
 
 _PYTHON = '/usr/bin/python3.12'
 
-# Piezense ROS2 workspace overlay (provides piezense_interfaces + piezense_ros)
-_PIEZENSE_WS = '/home/piezense/ros2_ws/install'
-
-# Piezense driver script
-_PIEZENSE_DRIVER = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'Piezense-ROS', 'ros2_ws', 'src', 'piezense_ros', 'piezense_ros', 'piezense_driver.py',
-)
-
-def _piezense_env():
-    """Environment with piezense workspace overlaid onto the ROS2 environment."""
-    env = dict(os.environ)
-    prefix = env.get('AMENT_PREFIX_PATH', '')
-    env['AMENT_PREFIX_PATH'] = f'{_PIEZENSE_WS}:{prefix}' if prefix else _PIEZENSE_WS
-    pypath = env.get('PYTHONPATH', '')
-    piezense_pypath = os.path.join(_PIEZENSE_WS, 'piezense_interfaces', 'local', 'lib',
-                                   'python3.12', 'dist-packages')
-    env['PYTHONPATH'] = f'{piezense_pypath}:{pypath}' if pypath else piezense_pypath
-    return env
-
 
 def generate_launch_description(robot_ip: str) -> LaunchDescription:
     d = os.path.dirname(os.path.abspath(__file__))
@@ -109,20 +89,12 @@ def generate_launch_description(robot_ip: str) -> LaunchDescription:
             output='screen',
         ),
 
-        # ── Piezense pressure sensor driver ───────────────────────────────────
-        # Publishes PiezenseSystemArray on piezense/data at 30 Hz.
-        # Input sensors are on system 0, channels 2 and 3.
-        # ExecuteProcess(
-        #     cmd=[
-        #         _PYTHON, _PIEZENSE_DRIVER,
-        #         '--ros-args',
-        #         '-p', 'systems:=[Piezense:4]',
-        #         '-p', 'hz:=30.0',
-        #     ],
-        #     name='piezense_driver',
-        #     output='screen',
-        #     additional_env=_piezense_env(),
-        # ),
+        # ── Piezense pressure sensor controller ───────────────────────────────
+        ExecuteProcess(
+            cmd=['ros2', 'launch', 'piezense_ros', 'ar_teleop_piezense_launch.py'],
+            name='piezense_driver',
+            output='screen',
+        ),
     ])
 
 
