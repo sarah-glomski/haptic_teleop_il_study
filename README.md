@@ -45,7 +45,7 @@ for the HoloLens 2 + Kinova Gen3 + PieZense imitation learning study.
 | `hand/gripper_cmd` | `Float32` | hololens_hand_node | kinova_hand_controller |
 | `/zed_front/zed_node/left/image_rect_color` | `Image` | zed_wrapper | hdf5_data_collector, inference |
 | `/dji_wrist/dji_wrist/color/image_raw` | `Image` | dji_camera_node | hdf5_data_collector, inference |
-| `piezense/data` | `PiezenseSystemArray` | piezense_driver | hdf5_data_collector, inference |
+| `piezense/data` | `PiezenseSystemArray` | ar_teleop_piezense_launch | hdf5_data_collector, inference |
 
 ---
 
@@ -396,8 +396,14 @@ misses ~6 ticks (node crash/freeze), the Kortex SDK stops the robot automaticall
 
 Piezense (`piezense/data`) is subscribed as a side-channel (not in the synchronized
 filter). If the driver is not running, `piezense_pressure` defaults to zeros, which
-the policy receives as a valid (if uninformative) observation. The piezense driver
+the policy receives as a valid (if uninformative) observation. The piezense controller
 must be running for tactile feedback to inform the policy.
+
+Both `launch_teleop.py` and `launch_data_collection.py` start the controller via:
+
+```bash
+ros2 launch piezense_ros ar_teleop_piezense_launch.py
+```
 
 ---
 
