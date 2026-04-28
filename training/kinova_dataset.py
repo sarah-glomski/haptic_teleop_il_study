@@ -1,13 +1,18 @@
 """
-KinovaImageDataset — per-episode zarr dataset for diffusion policy training.
+KinovaImageDataset — flat UMI-style zarr dataset for diffusion policy training.
 
-Reads the per-episode zarr format produced by convert_data.py and returns
-sliding-window samples compatible with TrainDiffusionUnetImageWorkspace.
+Reads the flat zarr format produced by convert_data.py:
+  data/zed_front_rgb       (N, 224, 224, 3) uint8
+  data/dji_wrist_rgb       (N, 224, 224, 3) uint8
+  data/pose                (N, 10) float32
+  data/action              (N, 10) float32
+  data/piezense_pressure   (N, 2)  float32
+  meta/episode_ends        (E,)    int64   cumulative end indices
 
 Each __getitem__ returns:
   obs:
     zed_front_rgb:      (obs_horizon, 3, 224, 224)  float32  [0, 1]
-    dji_wrist_rgb:       (obs_horizon, 3, 224, 224)  float32  [0, 1]
+    dji_wrist_rgb:      (obs_horizon, 3, 224, 224)  float32  [0, 1]
     pose:               (obs_horizon, 10)            float32
     piezense_pressure:  (obs_horizon, 2)             float32  Pa
   action:               (action_horizon, 10)         float32
@@ -43,44 +48,40 @@ class KinovaImageDataset(Dataset):
         self.action_horizon = action_horizon
 
         store = zarr.open(zarr_path, mode="r")
-        all_ep_names = sorted(store.group_keys())
+        episode_ends   = store["meta/episode_ends"][:]                  # (E,) int64
+        episode_starts = np.concatenate([[0], episode_ends[:-1]])       # (E,)
 
-        # Gather valid episodes (must have at least `horizon` frames)
+        # Gather valid episodes as (ep_idx, global_start, global_end)
         all_episodes = []
-        for ep_name in all_ep_names:
-            grp = store[ep_name]
-            T = grp["pose"].shape[0]
-            if T >= horizon:
-                all_episodes.append((ep_name, T))
+        for ep_idx, (s, e) in enumerate(zip(episode_starts.tolist(), episode_ends.tolist())):
+            if int(e) - int(s) >= horizon:
+                all_episodes.append((ep_idx, int(s), int(e)))
 
-        # Reproducible train/val split
+        # Reproducible train/val split by episode
         rng = np.random.RandomState(seed)
-        idx = rng.permutation(len(all_episodes))
+        perm = rng.permutation(len(all_episodes))
         n_val = max(1, int(len(all_episodes) * val_ratio))
-        val_set = set(idx[:n_val].tolist())
+        val_set = set(perm[:n_val].tolist())
 
         if _split == "train":
             self.episodes = [ep for i, ep in enumerate(all_episodes) if i not in val_set]
         else:
             self.episodes = [ep for i, ep in enumerate(all_episodes) if i in val_set]
 
-        # Build (ep_name, t_start) index for sliding windows
-        self.samples: list[tuple[str, int]] = []
-        for ep_name, T in self.episodes:
+        # Build list of global t_start indices (one per sliding-window sample)
+        self.samples: list[int] = []
+        for _, ep_start, ep_end in self.episodes:
+            T = ep_end - ep_start
             for t in range(T - horizon + 1):
-                self.samples.append((ep_name, t))
+                self.samples.append(ep_start + t)
 
         self._store = store
 
-        # Optionally preload all arrays into RAM
-        self._preloaded: dict[str, dict] | None = None
+        # Optionally preload all data arrays into RAM
+        self._preloaded: dict | None = None
         if preload:
-            self._preloaded = {}
-            for ep_name, _ in self.episodes:
-                grp = store[ep_name]
-                self._preloaded[ep_name] = {k: grp[k][:] for k in grp.array_keys()}
+            self._preloaded = {k: store["data"][k][:] for k in store["data"].array_keys()}
 
-        # Stash for get_validation_dataset
         self._val_ratio = val_ratio
         self._seed = seed
 
@@ -90,32 +91,29 @@ class KinovaImageDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
-        ep_name, t_start = self.samples[idx]
+        t_start = self.samples[idx]
+        t_obs_end = t_start + self.obs_horizon
+        t_act_end = t_start + self.action_horizon
 
-        if self._preloaded is not None:
-            grp = self._preloaded[ep_name]
-            def load(key, s, e): return grp[key][s:e]
-        else:
-            grp = self._store[ep_name]
-            def load(key, s, e): return grp[key][s:e]
+        data = self._preloaded if self._preloaded is not None else self._store["data"]
 
-        t_obs_start = t_start
-        t_obs_end   = t_start + self.obs_horizon
+        def load(key, s, e):
+            return data[key][s:e]
 
         # Images: (obs_horizon, H, W, 3) uint8 -> (obs_horizon, 3, H, W) float [0,1]
         def load_img(key):
-            imgs = load(key, t_obs_start, t_obs_end)  # (obs_h, H, W, 3)
+            imgs = load(key, t_start, t_obs_end)  # (obs_h, H, W, 3)
             return torch.from_numpy(imgs.copy()).permute(0, 3, 1, 2).float() / 255.0
 
         obs = {
             "zed_front_rgb":     load_img("zed_front_rgb"),
-            "dji_wrist_rgb":      load_img("dji_wrist_rgb"),
-            "pose":              torch.from_numpy(load("pose", t_obs_start, t_obs_end).copy()).float(),
-            "piezense_pressure": torch.from_numpy(load("piezense_pressure", t_obs_start, t_obs_end).copy()).float(),
+            "dji_wrist_rgb":     load_img("dji_wrist_rgb"),
+            "pose":              torch.from_numpy(load("pose",              t_start, t_obs_end).copy()).float(),
+            "piezense_pressure": torch.from_numpy(load("piezense_pressure", t_start, t_obs_end).copy()).float(),
         }
 
         action = torch.from_numpy(
-            load("action", t_start, t_start + self.action_horizon).copy()
+            load("action", t_start, t_act_end).copy()
         ).float()
 
         return {"obs": obs, "action": action}
@@ -135,27 +133,23 @@ class KinovaImageDataset(Dataset):
         )
 
     def get_normalizer(self, mode: str = "limits", **kwargs) -> LinearNormalizer:
-        """Compute per-key linear normalizers from full dataset statistics."""
+        """Compute per-key linear normalizers from the split's episodes."""
+        data_grp = self._store["data"]
         pose_all, action_all, piezense_all = [], [], []
 
-        for ep_name, _ in self.episodes:
-            grp = self._store[ep_name]
-            pose_all.append(grp["pose"][:])
-            action_all.append(grp["action"][:])
-            piezense_all.append(grp["piezense_pressure"][:])
-
-        pose_cat     = np.concatenate(pose_all,     axis=0)  # (N, 10)
-        action_cat   = np.concatenate(action_all,   axis=0)  # (N, 10)
-        piezense_cat = np.concatenate(piezense_all, axis=0)  # (N, 2)
+        for _, ep_start, ep_end in self.episodes:
+            pose_all.append(data_grp["pose"][ep_start:ep_end])
+            action_all.append(data_grp["action"][ep_start:ep_end])
+            piezense_all.append(data_grp["piezense_pressure"][ep_start:ep_end])
 
         normalizer = LinearNormalizer()
         normalizer.fit(
             data={
                 "obs": {
-                    "pose":              torch.from_numpy(pose_cat),
-                    "piezense_pressure": torch.from_numpy(piezense_cat),
+                    "pose":              torch.from_numpy(np.concatenate(pose_all)),
+                    "piezense_pressure": torch.from_numpy(np.concatenate(piezense_all)),
                 },
-                "action": torch.from_numpy(action_cat),
+                "action": torch.from_numpy(np.concatenate(action_all)),
             },
             last_n_dims=1,
             mode=mode,

@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-Convert Kinova Gen3 HDF5 teleop episodes to per-episode zarr for KinovaImageDataset.
+Convert Kinova Gen3 HDF5 teleop episodes to flat UMI-style zarr for KinovaImageDataset.
 
 Adapted from Robomimic/training/convert_data.py for the HoloLens + Kinova Gen3
 setup (ZED front + DJI wrist cameras, piezense pressure).
 
 Reads episode_*.hdf5 files produced by data_collection/hdf5_data_collector.py,
 converts quaternion poses to 10D [x,y,z,rot6d(6),gripper] using scipy,
-resizes images to 224x224, and writes a zarr store with per-episode groups
-compatible with KinovaImageDataset.
+resizes images to 224x224, and writes a flat zarr store compatible with
+KinovaImageDataset.
 
 Output zarr schema:
   output.zarr/
-  ├── episode_0/
-  │   ├── zed_front_rgb:      (T, 224, 224, 3)  uint8   HWC
-  │   ├── dji_wrist_rgb:       (T, 224, 224, 3)  uint8   HWC
-  │   ├── pose:               (T, 10)            float32 [xyz, rot6d, gripper_obs]
-  │   ├── action:             (T, 10)            float32 [xyz, rot6d, gripper_cmd]
-  │   └── piezense_pressure:  (T, 2)             float32 input channel pressures (Pa)
-  ├── episode_1/
-  │   └── ...
+  ├── data/
+  │   ├── zed_front_rgb:      (N, 224, 224, 3)  uint8   HWC
+  │   ├── dji_wrist_rgb:      (N, 224, 224, 3)  uint8   HWC
+  │   ├── pose:               (N, 10)            float32 [xyz, rot6d, gripper_obs]
+  │   ├── action:             (N, 10)            float32 [xyz, rot6d, gripper_cmd]
+  │   └── piezense_pressure:  (N, 2)             float32 input channel pressures (Pa)
+  └── meta/
+      └── episode_ends:       (E,)               int64   cumulative end indices
 
 Usage:
     python convert_data.py --input ../data_collection/demo_data --output kinova_teleop.zarr
@@ -48,7 +48,6 @@ CAMERA_KEYS = {
 def quat_xyzw_to_10d(pose_7: np.ndarray, gripper: np.ndarray) -> np.ndarray:
     """Convert (T,7) [x,y,z,qx,qy,qz,qw] + (T,) gripper to (T,10) [xyz,rot6d,grip].
 
-    HDF5 stores pose in ROS/scipy convention: quaternion [qx, qy, qz, qw].
     Rotation 6D = first two columns of the rotation matrix concatenated.
     """
     xyz = pose_7[:, :3]
@@ -79,66 +78,81 @@ def convert(input_dir: str, output_path: str, max_episodes: int = None):
         h5_files = h5_files[:max_episodes]
 
     print(f"Found {len(h5_files)} episode(s) in {input_dir}")
-    store = zarr.open(output_path, mode="w")
+
+    root     = zarr.open(output_path, mode="w")
+    data_grp = root.require_group("data")
+    meta_grp = root.require_group("meta")
+
+    initialized = False
+    total_frames = 0
 
     for ep_idx, h5_path in enumerate(h5_files):
-        ep_name = f"episode_{ep_idx}"
-        print(f"  [{ep_idx + 1}/{len(h5_files)}] {h5_path.name} -> {ep_name}")
+        print(f"  [{ep_idx + 1}/{len(h5_files)}] {h5_path.name} ", end="")
 
         with h5py.File(h5_path, "r") as f:
-            # Robot pose and action (quaternion -> 10D)
-            obs_pose = f["observation/pose"][:]     # (T, 7)
-            obs_grip = f["observation/gripper"][:]  # (T,)
-            act_pose = f["action/pose"][:]          # (T, 7)
-            act_grip = f["action/gripper"][:]       # (T,)
+            obs_pose = f["observation/pose"][:]
+            obs_grip = f["observation/gripper"][:]
+            act_pose = f["action/pose"][:]
+            act_grip = f["action/gripper"][:]
 
             pose_10d   = quat_xyzw_to_10d(obs_pose, obs_grip)
             action_10d = quat_xyzw_to_10d(act_pose, act_grip)
             T = pose_10d.shape[0]
 
-            grp = store.create_group(ep_name)
-
-            # Camera images
+            cam_data = {}
             for h5_key, zarr_key in CAMERA_KEYS.items():
-                if h5_key not in f:
-                    print(f"    Warning: {h5_key} not found, skipping")
-                    continue
-                raw = f[h5_key][:]  # (T, 3, H, W) CHW uint8
-                resized = resize_images(raw, IMG_SIZE)  # (T, 224, 224, 3) HWC
-                grp.create_dataset(
-                    zarr_key, data=resized,
-                    chunks=(1, IMG_SIZE, IMG_SIZE, 3), dtype="uint8",
-                )
-                print(f"    {zarr_key}: {resized.shape}")
+                if h5_key in f:
+                    cam_data[zarr_key] = resize_images(f[h5_key][:], IMG_SIZE)
+                else:
+                    print(f"\n    Warning: {h5_key} not found, skipping")
 
-            # Robot state
-            grp.create_dataset("pose",   data=pose_10d,   chunks=(T, 10), dtype="float32")
-            grp.create_dataset("action", data=action_10d, chunks=(T, 10), dtype="float32")
-            print(f"    pose: {pose_10d.shape}  action: {action_10d.shape}")
-
-            # Piezense pressure (2 input channels)
             if "piezense/pressure_input" in f:
-                piezense = f["piezense/pressure_input"][:].astype(np.float32)  # (T, 2)
+                piezense = f["piezense/pressure_input"][:].astype(np.float32)
             else:
-                print("    Warning: piezense/pressure_input not found, writing zeros")
+                print("\n    Warning: piezense/pressure_input not found, writing zeros")
                 piezense = np.zeros((T, 2), dtype=np.float32)
-            grp.create_dataset("piezense_pressure", data=piezense,
-                               chunks=(min(T, 1000), 2), dtype="float32")
-            print(f"    piezense_pressure: {piezense.shape}")
 
-    print(f"\nDone. Zarr store written to {output_path}")
-    print(f"Total episodes: {len(h5_files)}")
+        ep_data = {
+            "pose":              pose_10d,
+            "action":            action_10d,
+            "piezense_pressure": piezense,
+            **cam_data,
+        }
 
-    z = zarr.open(output_path, mode="r")
-    for ep in sorted(z.group_keys()):
-        g = z[ep]
-        shapes = {k: g[k].shape for k in g.array_keys()}
-        print(f"  {ep}: {shapes}")
+        if not initialized:
+            for key, val in ep_data.items():
+                shape  = (0,) + val.shape[1:]
+                chunks = (1,) + val.shape[1:] if val.ndim >= 3 else (min(T, 1000),) + val.shape[1:]
+                data_grp.zeros(key, shape=shape, chunks=chunks, dtype=val.dtype)
+            meta_grp.zeros("episode_ends", shape=(0,), dtype=np.int64, compressor=None)
+            initialized = True
+
+        # Append this episode to each flat array
+        curr = total_frames
+        new  = curr + T
+        for key, val in ep_data.items():
+            arr = data_grp[key]
+            arr.resize((new,) + val.shape[1:])
+            arr[curr:new] = val
+
+        ends = meta_grp["episode_ends"]
+        ends.resize(ends.shape[0] + 1)
+        ends[-1] = new
+        total_frames = new
+
+        print(f"({T} frames, cumulative={new})")
+
+    print(f"\nDone. Zarr written to {output_path}")
+    print(f"Total frames : {total_frames}")
+    print(f"episode_ends : {meta_grp['episode_ends'][:]}")
+    for key in sorted(data_grp.array_keys()):
+        arr = data_grp[key]
+        print(f"  data/{key:25s}  {arr.shape}  {arr.dtype}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert Kinova Gen3 HDF5 episodes to per-episode zarr"
+        description="Convert Kinova Gen3 HDF5 episodes to flat UMI-style zarr"
     )
     parser.add_argument(
         "--input", type=str,
