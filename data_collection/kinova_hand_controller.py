@@ -45,6 +45,9 @@ Subscribed topics:
   hand/tracking_active std_msgs/Bool
   /reset_kinova        std_msgs/Bool
   /pause_kinova        std_msgs/Bool
+  /wrist_tracking      std_msgs/String    — "true"/"false"; gates arm movement (HoloLens Arm button)
+  /gripper_movement    std_msgs/String    — "true"/"false"; gates gripper (HoloLens Gripper button)
+  /vertical_only       std_msgs/String    — "true"/"false"; restricts motion to Z-axis only
 
 Published topics:
   robot_action/pose    geometry_msgs/PoseStamped
@@ -81,7 +84,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from scipy.spatial.transform import Rotation as R
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, String
 
 from kortex_api.TCPTransport import TCPTransport
 from kortex_api.RouterClient import RouterClient
@@ -170,12 +173,20 @@ class KinovaHandController(Node):
         self.hand_tracking_active  = False
         self._smoothed_vel         = np.zeros(3)  # exponentially smoothed velocity
 
+        # ── HoloLens safety gates (all off by default) ──────────────────────────
+        self.arm_enabled     = False  # /wrist_tracking "true" to enable arm movement
+        self.gripper_enabled = False  # /gripper_movement "true" to enable gripper
+        self.vertical_only   = False  # /vertical_only "true" to restrict to Z-axis
+
         # ── Subscriptions ───────────────────────────────────────────────────────
         self.create_subscription(PoseStamped, 'hand/pose',            self._hand_pose_cb,       10)
         self.create_subscription(Float32,     'hand/gripper_cmd',     self._gripper_cb,         10)
         self.create_subscription(Bool,        'hand/tracking_active', self._tracking_status_cb, 10)
         self.create_subscription(Bool,        '/reset_kinova',        self._reset_cb,           10)
         self.create_subscription(Bool,        '/pause_kinova',        self._pause_cb,           10)
+        self.create_subscription(String,      '/wrist_tracking',      self._arm_toggle_cb,      10)
+        self.create_subscription(String,      '/gripper_movement',    self._gripper_toggle_cb,  10)
+        self.create_subscription(String,      '/vertical_only',       self._vertical_toggle_cb, 10)
 
         # ── Publishers ──────────────────────────────────────────────────────────
         self.action_pose_pub    = self.create_publisher(PoseStamped, 'robot_action/pose',    10)
@@ -264,7 +275,7 @@ class KinovaHandController(Node):
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     def _hand_pose_cb(self, msg: PoseStamped):
-        if self.is_resetting or self.is_paused:
+        if self.is_resetting or self.is_paused or not self.arm_enabled:
             return
 
         raw_pos = np.array([
@@ -272,7 +283,13 @@ class KinovaHandController(Node):
             msg.pose.position.y,
             msg.pose.position.z,
         ])
-        self.target_position = self._clip_to_workspace(raw_pos)
+        clipped = self._clip_to_workspace(raw_pos)
+
+        if self.vertical_only and self.target_position is not None:
+            # Freeze X/Y at their current values; only track Z
+            self.target_position[2] = clipped[2]
+        else:
+            self.target_position = clipped
 
         # Wrist yaw from palm orientation
         o = msg.pose.orientation
@@ -285,7 +302,7 @@ class KinovaHandController(Node):
         self._publish_action_pose(self.target_position, msg.header.stamp)
 
     def _gripper_cb(self, msg: Float32):
-        if self.is_resetting or self.is_paused:
+        if self.is_resetting or self.is_paused or not self.gripper_enabled:
             return
 
         self.gripper_cmd = float(np.clip(msg.data, 0.0, 1.0))
@@ -311,6 +328,29 @@ class KinovaHandController(Node):
             actual = self.gripper_cmd
 
         self.action_gripper_pub.publish(Float32(data=actual))
+
+    def _arm_toggle_cb(self, msg: String):
+        enabled = msg.data.strip().lower() == 'true'
+        if self.arm_enabled and not enabled:
+            self.target_position = None
+            self._smoothed_vel[:] = 0.0
+            self._send_zero_twist()
+            self.get_logger().info('Arm tracking disabled — robot stopped')
+        elif not self.arm_enabled and enabled:
+            self.get_logger().info('Arm tracking enabled')
+        self.arm_enabled = enabled
+
+    def _gripper_toggle_cb(self, msg: String):
+        enabled = msg.data.strip().lower() == 'true'
+        if enabled != self.gripper_enabled:
+            self.get_logger().info(f'Gripper control {"enabled" if enabled else "disabled"}')
+        self.gripper_enabled = enabled
+
+    def _vertical_toggle_cb(self, msg: String):
+        v_only = msg.data.strip().lower() == 'true'
+        if v_only != self.vertical_only:
+            self.get_logger().info(f'Vertical-only mode {"enabled" if v_only else "disabled"}')
+        self.vertical_only = v_only
 
     def _tracking_status_cb(self, msg: Bool):
         was_active = self.hand_tracking_active
