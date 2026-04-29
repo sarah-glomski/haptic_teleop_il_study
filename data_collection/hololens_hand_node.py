@@ -51,6 +51,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
+from rcl_interfaces.msg import SetParametersResult
 from std_msgs.msg import Float32, Bool, Float32MultiArray
 
 
@@ -136,6 +137,9 @@ class HoloLensHandNode(Node):
         # ── Processing timer at 30 Hz ───────────────────────────────────────────
         self.create_timer(1.0 / 30.0, self._process_and_publish)
 
+        # ── Live parameter tuning ───────────────────────────────────────────────
+        self.add_on_set_parameters_callback(self._on_parameter_change)
+
         self.get_logger().info('HoloLens Hand Node initialized')
 
     # ── Callbacks (just store latest message) ───────────────────────────────
@@ -184,6 +188,23 @@ class HoloLensHandNode(Node):
             holo_pos[1] * self.ws_y_scale + self.ws_y_offset,
             holo_pos[2] * self.ws_z_scale + self.ws_z_offset,
         ], dtype=np.float32)
+
+    # ── Live parameter updates ────────────────────────────────────────────────
+    def _on_parameter_change(self, params):
+        for p in params:
+            if p.name == 'filter_alpha':
+                self._pos_filter.alpha = float(p.value)
+                self.get_logger().info(f'filter_alpha → {p.value}')
+            elif p.name == 'grip_alpha':
+                self._grip_filter.alpha = float(p.value)
+                self.get_logger().info(f'grip_alpha → {p.value}')
+            elif p.name == 'pinch_close_m':
+                self.pinch_close_m = float(p.value)
+                self.get_logger().info(f'pinch_close_m → {p.value}')
+            elif p.name == 'pinch_open_m':
+                self.pinch_open_m = float(p.value)
+                self.get_logger().info(f'pinch_open_m → {p.value}')
+        return SetParametersResult(successful=True)
 
     # ── Main processing loop ─────────────────────────────────────────────────
     def _process_and_publish(self):

@@ -84,6 +84,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from scipy.spatial.transform import Rotation as R
+from rcl_interfaces.msg import SetParametersResult
 from std_msgs.msg import Bool, Float32, String
 
 from kortex_api.TCPTransport import TCPTransport
@@ -194,6 +195,9 @@ class KinovaHandController(Node):
 
         # ── Control loop ────────────────────────────────────────────────────────
         self.create_timer(1.0 / self.control_rate, self._control_loop)
+
+        # ── Live parameter tuning ───────────────────────────────────────────────
+        self.add_on_set_parameters_callback(self._on_parameter_change)
 
     # ── Robot connection ──────────────────────────────────────────────────────
     def _connect(self):
@@ -328,6 +332,17 @@ class KinovaHandController(Node):
             actual = self.gripper_cmd
 
         self.action_gripper_pub.publish(Float32(data=actual))
+
+    # ── Live parameter updates ────────────────────────────────────────────────
+    def _on_parameter_change(self, params):
+        for p in params:
+            if p.name == 'vel_alpha':
+                self.vel_alpha = float(p.value)
+                self.get_logger().info(f'vel_alpha → {p.value}')
+            elif p.name == 'p_gain':
+                self.p_gain = float(p.value)
+                self.get_logger().info(f'p_gain → {p.value}')
+        return SetParametersResult(successful=True)
 
     def _arm_toggle_cb(self, msg: String):
         enabled = msg.data.strip().lower() == 'true'
