@@ -76,6 +76,15 @@ HoloLens startup checklist:
 - Press **Arm** to enable wrist tracking
 - Press **Gripper** to enable thumb-index gripper control
 
+> **Wrist orientation neutral pose**: When you press **Arm**, the controller snapshots
+> your current palm yaw and the robot's current `theta_z`. All subsequent wrist rotation
+> is tracked as a *delta* from that reference — the robot stays put at program start and
+> only follows your relative wrist rotation. Hold your hand in your intended neutral pose
+> (palm facing down, natural forearm position) when pressing **Arm**. The log line
+> `Wrist reference captured: palm_yaw=X° robot_theta_z=Y°` confirms the snapshot.
+> If the robot drifts rotationally after a tracking dropout, re-press **Arm** to
+> recapture the reference.
+
 Stop with `Ctrl-C` — the watchdog halts the robot within 200 ms.
 
 ## Preflight Check

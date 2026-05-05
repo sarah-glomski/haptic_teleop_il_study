@@ -174,6 +174,12 @@ class KinovaHandController(Node):
         self.hand_tracking_active  = False
         self._smoothed_vel         = np.zeros(3)  # exponentially smoothed velocity
 
+        # Reference yaw for relative wrist tracking: captured once when arm tracking
+        # first enables so the robot holds its current orientation at start and only
+        # responds to delta rotation from the user's neutral hand pose.
+        self._ref_yaw: float | None = None
+        self._ref_theta_z: float = self.home_tz
+
         # ── HoloLens safety gates (all off by default) ──────────────────────────
         self.arm_enabled     = False  # /wrist_tracking "true" to enable arm movement
         self.gripper_enabled = False  # /gripper_movement "true" to enable gripper
@@ -301,7 +307,26 @@ class KinovaHandController(Node):
             2.0 * (o.w * o.z + o.x * o.y),
             1.0 - 2.0 * (o.y * o.y + o.z * o.z),
         )
-        self.target_theta_z_deg = self.fixed_theta_z_offset + math.degrees(yaw_rad)
+        yaw_deg = math.degrees(yaw_rad)
+
+        # On the first callback after arm tracking is enabled, snapshot the current
+        # palm yaw and the robot's actual theta_z so we track *delta* rotation only.
+        # This prevents a large jump-to-target when the HoloLens frame doesn't align
+        # with the robot frame.
+        if self._ref_yaw is None:
+            self._ref_yaw = yaw_deg
+            try:
+                fb = self._base_cyclic.RefreshFeedback()
+                self._ref_theta_z = fb.base.tool_pose_theta_z
+            except Exception:
+                self._ref_theta_z = self.home_tz
+            self.get_logger().info(
+                f'Wrist reference captured: palm_yaw={yaw_deg:.1f}°  robot_theta_z={self._ref_theta_z:.1f}°'
+            )
+
+        delta_yaw = yaw_deg - self._ref_yaw
+        delta_yaw = (delta_yaw + 180.0) % 360.0 - 180.0  # wrap to [-180, 180]
+        self.target_theta_z_deg = self.fixed_theta_z_offset + self._ref_theta_z + delta_yaw
 
         self._publish_action_pose(self.target_position, msg.header.stamp)
 
@@ -349,10 +374,12 @@ class KinovaHandController(Node):
         if self.arm_enabled and not enabled:
             self.target_position = None
             self._smoothed_vel[:] = 0.0
+            self._ref_yaw = None  # reset so next enable captures a fresh reference
             self._send_zero_twist()
             self.get_logger().info('Arm tracking disabled — robot stopped')
         elif not self.arm_enabled and enabled:
-            self.get_logger().info('Arm tracking enabled')
+            self._ref_yaw = None  # will be captured on first pose callback
+            self.get_logger().info('Arm tracking enabled — wrist reference will be captured on first pose')
         self.arm_enabled = enabled
 
     def _gripper_toggle_cb(self, msg: String):
@@ -373,6 +400,7 @@ class KinovaHandController(Node):
         if was_active and not self.hand_tracking_active:
             self.target_position = None
             self._smoothed_vel[:] = 0.0
+            self._ref_yaw = None  # reset so re-acquisition captures a fresh reference
             self._send_zero_twist()
             self.get_logger().warn('Hand tracking lost — robot stopped')
 
