@@ -71,6 +71,7 @@ ROS2 Parameters:
   fixed_theta_x_deg           float  180.0
   fixed_theta_y_deg           float  0.0
   fixed_theta_z_offset_deg    float  0.0
+  position_scale              float  1.0   hand-motion → robot-motion scale (all axes)
   p_gain                      float  2.0
   ── Home position (m / deg) ──────────────────────────────────────────────
   home_x / home_y / home_z    float  0.474 / 0.02 / 0.107
@@ -139,6 +140,7 @@ class KinovaHandController(Node):
         self.fixed_theta_x        = self.declare_parameter('fixed_theta_x_deg',        180.0).value
         self.fixed_theta_y        = self.declare_parameter('fixed_theta_y_deg',          0.0).value
         self.fixed_theta_z_offset = self.declare_parameter('fixed_theta_z_offset_deg',   0.0).value
+        self.position_scale       = self.declare_parameter('position_scale',              1.0).value
         self.p_gain               = self.declare_parameter('p_gain',                    2.0).value
 
         self.home_x  = self.declare_parameter('home_x',   0.474).value
@@ -176,11 +178,13 @@ class KinovaHandController(Node):
         self.hand_tracking_active  = False
         self._smoothed_vel         = np.zeros(3)  # exponentially smoothed velocity
 
-        # Reference yaw for relative wrist tracking: captured once when arm tracking
-        # first enables so the robot holds its current orientation at start and only
-        # responds to delta rotation from the user's neutral hand pose.
+        # References captured at arm-enable (after settling).
+        # Position uses a delta approach: target = ref_robot_pos + (holo - ref_holo) * scale,
+        # so workspace offsets in hololens_hand_node cancel out and no calibration is needed.
         self._ref_yaw: float | None = None
         self._ref_theta_z: float = self.home_tz
+        self._ref_holo_pos: np.ndarray | None = None
+        self._ref_robot_pos: np.ndarray | None = None
         # Monotonic time when arm tracking was last enabled.  Reference capture is
         # deferred 0.5 s to let MRTK hand tracking stabilise — MRTK can return
         # tracked=True with identity rotation for 1-2 frames on first acquisition,
@@ -309,6 +313,8 @@ class KinovaHandController(Node):
         self.target_position = None
         self._smoothed_vel[:] = 0.0
         self._ref_yaw = None
+        self._ref_holo_pos = None
+        self._ref_robot_pos = None
         self.get_logger().error(
             'ROBOT FAULT DETECTED — arm motion disabled. '
             'Auto-clear will be attempted every 3 s. '
@@ -343,12 +349,17 @@ class KinovaHandController(Node):
         ))
 
     def _hand_pose_cb(self, msg: PoseStamped):
+        current_holo_pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+
         # ── Always publish goal pose for visualization ────────────────────────
-        # Computed before any arm-enabled / fault / settling guards so RViz and
-        # ros2 topic echo show live 3-D coordinates even when the arm is off.
-        raw_pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
-        goal_pos = self._clip_to_workspace(raw_pos)
+        # Uses the delta approach so the goal reflects where the robot would be,
+        # not the raw (uncalibrated) HoloLens world position.
         raw_yaw = self._palm_yaw_deg(msg.pose.orientation)
+        if self._ref_holo_pos is not None and self._ref_robot_pos is not None:
+            delta = (current_holo_pos - self._ref_holo_pos) * self.position_scale
+            goal_pos = self._clip_to_workspace(self._ref_robot_pos + delta)
+        else:
+            goal_pos = np.array([self.home_x, self.home_y, self.home_z])
         if self._ref_yaw is not None:
             d = (raw_yaw - self._ref_yaw + 180.0) % 360.0 - 180.0
             goal_theta_z = self.fixed_theta_z_offset + self._ref_theta_z + d
@@ -363,41 +374,44 @@ class KinovaHandController(Node):
         # Hold robot completely still for 0.5 s after arm tracking is enabled.
         # MRTK can return tracked=True with identity rotation for the first 1-2
         # frames on hand acquisition; capturing that as the yaw reference produces
-        # wrong wrist commands.  During settling neither position nor orientation
-        # targets are updated so the control loop sends zero velocity.
+        # wrong wrist commands.  During settling no targets are updated.
         if self._ref_yaw is None:
             if time.monotonic() - self._arm_enabled_at < 0.5:
                 return  # still settling — don't move yet
-            # Capture reference from the first stable pose
+            # Capture all references from the first stable pose
             yaw_deg = self._palm_yaw_deg(msg.pose.orientation)
             self._ref_yaw = yaw_deg
+            self._ref_holo_pos = current_holo_pos.copy()
             try:
                 fb = self._base_cyclic.RefreshFeedback()
                 self._ref_theta_z = fb.base.tool_pose_theta_z
+                self._ref_robot_pos = np.array([
+                    fb.base.tool_pose_x,
+                    fb.base.tool_pose_y,
+                    fb.base.tool_pose_z,
+                ])
             except Exception:
                 self._ref_theta_z = self.home_tz
-            # Z diagnostic: move your hand up/down and verify holo_pos.z changes.
-            # If z stays constant while x changes instead, the HoloLens height axis
-            # is being published as x — swap the axis mapping in
-            # hololens_hand_node._to_robot_frame.
+                self._ref_robot_pos = np.array([self.home_x, self.home_y, self.home_z])
             self.get_logger().info(
-                f'Wrist reference captured (after settling): '
+                f'Reference captured (after settling): '
                 f'palm_yaw={yaw_deg:.1f}°  robot_theta_z={self._ref_theta_z:.1f}°  '
-                f'holo_pos=({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f}, {msg.pose.position.z:.3f})'
+                f'robot_pos=({self._ref_robot_pos[0]:.3f}, {self._ref_robot_pos[1]:.3f}, {self._ref_robot_pos[2]:.3f})  '
+                f'holo_pos=({current_holo_pos[0]:.3f}, {current_holo_pos[1]:.3f}, {current_holo_pos[2]:.3f})'
             )
 
-        # ── Position target ───────────────────────────────────────────────────
-        clipped = self._clip_to_workspace(raw_pos)
+        # ── Position target (delta from reference) ────────────────────────────
+        delta = (current_holo_pos - self._ref_holo_pos) * self.position_scale
+        clipped = self._clip_to_workspace(self._ref_robot_pos + delta)
 
         if self.vertical_only and self.target_position is not None:
-            # Freeze X/Y at their current values; only track Z
             self.target_position[2] = clipped[2]
         else:
             self.target_position = clipped
 
         # ── Orientation target (delta wrist yaw) ──────────────────────────────
         yaw_deg = self._palm_yaw_deg(msg.pose.orientation)
-        delta_yaw = (yaw_deg - self._ref_yaw + 180.0) % 360.0 - 180.0  # wrap to [-180, 180]
+        delta_yaw = (yaw_deg - self._ref_yaw + 180.0) % 360.0 - 180.0
         self.target_theta_z_deg = self.fixed_theta_z_offset + self._ref_theta_z + delta_yaw
 
         self._publish_pose(self.action_pose_pub, self.target_position, self.target_theta_z_deg, msg.header.stamp)
@@ -447,6 +461,9 @@ class KinovaHandController(Node):
             elif p.name == 'p_gain':
                 self.p_gain = float(p.value)
                 self.get_logger().info(f'p_gain → {p.value}')
+            elif p.name == 'position_scale':
+                self.position_scale = float(p.value)
+                self.get_logger().info(f'position_scale → {p.value}')
         return SetParametersResult(successful=True)
 
     def _arm_toggle_cb(self, msg: String):
@@ -454,11 +471,15 @@ class KinovaHandController(Node):
         if self.arm_enabled and not enabled:
             self.target_position = None
             self._smoothed_vel[:] = 0.0
-            self._ref_yaw = None  # reset so next enable captures a fresh reference
+            self._ref_yaw = None
+            self._ref_holo_pos = None
+            self._ref_robot_pos = None
             self._send_zero_twist()
             self.get_logger().info('Arm tracking disabled — robot stopped')
         elif not self.arm_enabled and enabled:
             self._ref_yaw = None
+            self._ref_holo_pos = None
+            self._ref_robot_pos = None
             self._arm_enabled_at = time.monotonic()
             self.get_logger().info(
                 'Arm tracking enabled — robot held still for 0.5 s while MRTK tracking settles, '
@@ -485,6 +506,8 @@ class KinovaHandController(Node):
             self.target_position = None
             self._smoothed_vel[:] = 0.0
             self._ref_yaw = None
+            self._ref_holo_pos = None
+            self._ref_robot_pos = None
             self._arm_enabled_at = time.monotonic()  # re-settle when tracking resumes
             self._send_zero_twist()
             self.get_logger().warn('Hand tracking lost — robot stopped; will re-settle on re-acquisition')
