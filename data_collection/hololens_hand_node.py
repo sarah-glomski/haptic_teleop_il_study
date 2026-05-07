@@ -25,8 +25,10 @@ Subscribed topics (from HoloLens Unity app via rosbridge):
 ROS2 Parameters:
   pinch_close_m   float  0.025  distance (m) below which gripper fully closes
   pinch_open_m    float  0.10   distance (m) above which gripper fully opens
-  filter_alpha    float  0.3    low-pass position filter coefficient (0=heavy, 1=raw)
-  grip_alpha      float  0.2    low-pass gripper filter coefficient
+  filter_alpha    float  0.3    low-pass position filter (0=heavy smoothing, 1=raw)
+  grip_alpha      float  0.6    gripper EMA alpha — higher = lower latency, less smoothing
+                                95% step response ≈ 3 / (alpha × 30 Hz):
+                                  0.2 → ~500 ms | 0.5 → ~200 ms | 0.8 → ~125 ms | 1.0 → ~33 ms
 
   Workspace transform — maps HoloLens Unity world frame to robot base_link frame.
   The HoloLens publishes poses in the Unity world frame (already converted to ROS
@@ -88,7 +90,14 @@ class HoloLensHandNode(Node):
         self.pinch_close_m = self.declare_parameter('pinch_close_m', 0.025).value
         self.pinch_open_m  = self.declare_parameter('pinch_open_m',  0.10).value
         filter_alpha       = self.declare_parameter('filter_alpha',  0.3).value
-        grip_alpha         = self.declare_parameter('grip_alpha',    0.2).value
+        # Gripper EMA alpha: higher = faster response, less smoothing.
+        # 95 % step response ≈ 3 / (alpha * 30 Hz).
+        #   alpha 0.2 → ~500 ms   (smooth, laggy)
+        #   alpha 0.5 → ~200 ms   (balanced)
+        #   alpha 0.8 → ~125 ms   (responsive, some jitter)
+        #   alpha 1.0 → raw, ~33 ms (no filtering)
+        # Tune live: ros2 param set /hololens_hand_node grip_alpha <value>
+        grip_alpha         = self.declare_parameter('grip_alpha',    0.6).value
 
         self.ws_x_offset = self.declare_parameter('workspace_x_offset', 0.4).value
         self.ws_y_offset = self.declare_parameter('workspace_y_offset', 0.0).value
