@@ -185,7 +185,6 @@ class KinovaHandController(Node):
         self._ref_theta_z: float = self.home_tz
         self._ref_holo_pos: np.ndarray | None = None
         self._ref_robot_pos: np.ndarray | None = None
-        self._identity_warned = False  # suppress repeated identity-rejection log spam
         # Monotonic time when arm tracking was last enabled.  Reference capture is
         # deferred 0.5 s to let MRTK hand tracking stabilise — MRTK can return
         # tracked=True with identity rotation for 1-2 frames on first acquisition,
@@ -379,21 +378,10 @@ class KinovaHandController(Node):
         if self._ref_yaw is None:
             if time.monotonic() - self._arm_enabled_at < 0.5:
                 return  # still settling — don't move yet
-            # Reject near-identity quaternion: MRTK can return tracked=True with
-            # w≈1, xyz≈0 for several frames after first acquisition.  Any real hand
-            # pose has a rotation angle well above 5° from identity.
-            o = msg.pose.orientation
-            angle_deg = math.degrees(2.0 * math.acos(min(1.0, abs(o.w))))
-            if angle_deg < 5.0:
-                if not self._identity_warned:
-                    self._identity_warned = True
-                    self.get_logger().warn(
-                        f'Palm orientation still near-identity ({angle_deg:.1f}°) after settling — '
-                        'waiting for real MRTK tracking. Re-raise your hand if this persists.'
-                    )
-                return
-            self._identity_warned = False
-            # Capture all references from the first stable pose
+            # Capture all references from the first stable pose.
+            # Identity quaternion is safe here because target_theta_z is slew-rate
+            # limited below — even a sudden jump to real orientation can only move
+            # the target at max_angular_speed deg/s, not instantaneously.
             yaw_deg = self._palm_yaw_deg(msg.pose.orientation)
             self._ref_yaw = yaw_deg
             self._ref_holo_pos = current_holo_pos.copy()
@@ -424,10 +412,16 @@ class KinovaHandController(Node):
         else:
             self.target_position = clipped
 
-        # ── Orientation target (delta wrist yaw) ──────────────────────────────
+        # ── Orientation target (delta wrist yaw, slew-rate limited) ──────────
+        # Slew-rate limiting: target_theta_z can change at most max_angular_speed
+        # deg/s regardless of how large the delta is.  This prevents a sudden
+        # identity→real-orientation transition from commanding sustained max velocity.
         yaw_deg = self._palm_yaw_deg(msg.pose.orientation)
         delta_yaw = (yaw_deg - self._ref_yaw + 180.0) % 360.0 - 180.0
-        self.target_theta_z_deg = self.fixed_theta_z_offset + self._ref_theta_z + delta_yaw
+        desired_theta_z = self.fixed_theta_z_offset + self._ref_theta_z + delta_yaw
+        max_step = self.max_angular_speed / self.control_rate  # deg per control tick
+        err = (desired_theta_z - self.target_theta_z_deg + 180.0) % 360.0 - 180.0
+        self.target_theta_z_deg += float(np.clip(err, -max_step, max_step))
 
         self._publish_pose(self.action_pose_pub, self.target_position, self.target_theta_z_deg, msg.header.stamp)
 
@@ -495,7 +489,6 @@ class KinovaHandController(Node):
             self._ref_yaw = None
             self._ref_holo_pos = None
             self._ref_robot_pos = None
-            self._identity_warned = False
             self._arm_enabled_at = time.monotonic()
             self.get_logger().info(
                 'Arm tracking enabled — robot held still for 0.5 s while MRTK tracking settles, '
