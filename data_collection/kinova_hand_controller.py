@@ -68,9 +68,9 @@ ROS2 Parameters:
   workspace_z_min / z_max     float  0.025 / 0.30  m
   workspace_soft_margin_m     float  0.04   soft deceleration zone (m from wall)
   ── EEF orientation ──────────────────────────────────────────────────────
-  fixed_theta_x_deg           float  180.0
-  fixed_theta_y_deg           float  0.0
-  fixed_theta_z_offset_deg    float  0.0
+  fixed_theta_x_deg           float  -179.3  (home roll)
+  fixed_theta_y_deg           float    -0.4  (home pitch)
+  fixed_theta_z_offset_deg    float     0.0  added to home_tz (89.3) → fixed yaw = 89.3°
   position_scale              float  1.0   hand-motion → robot-motion scale (all axes)
   p_gain                      float  2.0
   ── Home position (m / deg) ──────────────────────────────────────────────
@@ -137,8 +137,8 @@ class KinovaHandController(Node):
         self.z_max = self.declare_parameter('workspace_z_max',  0.30).value
         self.soft_margin = self.declare_parameter('workspace_soft_margin_m', 0.01).value
 
-        self.fixed_theta_x        = self.declare_parameter('fixed_theta_x_deg',        180.0).value
-        self.fixed_theta_y        = self.declare_parameter('fixed_theta_y_deg',          0.0).value
+        self.fixed_theta_x        = self.declare_parameter('fixed_theta_x_deg',       -179.3).value
+        self.fixed_theta_y        = self.declare_parameter('fixed_theta_y_deg',          -0.4).value
         self.fixed_theta_z_offset = self.declare_parameter('fixed_theta_z_offset_deg',   0.0).value
         self.position_scale       = self.declare_parameter('position_scale',              1.0).value
         self.p_gain               = self.declare_parameter('p_gain',                    2.0).value
@@ -171,7 +171,7 @@ class KinovaHandController(Node):
 
         # ── Controller state ────────────────────────────────────────────────────
         self.target_position       = None   # np.ndarray (3,) metres, already clipped
-        self.target_theta_z_deg    = self.fixed_theta_z_offset
+        self.target_theta_z_deg    = self.fixed_theta_z_offset + self.home_tz
         self.gripper_cmd           = 0.0
         self.is_paused             = False
         self.is_resetting          = False
@@ -181,8 +181,7 @@ class KinovaHandController(Node):
         # References captured at arm-enable (after settling).
         # Position uses a delta approach: target = ref_robot_pos + (holo - ref_holo) * scale,
         # so workspace offsets in hololens_hand_node cancel out and no calibration is needed.
-        self._ref_yaw: float | None = None
-        self._ref_theta_z: float = self.home_tz
+        # Yaw is fixed at home_tz — not tracked from hand orientation.
         self._ref_holo_pos: np.ndarray | None = None
         self._ref_robot_pos: np.ndarray | None = None
         # Monotonic time when arm tracking was last enabled.  Reference capture is
@@ -312,7 +311,6 @@ class KinovaHandController(Node):
         self.arm_enabled = False       # require explicit re-press of Arm after recovery
         self.target_position = None
         self._smoothed_vel[:] = 0.0
-        self._ref_yaw = None
         self._ref_holo_pos = None
         self._ref_robot_pos = None
         self.get_logger().error(
@@ -352,53 +350,32 @@ class KinovaHandController(Node):
         current_holo_pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
 
         # ── Always publish goal pose for visualization ────────────────────────
-        # Uses the delta approach so the goal reflects where the robot would be,
-        # not the raw (uncalibrated) HoloLens world position.
-        raw_yaw = self._palm_yaw_deg(msg.pose.orientation)
         if self._ref_holo_pos is not None and self._ref_robot_pos is not None:
             delta = (current_holo_pos - self._ref_holo_pos) * self.position_scale
             goal_pos = self._clip_to_workspace(self._ref_robot_pos + delta)
         else:
             goal_pos = np.array([self.home_x, self.home_y, self.home_z])
-        if self._ref_yaw is not None:
-            d = (raw_yaw - self._ref_yaw + 180.0) % 360.0 - 180.0
-            goal_theta_z = self.fixed_theta_z_offset + self._ref_theta_z + d
-        else:
-            goal_theta_z = self.fixed_theta_z_offset + self.home_tz
-        self._publish_pose(self.goal_pose_pub, goal_pos, goal_theta_z, msg.header.stamp)
+        self._publish_pose(self.goal_pose_pub, goal_pos, self.target_theta_z_deg, msg.header.stamp)
 
         if self.is_resetting or self.is_paused or not self.arm_enabled or self._is_faulted:
             return
 
         # ── Settling period ───────────────────────────────────────────────────
-        # Hold robot completely still for 0.5 s after arm tracking is enabled.
-        # MRTK can return tracked=True with identity rotation for the first 1-2
-        # frames on hand acquisition; capturing that as the yaw reference produces
-        # wrong wrist commands.  During settling no targets are updated.
-        if self._ref_yaw is None:
+        if self._ref_robot_pos is None:
             if time.monotonic() - self._arm_enabled_at < 0.5:
                 return  # still settling — don't move yet
-            # Capture all references from the first stable pose.
-            # Identity quaternion is safe here because target_theta_z is slew-rate
-            # limited below — even a sudden jump to real orientation can only move
-            # the target at max_angular_speed deg/s, not instantaneously.
-            yaw_deg = self._palm_yaw_deg(msg.pose.orientation)
-            self._ref_yaw = yaw_deg
             self._ref_holo_pos = current_holo_pos.copy()
             try:
                 fb = self._base_cyclic.RefreshFeedback()
-                self._ref_theta_z = fb.base.tool_pose_theta_z
                 self._ref_robot_pos = np.array([
                     fb.base.tool_pose_x,
                     fb.base.tool_pose_y,
                     fb.base.tool_pose_z,
                 ])
             except Exception:
-                self._ref_theta_z = self.home_tz
                 self._ref_robot_pos = np.array([self.home_x, self.home_y, self.home_z])
             self.get_logger().info(
                 f'Reference captured (after settling): '
-                f'palm_yaw={yaw_deg:.1f}°  robot_theta_z={self._ref_theta_z:.1f}°  '
                 f'robot_pos=({self._ref_robot_pos[0]:.3f}, {self._ref_robot_pos[1]:.3f}, {self._ref_robot_pos[2]:.3f})  '
                 f'holo_pos=({current_holo_pos[0]:.3f}, {current_holo_pos[1]:.3f}, {current_holo_pos[2]:.3f})'
             )
@@ -411,17 +388,6 @@ class KinovaHandController(Node):
             self.target_position[2] = clipped[2]
         else:
             self.target_position = clipped
-
-        # ── Orientation target (delta wrist yaw, slew-rate limited) ──────────
-        # Slew-rate limiting: target_theta_z can change at most max_angular_speed
-        # deg/s regardless of how large the delta is.  This prevents a sudden
-        # identity→real-orientation transition from commanding sustained max velocity.
-        yaw_deg = self._palm_yaw_deg(msg.pose.orientation)
-        delta_yaw = (yaw_deg - self._ref_yaw + 180.0) % 360.0 - 180.0
-        desired_theta_z = self.fixed_theta_z_offset + self._ref_theta_z + delta_yaw
-        max_step = self.max_angular_speed / self.control_rate  # deg per control tick
-        err = (desired_theta_z - self.target_theta_z_deg + 180.0) % 360.0 - 180.0
-        self.target_theta_z_deg += float(np.clip(err, -max_step, max_step))
 
         self._publish_pose(self.action_pose_pub, self.target_position, self.target_theta_z_deg, msg.header.stamp)
 
@@ -450,16 +416,7 @@ class KinovaHandController(Node):
                 self.get_logger().error(f'Gripper command error: {e}')
             return
 
-        # Read back actual position (may differ from command if grasping)
-        try:
-            fb = self._base.GetMeasuredGripperMovement(
-                Base_pb2.GripperRequest(mode=Base_pb2.GRIPPER_POSITION)
-            )
-            actual = float(fb.finger[0].value) if fb.finger else self.gripper_cmd
-        except Exception:
-            actual = self.gripper_cmd
-
-        self.action_gripper_pub.publish(Float32(data=actual))
+        self.action_gripper_pub.publish(Float32(data=self.gripper_cmd))
 
     # ── Live parameter updates ────────────────────────────────────────────────
     def _on_parameter_change(self, params):
@@ -480,13 +437,11 @@ class KinovaHandController(Node):
         if self.arm_enabled and not enabled:
             self.target_position = None
             self._smoothed_vel[:] = 0.0
-            self._ref_yaw = None
             self._ref_holo_pos = None
             self._ref_robot_pos = None
             self._send_zero_twist()
             self.get_logger().info('Arm tracking disabled — robot stopped')
         elif not self.arm_enabled and enabled:
-            self._ref_yaw = None
             self._ref_holo_pos = None
             self._ref_robot_pos = None
             self._arm_enabled_at = time.monotonic()
@@ -514,7 +469,6 @@ class KinovaHandController(Node):
         if was_active and not self.hand_tracking_active:
             self.target_position = None
             self._smoothed_vel[:] = 0.0
-            self._ref_yaw = None
             self._ref_holo_pos = None
             self._ref_robot_pos = None
             self._arm_enabled_at = time.monotonic()  # re-settle when tracking resumes
