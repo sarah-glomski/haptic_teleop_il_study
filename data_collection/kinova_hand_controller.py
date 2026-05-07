@@ -50,7 +50,9 @@ Subscribed topics:
   /vertical_only       std_msgs/String    — "true"/"false"; restricts motion to Z-axis only
 
 Published topics:
-  robot_action/pose    geometry_msgs/PoseStamped
+  robot_goal/pose      geometry_msgs/PoseStamped  — live goal pose (always, arm need not be active)
+  robot_goal/gripper   std_msgs/Float32           — live gripper target (always, gripper need not be active)
+  robot_action/pose    geometry_msgs/PoseStamped  — goal pose echoed only while arm is active
   robot_action/gripper std_msgs/Float32
 
 ROS2 Parameters:
@@ -75,6 +77,7 @@ ROS2 Parameters:
   home_tx / home_ty / home_tz float  -179.3 / -0.4 / 89.3
 """
 
+import concurrent.futures
 import math
 import threading
 import time
@@ -146,10 +149,26 @@ class KinovaHandController(Node):
         self.home_ty = self.declare_parameter('home_ty',   -0.4).value
         self.home_tz = self.declare_parameter('home_tz',   89.3).value
 
-        # ── Connect and configure robot ─────────────────────────────────────────
+        # ── Connect and configure robot (optional — node runs without robot) ───
+        self._robot_connected = False
         self.get_logger().info(f'Connecting to Kinova Gen3 at {self.robot_ip} …')
-        self._connect()
-        self._setup_servoing()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(lambda: (self._connect(), self._setup_servoing()))
+                fut.result(timeout=5.0)
+            self._robot_connected = True
+        except concurrent.futures.TimeoutError:
+            self.get_logger().warn(
+                f'Robot connection timed out after 5 s ({self.robot_ip} unreachable). '
+                'Starting in observation-only mode — robot_goal/* topics will publish '
+                'from hand tracking but no motion commands will be sent.'
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f'Robot not reachable ({e}). '
+                'Starting in observation-only mode — robot_goal/* topics will publish '
+                'from hand tracking but no motion commands will be sent.'
+            )
 
         # ── Safety — log configured limits at startup ───────────────────────────
         self.get_logger().info(
@@ -208,6 +227,8 @@ class KinovaHandController(Node):
         self.create_subscription(String,      '/vertical_only',       self._vertical_toggle_cb, 10)
 
         # ── Publishers ──────────────────────────────────────────────────────────
+        self.goal_pose_pub      = self.create_publisher(PoseStamped, 'robot_goal/pose',      10)
+        self.goal_gripper_pub   = self.create_publisher(Float32,     'robot_goal/gripper',   10)
         self.action_pose_pub    = self.create_publisher(PoseStamped, 'robot_action/pose',    10)
         self.action_gripper_pub = self.create_publisher(Float32,     'robot_action/gripper', 10)
 
@@ -330,8 +351,29 @@ class KinovaHandController(Node):
             self.get_logger().error(f'Fault clear attempt failed: {e}')
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _palm_yaw_deg(o) -> float:
+        """Extract yaw (rotation about ROS z-axis) from a quaternion message."""
+        return math.degrees(math.atan2(
+            2.0 * (o.w * o.z + o.x * o.y),
+            1.0 - 2.0 * (o.y * o.y + o.z * o.z),
+        ))
+
     def _hand_pose_cb(self, msg: PoseStamped):
-        if self.is_resetting or self.is_paused or not self.arm_enabled or self._is_faulted:
+        # ── Always publish goal pose for visualization ────────────────────────
+        # Computed before any arm-enabled / fault / settling guards so RViz and
+        # ros2 topic echo show live 3-D coordinates even when the arm is off.
+        raw_pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+        goal_pos = self._clip_to_workspace(raw_pos)
+        raw_yaw = self._palm_yaw_deg(msg.pose.orientation)
+        if self._ref_yaw is not None:
+            d = (raw_yaw - self._ref_yaw + 180.0) % 360.0 - 180.0
+            goal_theta_z = self.fixed_theta_z_offset + self._ref_theta_z + d
+        else:
+            goal_theta_z = self.fixed_theta_z_offset + self.home_tz
+        self._publish_pose(self.goal_pose_pub, goal_pos, goal_theta_z, msg.header.stamp)
+
+        if self.is_resetting or self.is_paused or not self.arm_enabled or self._is_faulted or not self._robot_connected:
             return
 
         # ── Settling period ───────────────────────────────────────────────────
@@ -344,11 +386,7 @@ class KinovaHandController(Node):
             if time.monotonic() - self._arm_enabled_at < 0.5:
                 return  # still settling — don't move yet
             # Capture reference from the first stable pose
-            o = msg.pose.orientation
-            yaw_deg = math.degrees(math.atan2(
-                2.0 * (o.w * o.z + o.x * o.y),
-                1.0 - 2.0 * (o.y * o.y + o.z * o.z),
-            ))
+            yaw_deg = self._palm_yaw_deg(msg.pose.orientation)
             self._ref_yaw = yaw_deg
             try:
                 fb = self._base_cyclic.RefreshFeedback()
@@ -366,11 +404,6 @@ class KinovaHandController(Node):
             )
 
         # ── Position target ───────────────────────────────────────────────────
-        raw_pos = np.array([
-            msg.pose.position.x,
-            msg.pose.position.y,
-            msg.pose.position.z,
-        ])
         clipped = self._clip_to_workspace(raw_pos)
 
         if self.vertical_only and self.target_position is not None:
@@ -380,22 +413,21 @@ class KinovaHandController(Node):
             self.target_position = clipped
 
         # ── Orientation target (delta wrist yaw) ──────────────────────────────
-        o = msg.pose.orientation
-        yaw_deg = math.degrees(math.atan2(
-            2.0 * (o.w * o.z + o.x * o.y),
-            1.0 - 2.0 * (o.y * o.y + o.z * o.z),
-        ))
-        delta_yaw = yaw_deg - self._ref_yaw
-        delta_yaw = (delta_yaw + 180.0) % 360.0 - 180.0  # wrap to [-180, 180]
+        yaw_deg = self._palm_yaw_deg(msg.pose.orientation)
+        delta_yaw = (yaw_deg - self._ref_yaw + 180.0) % 360.0 - 180.0  # wrap to [-180, 180]
         self.target_theta_z_deg = self.fixed_theta_z_offset + self._ref_theta_z + delta_yaw
 
-        self._publish_action_pose(self.target_position, msg.header.stamp)
+        self._publish_pose(self.action_pose_pub, self.target_position, self.target_theta_z_deg, msg.header.stamp)
 
     def _gripper_cb(self, msg: Float32):
-        if self.is_resetting or self.is_paused or not self.gripper_enabled or self._is_faulted:
+        # Always publish goal gripper for visualization, regardless of enabled state.
+        goal_gripper = float(np.clip(msg.data, 0.0, 1.0))
+        self.goal_gripper_pub.publish(Float32(data=goal_gripper))
+
+        if self.is_resetting or self.is_paused or not self.gripper_enabled or self._is_faulted or not self._robot_connected:
             return
 
-        self.gripper_cmd = float(np.clip(msg.data, 0.0, 1.0))
+        self.gripper_cmd = goal_gripper
 
         try:
             gripper_cmd = Base_pb2.GripperCommand()
@@ -475,7 +507,7 @@ class KinovaHandController(Node):
             self.get_logger().warn('Hand tracking lost — robot stopped; will re-settle on re-acquisition')
 
     def _reset_cb(self, msg: Bool):
-        if not msg.data or self.is_resetting:
+        if not msg.data or self.is_resetting or not self._robot_connected:
             return
         self.get_logger().info('Resetting Kinova Gen3 to home …')
         self.is_resetting = True
@@ -545,7 +577,7 @@ class KinovaHandController(Node):
             self.get_logger().info('Kinova resumed')
 
     # ── Publishers ────────────────────────────────────────────────────────────
-    def _publish_action_pose(self, position: np.ndarray, stamp):
+    def _publish_pose(self, pub, position: np.ndarray, theta_z_deg: float, stamp):
         msg = PoseStamped()
         msg.header.stamp = stamp
         msg.header.frame_id = 'base_link'
@@ -556,13 +588,13 @@ class KinovaHandController(Node):
         quat = R.from_euler('xyz', [
             math.radians(self.fixed_theta_x),
             math.radians(self.fixed_theta_y),
-            math.radians(self.target_theta_z_deg),
+            math.radians(theta_z_deg),
         ]).as_quat()
         msg.pose.orientation.x = float(quat[0])
         msg.pose.orientation.y = float(quat[1])
         msg.pose.orientation.z = float(quat[2])
         msg.pose.orientation.w = float(quat[3])
-        self.action_pose_pub.publish(msg)
+        pub.publish(msg)
 
     # ── Control loop ──────────────────────────────────────────────────────────
     def _control_loop(self):
@@ -574,6 +606,9 @@ class KinovaHandController(Node):
           - TwistCommand watchdog duration
           - fault detection + auto-recovery
         """
+        if not self._robot_connected:
+            return
+
         # Fault takes priority: suppress all commands and attempt periodic clear.
         if self._is_faulted:
             self._try_clear_fault()
@@ -649,6 +684,8 @@ class KinovaHandController(Node):
 
     def _send_zero_twist(self):
         """Zero-velocity command with watchdog duration (safe stop)."""
+        if not self._robot_connected:
+            return
         try:
             cmd = Base_pb2.TwistCommand()
             cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED
@@ -659,13 +696,14 @@ class KinovaHandController(Node):
 
     # ── Cleanup ────────────────────────────────────────────────────────────────
     def destroy_node(self):
-        self.get_logger().info('Disconnecting from Kinova Gen3 …')
-        try:
-            self._send_zero_twist()
-            self._session_manager.CloseSession()
-            self._transport.disconnect()
-        except Exception:
-            pass
+        if self._robot_connected:
+            self.get_logger().info('Disconnecting from Kinova Gen3 …')
+            try:
+                self._send_zero_twist()
+                self._session_manager.CloseSession()
+                self._transport.disconnect()
+            except Exception:
+                pass
         super().destroy_node()
 
 
