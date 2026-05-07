@@ -76,14 +76,33 @@ HoloLens startup checklist:
 - Press **Arm** to enable wrist tracking
 - Press **Gripper** to enable thumb-index gripper control
 
-> **Wrist orientation neutral pose**: When you press **Arm**, the controller snapshots
-> your current palm yaw and the robot's current `theta_z`. All subsequent wrist rotation
-> is tracked as a *delta* from that reference — the robot stays put at program start and
-> only follows your relative wrist rotation. Hold your hand in your intended neutral pose
-> (palm facing down, natural forearm position) when pressing **Arm**. The log line
-> `Wrist reference captured: palm_yaw=X° robot_theta_z=Y°` confirms the snapshot.
-> If the robot drifts rotationally after a tracking dropout, re-press **Arm** to
-> recapture the reference.
+> **Wrist orientation settling (important)**: After you press **Arm**, the robot stays
+> completely still for **0.5 s** while MRTK hand tracking stabilises. MRTK can return
+> a valid-looking but identity quaternion for the first 1–2 frames of hand acquisition;
+> capturing that as the reference causes incorrect wrist commands. After settling, the
+> controller snapshots your actual palm yaw and the robot's current `theta_z`. All
+> subsequent wrist rotation is tracked as a *delta* from that reference.
+> Hold your hand in your intended neutral pose (palm facing down) **before** pressing **Arm**
+> and hold it still for the 0.5 s settling window. The log line
+> `Wrist reference captured (after settling): palm_yaw=X° robot_theta_z=Y° holo_pos=(x, y, z)`
+> confirms the snapshot. If `palm_yaw` is exactly `0.0°` it means identity was still captured —
+> try again. If the robot drifts rotationally after a tracking dropout, re-press **Arm**.
+
+> **Robot fault recovery**: If the arm enters a fault state (joint limit, collision, or
+> e-stop), the controller immediately disables arm motion and attempts `ClearFaults()` +
+> re-enters servoing mode every 3 s automatically. You will see:
+> `ROBOT FAULT DETECTED — arm motion disabled.`  then  `Robot fault cleared — re-entering servoing mode.`
+> After the fault clears, **re-press Arm** in the HoloLens app before motion resumes.
+> If faults recur, reduce `max_angular_speed_dps` or `max_linear_speed_mps` via `ros2 param set`.
+
+> **Z axis not moving — workspace calibration**: The z axis is the vertical (up/down) axis.
+> If height movement isn't reflected on the robot, the most likely cause is that
+> `workspace_z_offset` (default 0.2 m) doesn't map your hand's natural height into the
+> robot workspace [0.025, 0.30 m]. Calibrate by running (robot NOT enabled):
+> `ros2 topic echo /hololens/palm/right` — note the `position.z` value at your neutral
+> hand height. Set `workspace_z_offset = home_z (0.107) − holo_z_at_neutral`.
+> Also move your hand up/down and verify `position.z` changes (not `position.x`).
+> The `holo_pos` values in the settling log confirm this each session.
 
 Stop with `Ctrl-C` — the watchdog halts the robot within 200 ms.
 
