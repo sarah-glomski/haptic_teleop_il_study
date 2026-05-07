@@ -77,7 +77,6 @@ ROS2 Parameters:
   home_tx / home_ty / home_tz float  -179.3 / -0.4 / 89.3
 """
 
-import concurrent.futures
 import math
 import threading
 import time
@@ -149,26 +148,10 @@ class KinovaHandController(Node):
         self.home_ty = self.declare_parameter('home_ty',   -0.4).value
         self.home_tz = self.declare_parameter('home_tz',   89.3).value
 
-        # ── Connect and configure robot (optional — node runs without robot) ───
-        self._robot_connected = False
+        # ── Connect and configure robot ─────────────────────────────────────────
         self.get_logger().info(f'Connecting to Kinova Gen3 at {self.robot_ip} …')
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(lambda: (self._connect(), self._setup_servoing()))
-                fut.result(timeout=5.0)
-            self._robot_connected = True
-        except concurrent.futures.TimeoutError:
-            self.get_logger().warn(
-                f'Robot connection timed out after 5 s ({self.robot_ip} unreachable). '
-                'Starting in observation-only mode — robot_goal/* topics will publish '
-                'from hand tracking but no motion commands will be sent.'
-            )
-        except Exception as e:
-            self.get_logger().warn(
-                f'Robot not reachable ({e}). '
-                'Starting in observation-only mode — robot_goal/* topics will publish '
-                'from hand tracking but no motion commands will be sent.'
-            )
+        self._connect()
+        self._setup_servoing()
 
         # ── Safety — log configured limits at startup ───────────────────────────
         self.get_logger().info(
@@ -373,7 +356,7 @@ class KinovaHandController(Node):
             goal_theta_z = self.fixed_theta_z_offset + self.home_tz
         self._publish_pose(self.goal_pose_pub, goal_pos, goal_theta_z, msg.header.stamp)
 
-        if self.is_resetting or self.is_paused or not self.arm_enabled or self._is_faulted or not self._robot_connected:
+        if self.is_resetting or self.is_paused or not self.arm_enabled or self._is_faulted:
             return
 
         # ── Settling period ───────────────────────────────────────────────────
@@ -424,7 +407,7 @@ class KinovaHandController(Node):
         goal_gripper = float(np.clip(msg.data, 0.0, 1.0))
         self.goal_gripper_pub.publish(Float32(data=goal_gripper))
 
-        if self.is_resetting or self.is_paused or not self.gripper_enabled or self._is_faulted or not self._robot_connected:
+        if self.is_resetting or self.is_paused or not self.gripper_enabled or self._is_faulted:
             return
 
         self.gripper_cmd = goal_gripper
@@ -507,7 +490,7 @@ class KinovaHandController(Node):
             self.get_logger().warn('Hand tracking lost — robot stopped; will re-settle on re-acquisition')
 
     def _reset_cb(self, msg: Bool):
-        if not msg.data or self.is_resetting or not self._robot_connected:
+        if not msg.data or self.is_resetting:
             return
         self.get_logger().info('Resetting Kinova Gen3 to home …')
         self.is_resetting = True
@@ -606,9 +589,6 @@ class KinovaHandController(Node):
           - TwistCommand watchdog duration
           - fault detection + auto-recovery
         """
-        if not self._robot_connected:
-            return
-
         # Fault takes priority: suppress all commands and attempt periodic clear.
         if self._is_faulted:
             self._try_clear_fault()
@@ -684,8 +664,6 @@ class KinovaHandController(Node):
 
     def _send_zero_twist(self):
         """Zero-velocity command with watchdog duration (safe stop)."""
-        if not self._robot_connected:
-            return
         try:
             cmd = Base_pb2.TwistCommand()
             cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED
@@ -696,14 +674,13 @@ class KinovaHandController(Node):
 
     # ── Cleanup ────────────────────────────────────────────────────────────────
     def destroy_node(self):
-        if self._robot_connected:
-            self.get_logger().info('Disconnecting from Kinova Gen3 …')
-            try:
-                self._send_zero_twist()
-                self._session_manager.CloseSession()
-                self._transport.disconnect()
-            except Exception:
-                pass
+        self.get_logger().info('Disconnecting from Kinova Gen3 …')
+        try:
+            self._send_zero_twist()
+            self._session_manager.CloseSession()
+            self._transport.disconnect()
+        except Exception:
+            pass
         super().destroy_node()
 
 
