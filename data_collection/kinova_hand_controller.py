@@ -68,7 +68,6 @@ ROS2 Parameters:
   workspace_z_min / z_max     float  0.025 / 0.30  m
   workspace_soft_margin_m     float  0.04   soft deceleration zone (m from wall)
   ── EEF orientation ──────────────────────────────────────────────────────
-  fixed_theta_z_offset_deg    float     0.0  added to home_tz → fixed yaw; roll/pitch taken directly from home_tx/ty
   position_scale              float  1.0   hand-motion → robot-motion scale (all axes)
   p_gain                      float  2.0
   ── Home position (m / deg) ──────────────────────────────────────────────
@@ -135,7 +134,6 @@ class KinovaHandController(Node):
         self.z_max = self.declare_parameter('workspace_z_max',  0.30).value
         self.soft_margin = self.declare_parameter('workspace_soft_margin_m', 0.01).value
 
-        self.fixed_theta_z_offset = self.declare_parameter('fixed_theta_z_offset_deg',   0.0).value
         self.position_scale       = self.declare_parameter('position_scale',              1.0).value
         self.p_gain               = self.declare_parameter('p_gain',                    2.0).value
 
@@ -167,7 +165,7 @@ class KinovaHandController(Node):
 
         # ── Controller state ────────────────────────────────────────────────────
         self.target_position       = None   # np.ndarray (3,) metres, already clipped
-        self.target_theta_z_deg    = self.fixed_theta_z_offset + self.home_tz
+        self.target_theta_z_deg    = self.home_tz
         self.gripper_cmd           = 0.0
         self.is_paused             = False
         self.is_resetting          = False
