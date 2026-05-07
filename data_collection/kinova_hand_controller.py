@@ -179,6 +179,18 @@ class KinovaHandController(Node):
         # responds to delta rotation from the user's neutral hand pose.
         self._ref_yaw: float | None = None
         self._ref_theta_z: float = self.home_tz
+        # Monotonic time when arm tracking was last enabled.  Reference capture is
+        # deferred 0.5 s to let MRTK hand tracking stabilise — MRTK can return
+        # tracked=True with identity rotation for 1-2 frames on first acquisition,
+        # and capturing that as the reference produces incorrect wrist commands.
+        self._arm_enabled_at: float = 0.0
+
+        # Fault state — set when the Kortex SDK reports ROBOT_IN_FAULT.
+        # While faulted, all motion commands are suppressed and ClearFaults() is
+        # retried every 3 s. arm_enabled is also cleared so the user must explicitly
+        # re-press Arm in the HoloLens app after recovery.
+        self._is_faulted = False
+        self._last_fault_clear_t = 0.0
 
         # ── HoloLens safety gates (all off by default) ──────────────────────────
         self.arm_enabled     = False  # /wrist_tracking "true" to enable arm movement
@@ -283,11 +295,77 @@ class KinovaHandController(Node):
 
         return out
 
+    # ── Fault handling ────────────────────────────────────────────────────────
+    def _enter_fault_state(self):
+        """Called the first time a ROBOT_IN_FAULT error is detected."""
+        if self._is_faulted:
+            return
+        self._is_faulted = True
+        self.arm_enabled = False       # require explicit re-press of Arm after recovery
+        self.target_position = None
+        self._smoothed_vel[:] = 0.0
+        self._ref_yaw = None
+        self.get_logger().error(
+            'ROBOT FAULT DETECTED — arm motion disabled. '
+            'Auto-clear will be attempted every 3 s. '
+            'Re-press Arm in HoloLens after fault clears to resume.'
+        )
+
+    def _try_clear_fault(self):
+        """Attempt ClearFaults() + re-enter servoing mode. Rate-limited to 1 try / 3 s."""
+        now = time.monotonic()
+        if now - self._last_fault_clear_t < 3.0:
+            return
+        self._last_fault_clear_t = now
+        try:
+            self._base.ClearFaults()
+            time.sleep(0.5)
+            self._setup_servoing()
+            self._is_faulted = False
+            self.get_logger().warn(
+                'Robot fault cleared — re-entering servoing mode. '
+                'Re-press Arm in HoloLens to resume movement.'
+            )
+        except Exception as e:
+            self.get_logger().error(f'Fault clear attempt failed: {e}')
+
     # ── Callbacks ─────────────────────────────────────────────────────────────
     def _hand_pose_cb(self, msg: PoseStamped):
-        if self.is_resetting or self.is_paused or not self.arm_enabled:
+        if self.is_resetting or self.is_paused or not self.arm_enabled or self._is_faulted:
             return
 
+        # ── Settling period ───────────────────────────────────────────────────
+        # Hold robot completely still for 0.5 s after arm tracking is enabled.
+        # MRTK can return tracked=True with identity rotation for the first 1-2
+        # frames on hand acquisition; capturing that as the yaw reference produces
+        # wrong wrist commands.  During settling neither position nor orientation
+        # targets are updated so the control loop sends zero velocity.
+        if self._ref_yaw is None:
+            if time.monotonic() - self._arm_enabled_at < 0.5:
+                return  # still settling — don't move yet
+            # Capture reference from the first stable pose
+            o = msg.pose.orientation
+            yaw_deg = math.degrees(math.atan2(
+                2.0 * (o.w * o.z + o.x * o.y),
+                1.0 - 2.0 * (o.y * o.y + o.z * o.z),
+            ))
+            self._ref_yaw = yaw_deg
+            try:
+                fb = self._base_cyclic.RefreshFeedback()
+                self._ref_theta_z = fb.base.tool_pose_theta_z
+            except Exception:
+                self._ref_theta_z = self.home_tz
+            # Z diagnostic: move your hand up/down and verify holo_pos.z changes.
+            # If z stays constant while x changes instead, the HoloLens height axis
+            # is being published as x — swap the axis mapping in
+            # hololens_hand_node._to_robot_frame.
+            self.get_logger().info(
+                f'Wrist reference captured (after settling): '
+                f'palm_yaw={yaw_deg:.1f}°  robot_theta_z={self._ref_theta_z:.1f}°  '
+                f'holo_pos=({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f}, {msg.pose.position.z:.3f})'
+            )
+
+        # ── Position target ───────────────────────────────────────────────────
         raw_pos = np.array([
             msg.pose.position.x,
             msg.pose.position.y,
@@ -301,29 +379,12 @@ class KinovaHandController(Node):
         else:
             self.target_position = clipped
 
-        # Wrist yaw from palm orientation
+        # ── Orientation target (delta wrist yaw) ──────────────────────────────
         o = msg.pose.orientation
-        yaw_rad = math.atan2(
+        yaw_deg = math.degrees(math.atan2(
             2.0 * (o.w * o.z + o.x * o.y),
             1.0 - 2.0 * (o.y * o.y + o.z * o.z),
-        )
-        yaw_deg = math.degrees(yaw_rad)
-
-        # On the first callback after arm tracking is enabled, snapshot the current
-        # palm yaw and the robot's actual theta_z so we track *delta* rotation only.
-        # This prevents a large jump-to-target when the HoloLens frame doesn't align
-        # with the robot frame.
-        if self._ref_yaw is None:
-            self._ref_yaw = yaw_deg
-            try:
-                fb = self._base_cyclic.RefreshFeedback()
-                self._ref_theta_z = fb.base.tool_pose_theta_z
-            except Exception:
-                self._ref_theta_z = self.home_tz
-            self.get_logger().info(
-                f'Wrist reference captured: palm_yaw={yaw_deg:.1f}°  robot_theta_z={self._ref_theta_z:.1f}°'
-            )
-
+        ))
         delta_yaw = yaw_deg - self._ref_yaw
         delta_yaw = (delta_yaw + 180.0) % 360.0 - 180.0  # wrap to [-180, 180]
         self.target_theta_z_deg = self.fixed_theta_z_offset + self._ref_theta_z + delta_yaw
@@ -331,7 +392,7 @@ class KinovaHandController(Node):
         self._publish_action_pose(self.target_position, msg.header.stamp)
 
     def _gripper_cb(self, msg: Float32):
-        if self.is_resetting or self.is_paused or not self.gripper_enabled:
+        if self.is_resetting or self.is_paused or not self.gripper_enabled or self._is_faulted:
             return
 
         self.gripper_cmd = float(np.clip(msg.data, 0.0, 1.0))
@@ -344,7 +405,11 @@ class KinovaHandController(Node):
             finger.value = self.gripper_cmd
             self._base.SendGripperCommand(gripper_cmd)
         except Exception as e:
-            self.get_logger().error(f'Gripper command error: {e}')
+            err_str = str(e)
+            if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
+                self._enter_fault_state()
+            else:
+                self.get_logger().error(f'Gripper command error: {e}')
             return
 
         # Read back actual position (may differ from command if grasping)
@@ -378,8 +443,12 @@ class KinovaHandController(Node):
             self._send_zero_twist()
             self.get_logger().info('Arm tracking disabled — robot stopped')
         elif not self.arm_enabled and enabled:
-            self._ref_yaw = None  # will be captured on first pose callback
-            self.get_logger().info('Arm tracking enabled — wrist reference will be captured on first pose')
+            self._ref_yaw = None
+            self._arm_enabled_at = time.monotonic()
+            self.get_logger().info(
+                'Arm tracking enabled — robot held still for 0.5 s while MRTK tracking settles, '
+                'then wrist reference will be captured'
+            )
         self.arm_enabled = enabled
 
     def _gripper_toggle_cb(self, msg: String):
@@ -400,9 +469,10 @@ class KinovaHandController(Node):
         if was_active and not self.hand_tracking_active:
             self.target_position = None
             self._smoothed_vel[:] = 0.0
-            self._ref_yaw = None  # reset so re-acquisition captures a fresh reference
+            self._ref_yaw = None
+            self._arm_enabled_at = time.monotonic()  # re-settle when tracking resumes
             self._send_zero_twist()
-            self.get_logger().warn('Hand tracking lost — robot stopped')
+            self.get_logger().warn('Hand tracking lost — robot stopped; will re-settle on re-acquisition')
 
     def _reset_cb(self, msg: Bool):
         if not msg.data or self.is_resetting:
@@ -502,7 +572,13 @@ class KinovaHandController(Node):
           - soft boundary deceleration
           - hard velocity cap
           - TwistCommand watchdog duration
+          - fault detection + auto-recovery
         """
+        # Fault takes priority: suppress all commands and attempt periodic clear.
+        if self._is_faulted:
+            self._try_clear_fault()
+            return
+
         if self.is_paused or self.is_resetting or self.target_position is None:
             self._smoothed_vel[:] = 0.0
             self._send_zero_twist()
@@ -564,8 +640,12 @@ class KinovaHandController(Node):
             self._base.SendTwistCommand(cmd)
 
         except Exception as e:
-            self.get_logger().error(f'Control loop error: {e}')
-            self._send_zero_twist()
+            err_str = str(e)
+            if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
+                self._enter_fault_state()
+            else:
+                self.get_logger().error(f'Control loop error: {e}')
+                self._send_zero_twist()
 
     def _send_zero_twist(self):
         """Zero-velocity command with watchdog duration (safe stop)."""
