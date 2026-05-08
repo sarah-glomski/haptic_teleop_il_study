@@ -567,69 +567,80 @@ class KinovaHandController(Node):
             self._try_clear_fault()
             return
 
-        if self.is_paused or self.is_resetting or self.target_position is None:
+        blocked = self.is_paused or self.is_resetting
+        arm_active = not blocked and self.target_position is not None
+        gripper_active = not blocked and self.gripper_enabled
+
+        # ── Arm control ───────────────────────────────────────────────────────
+        if not arm_active:
             self._smoothed_vel[:] = 0.0
             self._send_zero_twist()
-            return
+        else:
+            try:
+                feedback = self._base_cyclic.RefreshFeedback()
+                current_pos = np.array([
+                    feedback.base.tool_pose_x,
+                    feedback.base.tool_pose_y,
+                    feedback.base.tool_pose_z,
+                ])
 
-        try:
-            feedback = self._base_cyclic.RefreshFeedback()
-            current_pos = np.array([
-                feedback.base.tool_pose_x,
-                feedback.base.tool_pose_y,
-                feedback.base.tool_pose_z,
-            ])
+                # P-loop: raw velocity from position error
+                pos_error = self.target_position - current_pos
+                raw_vel = self.p_gain * pos_error
 
-            # P-loop: raw velocity from position error
-            pos_error = self.target_position - current_pos
-            raw_vel = self.p_gain * pos_error
+                # 1 — Hard cap before smoothing (safety)
+                speed = float(np.linalg.norm(raw_vel))
+                if speed > self.max_linear_speed:
+                    raw_vel = raw_vel * (self.max_linear_speed / speed)
 
-            # 1 — Hard cap before smoothing (safety)
-            speed = float(np.linalg.norm(raw_vel))
-            if speed > self.max_linear_speed:
-                raw_vel = raw_vel * (self.max_linear_speed / speed)
+                # 2 — Soft boundary deceleration (uses current TCP position)
+                raw_vel = self._boundary_speed_scale(current_pos, raw_vel)
 
-            # 2 — Soft boundary deceleration (uses current TCP position)
-            raw_vel = self._boundary_speed_scale(current_pos, raw_vel)
+                # 3 — Velocity smoothing (limits effective acceleration)
+                self._smoothed_vel = (
+                    self.vel_alpha * raw_vel
+                    + (1.0 - self.vel_alpha) * self._smoothed_vel
+                )
 
-            # 3 — Velocity smoothing (limits effective acceleration)
-            self._smoothed_vel = (
-                self.vel_alpha * raw_vel
-                + (1.0 - self.vel_alpha) * self._smoothed_vel
-            )
+                # 4 — Final hard cap on smoothed velocity
+                smooth_speed = float(np.linalg.norm(self._smoothed_vel))
+                send_vel = self._smoothed_vel.copy()
+                if smooth_speed > self.max_linear_speed:
+                    send_vel = send_vel * (self.max_linear_speed / smooth_speed)
 
-            # 4 — Final hard cap on smoothed velocity
-            smooth_speed = float(np.linalg.norm(self._smoothed_vel))
-            send_vel = self._smoothed_vel.copy()
-            if smooth_speed > self.max_linear_speed:
-                send_vel = send_vel * (self.max_linear_speed / smooth_speed)
+                # Angular velocities are all zero: SINGLE_LEVEL_SERVOING holds
+                # the current EEF orientation passively when no angular velocity
+                # is commanded. We avoid angular P-loop entirely because the Kortex
+                # ZYX Euler decomposition has a gimbal singularity near theta_x=±180°
+                # (the arm's home orientation), causing theta_z to flip between
+                # 89.3° and ≈0°/180° — a P-loop would chase that noise.
+                cmd = Base_pb2.TwistCommand()
+                cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED
+                cmd.duration = TWIST_WATCHDOG_MS
+                cmd.twist.linear_x  = float(send_vel[0])
+                cmd.twist.linear_y  = float(send_vel[1])
+                cmd.twist.linear_z  = float(send_vel[2])
+                cmd.twist.angular_x = 0.0
+                cmd.twist.angular_y = 0.0
+                cmd.twist.angular_z = 0.0
+                self._base.SendTwistCommand(cmd)
 
-            # ── Send TwistCommand ─────────────────────────────────────────────
-            # Angular velocities are all zero: SINGLE_LEVEL_SERVOING holds
-            # the current EEF orientation passively when no angular velocity
-            # is commanded. We avoid angular P-loop entirely because the Kortex
-            # ZYX Euler decomposition has a gimbal singularity near theta_x=±180°
-            # (the arm's home orientation), causing theta_z to flip between
-            # 89.3° and ≈0°/180° — a P-loop would chase that noise.
-            # duration = TWIST_WATCHDOG_MS: robot auto-stops if we miss this
-            # many ms worth of ticks (node crash / freeze protection).
-            cmd = Base_pb2.TwistCommand()
-            cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED
-            cmd.duration = TWIST_WATCHDOG_MS
-            cmd.twist.linear_x  = float(send_vel[0])
-            cmd.twist.linear_y  = float(send_vel[1])
-            cmd.twist.linear_z  = float(send_vel[2])
-            cmd.twist.angular_x = 0.0
-            cmd.twist.angular_y = 0.0
-            cmd.twist.angular_z = 0.0
-            self._base.SendTwistCommand(cmd)
+            except Exception as e:
+                err_str = str(e)
+                if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
+                    self._enter_fault_state()
+                else:
+                    self.get_logger().error(f'Arm control loop error: {e}')
+                    self._send_zero_twist()
 
-            # ── Gripper speed P-loop ──────────────────────────────────────────
-            # GRIPPER_SPEED mode lets us command motor speed directly, avoiding
-            # the slow internal position controller in GRIPPER_POSITION mode.
-            # Current position comes from BaseCyclic feedback (0–100 → 0.0–1.0).
-            if self.gripper_enabled:
-                current_gripper = feedback.interconnect.gripper_feedback.motor[0].position / 100.0
+        # ── Gripper speed P-loop (independent of arm state) ──────────────────
+        # GRIPPER_SPEED mode commands motor speed directly, avoiding the slow
+        # internal position controller used by GRIPPER_POSITION mode.
+        # Current position from BaseCyclic feedback (0–100 scale → 0.0–1.0).
+        if gripper_active:
+            try:
+                fb = self._base_cyclic.RefreshFeedback()
+                current_gripper = fb.interconnect.gripper_feedback.motor[0].position / 100.0
                 gripper_err = self.gripper_cmd - current_gripper
                 gripper_speed = float(np.clip(self.gripper_p_gain * gripper_err, -1.0, 1.0))
                 gc = Base_pb2.GripperCommand()
@@ -638,14 +649,12 @@ class KinovaHandController(Node):
                 f.finger_identifier = 1
                 f.value = gripper_speed
                 self._base.SendGripperCommand(gc)
-
-        except Exception as e:
-            err_str = str(e)
-            if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
-                self._enter_fault_state()
-            else:
-                self.get_logger().error(f'Control loop error: {e}')
-                self._send_zero_twist()
+            except Exception as e:
+                err_str = str(e)
+                if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
+                    self._enter_fault_state()
+                else:
+                    self.get_logger().error(f'Gripper control loop error: {e}')
 
     def _send_zero_twist(self):
         """Zero-velocity command with watchdog duration (safe stop)."""
