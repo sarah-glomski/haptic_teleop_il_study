@@ -633,21 +633,14 @@ class KinovaHandController(Node):
                     self.get_logger().error(f'Arm control loop error: {e}')
                     self._send_zero_twist()
 
-        # ── Gripper speed P-loop (independent of arm state) ──────────────────
-        # GRIPPER_SPEED mode commands motor speed directly, avoiding the slow
-        # internal position controller used by GRIPPER_POSITION mode.
-        # Current position from BaseCyclic feedback (0–100 scale → 0.0–1.0).
+        # ── Gripper control (independent of arm state) ────────────────────────
         if gripper_active:
             try:
-                fb = self._base_cyclic.RefreshFeedback()
-                current_gripper = fb.interconnect.gripper_feedback.motor[0].position / 100.0
-                gripper_err = self.gripper_cmd - current_gripper
-                gripper_speed = float(np.clip(self.gripper_p_gain * gripper_err, -1.0, 1.0))
                 gc = Base_pb2.GripperCommand()
-                gc.mode = Base_pb2.GRIPPER_SPEED
+                gc.mode = Base_pb2.GRIPPER_POSITION
                 f = gc.gripper.finger.add()
                 f.finger_identifier = 1
-                f.value = gripper_speed
+                f.value = float(self.gripper_cmd)
                 self._base.SendGripperCommand(gc)
             except Exception as e:
                 err_str = str(e)
@@ -655,6 +648,12 @@ class KinovaHandController(Node):
                     self._enter_fault_state()
                 else:
                     self.get_logger().error(f'Gripper control loop error: {e}')
+        else:
+            self.get_logger().info(
+                f'[gripper] inactive — gripper_enabled={self.gripper_enabled} '
+                f'paused={self.is_paused} resetting={self.is_resetting}',
+                throttle_duration_sec=5.0,
+            )
 
     def _send_zero_twist(self):
         """Zero-velocity command with watchdog duration (safe stop)."""
