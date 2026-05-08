@@ -651,7 +651,7 @@ class KinovaHandController(Node):
                 gc.mode = Base_pb2.GRIPPER_SPEED
                 f = gc.gripper.finger.add()
                 f.finger_identifier = 1
-                f.value = gripper_speed
+                f.value = -gripper_speed  # Kortex: positive=open, negative=close
                 self._base.SendGripperCommand(gc)
             except Exception as e:
                 err_str = str(e)
