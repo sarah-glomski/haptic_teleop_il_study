@@ -169,6 +169,7 @@ class KinovaHandController(Node):
         self.target_position       = None   # np.ndarray (3,) metres, already clipped
         self.target_theta_z_deg    = self.home_tz
         self.gripper_cmd           = 0.0
+        self._gripper_pos          = 0.0  # internal position estimate for speed P-loop
         self.is_paused             = False
         self.is_resetting          = False
         self.hand_tracking_active  = False
@@ -633,14 +634,24 @@ class KinovaHandController(Node):
                     self.get_logger().error(f'Arm control loop error: {e}')
                     self._send_zero_twist()
 
-        # ── Gripper control (independent of arm state) ────────────────────────
+        # ── Gripper speed P-loop (independent of arm state) ──────────────────
+        # Uses an internal position estimate instead of robot feedback to avoid
+        # the unreliable BaseCyclic interconnect path. GRIPPER_SPEED mode gives
+        # direct motor speed control — faster than GRIPPER_POSITION's internal
+        # controller. The estimate integrates commanded speed each tick and is
+        # clamped to [0, 1] so it stays consistent with the physical stops.
         if gripper_active:
             try:
+                gripper_err = self.gripper_cmd - self._gripper_pos
+                gripper_speed = float(np.clip(self.gripper_p_gain * gripper_err, -1.0, 1.0))
+                self._gripper_pos = float(np.clip(
+                    self._gripper_pos + gripper_speed / self.control_rate, 0.0, 1.0
+                ))
                 gc = Base_pb2.GripperCommand()
-                gc.mode = Base_pb2.GRIPPER_POSITION
+                gc.mode = Base_pb2.GRIPPER_SPEED
                 f = gc.gripper.finger.add()
                 f.finger_identifier = 1
-                f.value = float(self.gripper_cmd)
+                f.value = gripper_speed
                 self._base.SendGripperCommand(gc)
             except Exception as e:
                 err_str = str(e)
@@ -648,12 +659,6 @@ class KinovaHandController(Node):
                     self._enter_fault_state()
                 else:
                     self.get_logger().error(f'Gripper control loop error: {e}')
-        else:
-            self.get_logger().info(
-                f'[gripper] inactive — gripper_enabled={self.gripper_enabled} '
-                f'paused={self.is_paused} resetting={self.is_resetting}',
-                throttle_duration_sec=5.0,
-            )
 
     def _send_zero_twist(self):
         """Zero-velocity command with watchdog duration (safe stop)."""
