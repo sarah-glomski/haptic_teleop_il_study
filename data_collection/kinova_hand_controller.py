@@ -70,7 +70,7 @@ ROS2 Parameters:
   ── EEF orientation ──────────────────────────────────────────────────────
   position_scale              float  1.0   hand-motion → robot-motion scale (all axes)
   p_gain                      float  2.0
-  gripper_p_gain              float  8.0   speed P-loop gain; full speed (±1.0) when error > 1/gain
+  gripper_deadband            float  0.05  bang-bang deadband; stop when |error| < this (0–1 scale)
   ── Home position (m / deg) ──────────────────────────────────────────────
   home_x / home_y / home_z    float  0.474 / 0.02 / 0.107
   home_tx / home_ty / home_tz float  -179.3 / -0.4 / 89.3
@@ -137,7 +137,7 @@ class KinovaHandController(Node):
 
         self.position_scale       = self.declare_parameter('position_scale',              1.0).value
         self.p_gain               = self.declare_parameter('p_gain',                    2.0).value
-        self.gripper_p_gain       = self.declare_parameter('gripper_p_gain',            8.0).value
+        self.gripper_deadband     = self.declare_parameter('gripper_deadband',          0.05).value
 
         self.home_x  = self.declare_parameter('home_x',   0.474).value
         self.home_y  = self.declare_parameter('home_y',   0.02).value
@@ -415,9 +415,9 @@ class KinovaHandController(Node):
             elif p.name == 'max_linear_speed_mps':
                 self.max_linear_speed = float(p.value)
                 self.get_logger().info(f'max_linear_speed_mps → {p.value}')
-            elif p.name == 'gripper_p_gain':
-                self.gripper_p_gain = float(p.value)
-                self.get_logger().info(f'gripper_p_gain → {p.value}')
+            elif p.name == 'gripper_deadband':
+                self.gripper_deadband = float(p.value)
+                self.get_logger().info(f'gripper_deadband → {p.value}')
         return SetParametersResult(successful=True)
 
     def _arm_toggle_cb(self, msg: String):
@@ -634,24 +634,28 @@ class KinovaHandController(Node):
                     self.get_logger().error(f'Arm control loop error: {e}')
                     self._send_zero_twist()
 
-        # ── Gripper speed P-loop (independent of arm state) ──────────────────
-        # Uses an internal position estimate instead of robot feedback to avoid
-        # the unreliable BaseCyclic interconnect path. GRIPPER_SPEED mode gives
-        # direct motor speed control — faster than GRIPPER_POSITION's internal
-        # controller. The estimate integrates commanded speed each tick and is
-        # clamped to [0, 1] so it stays consistent with the physical stops.
+        # ── Gripper bang-bang control (independent of arm state) ─────────────
+        # The Robotiq 2F has a motor deadband at low speed commands, causing a
+        # startup delay with a P-loop. Bang-bang eliminates this: any meaningful
+        # error immediately commands full speed. An internal position estimate
+        # (integrated at max speed) determines when to stop.
+        # Kortex GRIPPER_SPEED convention: positive=open, negative=close.
         if gripper_active:
             try:
                 gripper_err = self.gripper_cmd - self._gripper_pos
-                gripper_speed = float(np.clip(self.gripper_p_gain * gripper_err, -1.0, 1.0))
-                self._gripper_pos = float(np.clip(
-                    self._gripper_pos + gripper_speed / self.control_rate, 0.0, 1.0
-                ))
+                if gripper_err > self.gripper_deadband:
+                    robot_speed = -1.0   # close at full speed
+                    self._gripper_pos = min(self._gripper_pos + 1.0 / self.control_rate, 1.0)
+                elif gripper_err < -self.gripper_deadband:
+                    robot_speed = 1.0    # open at full speed
+                    self._gripper_pos = max(self._gripper_pos - 1.0 / self.control_rate, 0.0)
+                else:
+                    robot_speed = 0.0
                 gc = Base_pb2.GripperCommand()
                 gc.mode = Base_pb2.GRIPPER_SPEED
                 f = gc.gripper.finger.add()
                 f.finger_identifier = 1
-                f.value = -gripper_speed  # Kortex: positive=open, negative=close
+                f.value = float(robot_speed)
                 self._base.SendGripperCommand(gc)
             except Exception as e:
                 err_str = str(e)
