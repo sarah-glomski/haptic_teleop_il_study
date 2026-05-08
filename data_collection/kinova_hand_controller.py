@@ -60,16 +60,17 @@ ROS2 Parameters:
   username / password         str    'admin' / 'admin'
   control_rate                float  30.0   Hz
   ── Safety ──────────────────────────────────────────────────────────────
-  max_linear_speed_mps        float  0.10   m/s   hard velocity cap
+  max_linear_speed_mps        float  0.50   m/s   hard velocity cap
   max_angular_speed_dps       float  15.0   deg/s hard angular cap
   vel_alpha                   float  0.4    velocity smoothing (0=very smooth)
   workspace_x_min / x_max     float  0.40 / 0.50  m
-  workspace_y_min / y_max     float -0.27 / 0.27  m
+  workspace_y_min / y_max     float -0.37 / 0.37  m
   workspace_z_min / z_max     float  0.025 / 0.30  m
   workspace_soft_margin_m     float  0.04   soft deceleration zone (m from wall)
   ── EEF orientation ──────────────────────────────────────────────────────
   position_scale              float  1.0   hand-motion → robot-motion scale (all axes)
   p_gain                      float  2.0
+  gripper_p_gain              float  8.0   speed P-loop gain; full speed (±1.0) when error > 1/gain
   ── Home position (m / deg) ──────────────────────────────────────────────
   home_x / home_y / home_z    float  0.474 / 0.02 / 0.107
   home_tx / home_ty / home_tz float  -179.3 / -0.4 / 89.3
@@ -122,20 +123,21 @@ class KinovaHandController(Node):
         self.password  = self.declare_parameter('password',  'admin').value
 
         self.control_rate          = self.declare_parameter('control_rate',            30.0).value
-        self.max_linear_speed      = self.declare_parameter('max_linear_speed_mps',    0.10).value
+        self.max_linear_speed      = self.declare_parameter('max_linear_speed_mps',    0.50).value
         self.max_angular_speed     = self.declare_parameter('max_angular_speed_dps',   15.0).value
-        self.vel_alpha             = self.declare_parameter('vel_alpha',               0.4).value
+        self.vel_alpha             = self.declare_parameter('vel_alpha',               0.7).value
 
         self.x_min = self.declare_parameter('workspace_x_min',  0.40).value
         self.x_max = self.declare_parameter('workspace_x_max',  0.50).value
-        self.y_min = self.declare_parameter('workspace_y_min', -0.27).value
-        self.y_max = self.declare_parameter('workspace_y_max',  0.27).value
+        self.y_min = self.declare_parameter('workspace_y_min', -0.37).value
+        self.y_max = self.declare_parameter('workspace_y_max',  0.37).value
         self.z_min = self.declare_parameter('workspace_z_min',  0.025).value
         self.z_max = self.declare_parameter('workspace_z_max',  0.30).value
         self.soft_margin = self.declare_parameter('workspace_soft_margin_m', 0.01).value
 
         self.position_scale       = self.declare_parameter('position_scale',              1.0).value
         self.p_gain               = self.declare_parameter('p_gain',                    2.0).value
+        self.gripper_p_gain       = self.declare_parameter('gripper_p_gain',            8.0).value
 
         self.home_x  = self.declare_parameter('home_x',   0.474).value
         self.home_y  = self.declare_parameter('home_y',   0.02).value
@@ -393,23 +395,8 @@ class KinovaHandController(Node):
         if self.is_resetting or self.is_paused or not self.gripper_enabled or self._is_faulted:
             return
 
+        # Only update the target — the 30 Hz control loop sends GRIPPER_SPEED commands.
         self.gripper_cmd = goal_gripper
-
-        try:
-            gripper_cmd = Base_pb2.GripperCommand()
-            gripper_cmd.mode = Base_pb2.GRIPPER_POSITION
-            finger = gripper_cmd.gripper.finger.add()
-            finger.finger_identifier = 1
-            finger.value = self.gripper_cmd
-            self._base.SendGripperCommand(gripper_cmd)
-        except Exception as e:
-            err_str = str(e)
-            if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
-                self._enter_fault_state()
-            else:
-                self.get_logger().error(f'Gripper command error: {e}')
-            return
-
         self.action_gripper_pub.publish(Float32(data=self.gripper_cmd))
 
     # ── Live parameter updates ────────────────────────────────────────────────
@@ -424,6 +411,12 @@ class KinovaHandController(Node):
             elif p.name == 'position_scale':
                 self.position_scale = float(p.value)
                 self.get_logger().info(f'position_scale → {p.value}')
+            elif p.name == 'max_linear_speed_mps':
+                self.max_linear_speed = float(p.value)
+                self.get_logger().info(f'max_linear_speed_mps → {p.value}')
+            elif p.name == 'gripper_p_gain':
+                self.gripper_p_gain = float(p.value)
+                self.get_logger().info(f'gripper_p_gain → {p.value}')
         return SetParametersResult(successful=True)
 
     def _arm_toggle_cb(self, msg: String):
@@ -586,7 +579,6 @@ class KinovaHandController(Node):
                 feedback.base.tool_pose_y,
                 feedback.base.tool_pose_z,
             ])
-            current_theta_z = feedback.base.tool_pose_theta_z
 
             # P-loop: raw velocity from position error
             pos_error = self.target_position - current_pos
@@ -612,15 +604,13 @@ class KinovaHandController(Node):
             if smooth_speed > self.max_linear_speed:
                 send_vel = send_vel * (self.max_linear_speed / smooth_speed)
 
-            # Angular P-loop (theta_z only; theta_x/y are kept fixed)
-            theta_z_err = self.target_theta_z_deg - current_theta_z
-            theta_z_err = (theta_z_err + 180.0) % 360.0 - 180.0  # wrap [-180, 180]
-            ang_vel_z = float(
-                np.clip(self.p_gain * theta_z_err,
-                        -self.max_angular_speed, self.max_angular_speed)
-            )
-
             # ── Send TwistCommand ─────────────────────────────────────────────
+            # Angular velocities are all zero: SINGLE_LEVEL_SERVOING holds
+            # the current EEF orientation passively when no angular velocity
+            # is commanded. We avoid angular P-loop entirely because the Kortex
+            # ZYX Euler decomposition has a gimbal singularity near theta_x=±180°
+            # (the arm's home orientation), causing theta_z to flip between
+            # 89.3° and ≈0°/180° — a P-loop would chase that noise.
             # duration = TWIST_WATCHDOG_MS: robot auto-stops if we miss this
             # many ms worth of ticks (node crash / freeze protection).
             cmd = Base_pb2.TwistCommand()
@@ -631,8 +621,23 @@ class KinovaHandController(Node):
             cmd.twist.linear_z  = float(send_vel[2])
             cmd.twist.angular_x = 0.0
             cmd.twist.angular_y = 0.0
-            cmd.twist.angular_z = ang_vel_z
+            cmd.twist.angular_z = 0.0
             self._base.SendTwistCommand(cmd)
+
+            # ── Gripper speed P-loop ──────────────────────────────────────────
+            # GRIPPER_SPEED mode lets us command motor speed directly, avoiding
+            # the slow internal position controller in GRIPPER_POSITION mode.
+            # Current position comes from BaseCyclic feedback (0–100 → 0.0–1.0).
+            if self.gripper_enabled:
+                current_gripper = feedback.interconnect.gripper_feedback.motor[0].position / 100.0
+                gripper_err = self.gripper_cmd - current_gripper
+                gripper_speed = float(np.clip(self.gripper_p_gain * gripper_err, -1.0, 1.0))
+                gc = Base_pb2.GripperCommand()
+                gc.mode = Base_pb2.GRIPPER_SPEED
+                f = gc.gripper.finger.add()
+                f.finger_identifier = 1
+                f.value = gripper_speed
+                self._base.SendGripperCommand(gc)
 
         except Exception as e:
             err_str = str(e)

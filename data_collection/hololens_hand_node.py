@@ -89,7 +89,7 @@ class HoloLensHandNode(Node):
         # ── Parameters ─────────────────────────────────────────────────────────
         self.pinch_close_m = self.declare_parameter('pinch_close_m', 0.025).value
         self.pinch_open_m  = self.declare_parameter('pinch_open_m',  0.10).value
-        filter_alpha       = self.declare_parameter('filter_alpha',  0.3).value
+        filter_alpha       = self.declare_parameter('filter_alpha',  0.6).value
         # Gripper EMA alpha: higher = faster response, less smoothing.
         # 95 % step response ≈ 3 / (alpha * 30 Hz).
         #   alpha 0.2 → ~500 ms   (smooth, laggy)
@@ -97,7 +97,7 @@ class HoloLensHandNode(Node):
         #   alpha 0.8 → ~125 ms   (responsive, some jitter)
         #   alpha 1.0 → raw, ~33 ms (no filtering)
         # Tune live: ros2 param set /hololens_hand_node grip_alpha <value>
-        grip_alpha         = self.declare_parameter('grip_alpha',    0.6).value
+        grip_alpha         = self.declare_parameter('grip_alpha',    1.0).value
 
         self.ws_x_offset = self.declare_parameter('workspace_x_offset', 0.4).value
         self.ws_y_offset = self.declare_parameter('workspace_y_offset', 0.0).value
