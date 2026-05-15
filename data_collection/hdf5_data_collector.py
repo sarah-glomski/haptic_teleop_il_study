@@ -376,11 +376,15 @@ class HDF5DataCollector(Node):
 
     def get_camera_health(self) -> dict:
         now = time.monotonic()
-        return {
-            name: ('ok' if last is not None and (now - last) < 3.0
-                   else ('waiting' if last is None else 'dead'))
-            for name, last in self._cam_last_seen.items()
-        }
+        result = {}
+        for name in CAMERA_STREAMS:
+            if name not in self._cam_last_seen:
+                result[name] = 'disabled'
+            else:
+                last = self._cam_last_seen[name]
+                result[name] = ('ok' if last is not None and (now - last) < 3.0
+                                else ('waiting' if last is None else 'dead'))
+        return result
 
     def get_piezense_health(self) -> str:
         if not self._enable_piezense:
