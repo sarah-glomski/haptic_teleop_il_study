@@ -408,6 +408,8 @@ class KinovaHandController(Node):
             err_str = str(e)
             if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
                 self._enter_fault_state()
+            elif 'SESSION_NOT_IN_CONTROL' in err_str:
+                pass  # transient during servoing-mode transition; next callback retries
             else:
                 self.get_logger().error(f'Gripper callback error: {e}')
 
@@ -634,6 +636,8 @@ class KinovaHandController(Node):
                 err_str = str(e)
                 if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
                     self._enter_fault_state()
+                elif 'SESSION_NOT_IN_CONTROL' in err_str:
+                    pass  # transient during servoing-mode transition; next tick retries
                 else:
                     self.get_logger().error(f'Arm control loop error: {e}')
                     self._send_zero_twist()
