@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-Episode replay with end-to-end latency measurement — Kinova Gen3.
+Episode replay with end-to-end latency tuning — Kinova Gen3.
 
-Two latency estimates are computed:
+Replays a recorded episode with a forward time offset applied to the action
+sequence to pre-compensate for system latency.  Iterates until the robot
+successfully completes the task (ball in bin).
 
-  1. Offline (from the recording):
-       Cross-correlate hololens/hand_pose_robot_frame vs observation/pose
-       → full pipeline latency at record time (HoloLens sensing → robot state)
+Latency measurements:
+  Offline  — cross-correlate hololens/hand_pose_robot_frame vs observation/pose
+             from the HDF5 file (full pipeline latency at record time)
+  Live     — cross-correlate commanded vs observed TCP during each replay attempt
+             (control-loop latency at replay time)
 
-  2. Live replay:
-       Replay action/pose targets through the same P-loop controller used
-       during collection, cross-correlate commanded vs observed TCP positions
-       → control-loop latency at replay time (command → robot response)
+Time-offset tuning:
+  At step t the robot is commanded action[t + offset] instead of action[t],
+  so the robot reaches the "correct" position earlier, compensating for lag.
+  The first offset is seeded from the offline latency measurement.
+  After each failed attempt the measured live lag is added to the current
+  offset and offered as the suggested next value.
 
 Usage:
   python3.12 replay_episode.py demo_data/episode_9.hdf5
+  python3.12 replay_episode.py demo_data/episode_9.hdf5 --offset 8
   python3.12 replay_episode.py demo_data/episode_9.hdf5 --robot-ip 192.168.1.10
 
 Controls during replay (terminal):
@@ -24,7 +31,6 @@ Controls during replay (terminal):
 
 import argparse
 import os
-import sys
 import threading
 import time
 
@@ -40,12 +46,12 @@ from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
 from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.messages import Session_pb2, Base_pb2
 
-CONTROL_HZ    = 30.0
-WATCHDOG_MS   = 200
-HOME_POS      = (0.474, 0.02, 0.107)     # m  — matches kinova_hand_controller defaults
-HOME_ANGLES   = (-179.3, -0.4, 89.3)     # deg
-WS_BOUNDS     = dict(x=(0.30, 0.60), y=(-0.37, 0.37), z=(0.025, 0.30))
-MARGIN        = 0.005  # m — hard clip inside workspace walls
+CONTROL_HZ  = 30.0
+WATCHDOG_MS = 200
+HOME_POS    = (0.474, 0.02, 0.107)   # m
+HOME_ANGLES = (-179.3, -0.4, 89.3)   # deg
+WS_BOUNDS   = dict(x=(0.30, 0.60), y=(-0.37, 0.37), z=(0.025, 0.30))
+MARGIN      = 0.005  # m
 
 
 # ── Kortex connection ──────────────────────────────────────────────────────────
@@ -64,8 +70,8 @@ class KinovaConn:
         self._session = SessionManager(self._router)
         self._session.CreateSession(info)
 
-        self.base    = BaseClient(self._router)
-        self.cyclic  = BaseCyclicClient(self._router)
+        self.base   = BaseClient(self._router)
+        self.cyclic = BaseCyclicClient(self._router)
         print(f'Connected to Kinova Gen3 at {ip}')
 
     def disconnect(self):
@@ -143,22 +149,40 @@ def reset_to_home(conn: KinovaConn):
     print('At home, gripper open.')
 
 
+# ── Time-offset application ────────────────────────────────────────────────────
+
+def apply_offset(
+    action_pos: np.ndarray,
+    action_gripper: np.ndarray,
+    offset: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Shift action sequence forward by `offset` samples.
+
+    At step t the robot receives action[t + offset].  The last frame is held
+    for the final `offset` steps so the trajectory length stays the same.
+    A negative offset shifts backward (command earlier actions later).
+    """
+    if offset == 0:
+        return action_pos, action_gripper
+    T = len(action_pos)
+    if offset > 0:
+        idx = np.clip(np.arange(T) + offset, 0, T - 1)
+    else:
+        idx = np.clip(np.arange(T) + offset, 0, T - 1)
+    return action_pos[idx], action_gripper[idx]
+
+
 # ── Replay ─────────────────────────────────────────────────────────────────────
 
 def replay(
     conn: KinovaConn,
-    action_pos: np.ndarray,     # (T, 3)
-    action_gripper: np.ndarray, # (T,)
+    action_pos: np.ndarray,
+    action_gripper: np.ndarray,
     p_gain: float = 2.0,
     vel_alpha: float = 0.4,
     max_speed: float = 0.50,
 ) -> dict:
-    """
-    Run the P-loop velocity controller against the recorded action trajectory.
-
-    Returns a log dict with per-tick timestamps, commanded positions,
-    and observed positions.
-    """
     mode = Base_pb2.ServoingModeInformation()
     mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
     conn.base.SetServoingMode(mode)
@@ -168,7 +192,6 @@ def replay(
     smoothed_vel = np.zeros(3)
     t_cmd, cmd_pos, obs_pos, cmd_grip = [], [], [], []
 
-    # Keyboard listener for success/abort
     result   = {'success_t': None, 'aborted': False}
     inp_done = threading.Event()
 
@@ -190,17 +213,14 @@ def replay(
     print("  's' + ENTER = mark success    'q' + ENTER = abort\n")
 
     t0 = time.monotonic()
-    for i, (tgt, grip) in enumerate(zip(action_pos, action_gripper)):
+    for tgt, grip in zip(action_pos, action_gripper):
         if result['aborted']:
             print('Replay aborted.')
             break
 
         tick_start = time.monotonic()
+        obs        = _get_tcp(conn)
 
-        # Observe
-        obs = _get_tcp(conn)
-
-        # P-loop
         tgt_clipped = _clip_workspace(tgt)
         err         = tgt_clipped - obs
         raw_vel     = p_gain * err
@@ -212,22 +232,20 @@ def replay(
         _send_twist(conn, smoothed_vel)
         _send_gripper(conn, grip)
 
-        # Log
         t_cmd.append(time.monotonic() - t0)
         cmd_pos.append(tgt_clipped.copy())
         obs_pos.append(obs.copy())
         cmd_grip.append(float(grip))
 
-        # Pace to CONTROL_HZ
         elapsed = time.monotonic() - tick_start
         if elapsed < dt:
             time.sleep(dt - elapsed)
 
     inp_done.set()
-    _send_twist(conn, np.zeros(3))   # safe stop
+    _send_twist(conn, np.zeros(3))
 
     if result['success_t']:
-        result['success_t'] -= t0    # relative to replay start
+        result['success_t'] -= t0
 
     return {
         't':           np.array(t_cmd),
@@ -242,9 +260,8 @@ def replay(
 
 def _xcorr_lag(signal_a: np.ndarray, signal_b: np.ndarray) -> int | None:
     """
-    Cross-correlate two 1-D signals and return the lag (in samples) such that
-    signal_b[t] ≈ signal_a[t - lag].  Positive lag → b lags behind a.
-    Returns None if either signal has near-zero variance.
+    Return lag (samples) such that signal_b[t] ≈ signal_a[t - lag].
+    Positive → b lags behind a.  None if either signal has near-zero variance.
     """
     a = signal_a - signal_a.mean()
     b = signal_b - signal_b.mean()
@@ -255,11 +272,6 @@ def _xcorr_lag(signal_a: np.ndarray, signal_b: np.ndarray) -> int | None:
 
 
 def compute_latency(cmd: np.ndarray, obs: np.ndarray, hz: float, label: str) -> dict:
-    """
-    Compute per-axis cross-correlation lag between cmd (T, 3) and obs (T, 3).
-
-    Reports and returns a summary dict.
-    """
     axis_names = ['x', 'y', 'z']
     lags, valid_axes = [], []
     for i, ax in enumerate(axis_names):
@@ -275,19 +287,19 @@ def compute_latency(cmd: np.ndarray, obs: np.ndarray, hz: float, label: str) -> 
     mean_lag_s   = np.mean(lags) / hz
     median_lag_s = np.median(lags) / hz
 
-    print(f'\n── {label} latency ─────────────────────────────')
+    print(f'\n── {label} ─────────────────────────────')
     for ax, lag in zip(valid_axes, lags):
         print(f'  {ax}: {lag:+d} samples  ({lag/hz*1000:+.1f} ms)')
     print(f'  Mean:   {np.mean(lags):.1f} samples = {mean_lag_s*1000:.1f} ms')
     print(f'  Median: {np.median(lags):.1f} samples = {median_lag_s*1000:.1f} ms')
 
     return {
-        'label':          label,
-        'lags_samples':   lags,
-        'axes':           valid_axes,
-        'mean_lag_s':     mean_lag_s,
-        'median_lag_s':   median_lag_s,
-        'hz':             hz,
+        'label':        label,
+        'lags_samples': lags,
+        'axes':         valid_axes,
+        'mean_lag_s':   mean_lag_s,
+        'median_lag_s': median_lag_s,
+        'hz':           hz,
     }
 
 
@@ -296,24 +308,23 @@ def compute_latency(cmd: np.ndarray, obs: np.ndarray, hz: float, label: str) -> 
 def plot_results(
     episode_path: str,
     offline: dict,
-    replay_log: dict,
-    live: dict,
+    attempts: list[dict],   # each entry: {offset, replay_log, live_lat}
 ):
-    fig = plt.figure(figsize=(16, 10))
-    gs  = fig.add_gridspec(3, 4, hspace=0.45, wspace=0.35)
-    axes_labels = ['x (m)', 'y (m)', 'z (m)']
+    n_attempts = len(attempts)
+    fig = plt.figure(figsize=(16, 4 + 3 * n_attempts))
+    n_rows = 1 + n_attempts          # 1 offline row + 1 row per attempt
+    gs = fig.add_gridspec(n_rows, 4, hspace=0.5, wspace=0.35)
 
-    # ── Top row: offline latency (recorded hand vs recorded robot) ─────────────
-    hand_pos = offline['hand_pos']   # (T, 3)
-    rec_obs  = offline['obs_pos']    # (T, 3)
+    # ── Offline row ────────────────────────────────────────────────────────────
+    hand_pos = offline['hand_pos']
+    rec_obs  = offline['obs_pos']
     rec_t    = offline['t']
-
-    for i, lbl in enumerate(axes_labels):
+    for i, lbl in enumerate(['x (m)', 'y (m)', 'z (m)']):
         ax = fig.add_subplot(gs[0, i])
-        ax.plot(rec_t, hand_pos[:, i], label='hand (HoloLens)')
-        ax.plot(rec_t, rec_obs[:, i],  label='robot obs', linestyle='--')
+        ax.plot(rec_t, hand_pos[:, i], label='hand')
+        ax.plot(rec_t, rec_obs[:, i],  label='robot', linestyle='--')
         ax.set_title(f'[Offline] {lbl}', fontsize=8)
-        ax.set_xlabel('timestep', fontsize=7)
+        ax.set_xlabel('time (s)', fontsize=7)
         ax.legend(fontsize=6)
         ax.tick_params(labelsize=7)
 
@@ -323,7 +334,7 @@ def plot_results(
         ax_lat.bar(lat['axes'], [s / lat['hz'] * 1000 for s in lat['lags_samples']],
                    color='steelblue')
         ax_lat.axhline(lat['mean_lag_s'] * 1000, color='red', linestyle='--',
-                       label=f'mean {lat["mean_lag_s"]*1000:.1f} ms')
+                       label=f"mean {lat['mean_lag_s']*1000:.0f} ms")
         ax_lat.set_ylabel('lag (ms)')
         ax_lat.set_title('Offline latency\n(HoloLens→robot)', fontsize=8)
         ax_lat.legend(fontsize=7)
@@ -332,76 +343,42 @@ def plot_results(
         ax_lat.set_title('Offline latency', fontsize=8)
     ax_lat.tick_params(labelsize=7)
 
-    # ── Middle row: replay trajectories ───────────────────────────────────────
-    t_rep = replay_log['t']
-    cmd   = replay_log['cmd']
-    obs   = replay_log['obs']
+    # ── One row per attempt ────────────────────────────────────────────────────
+    for row, attempt in enumerate(attempts, start=1):
+        offset    = attempt['offset']
+        log       = attempt['replay_log']
+        live      = attempt['live_lat']
+        succeeded = bool(log.get('success_t'))
+        tag       = f'Attempt {row}  offset={offset} ({offset/CONTROL_HZ*1000:.0f} ms)' \
+                    + (' ✓' if succeeded else '')
 
-    for i, lbl in enumerate(axes_labels):
-        ax = fig.add_subplot(gs[1, i])
-        ax.plot(t_rep, cmd[:, i], label='commanded')
-        ax.plot(t_rep, obs[:, i], label='observed', linestyle='--')
-        if live and live.get('mean_lag_s'):
-            lag_s = live['mean_lag_s']
-            ax.plot(t_rep, np.interp(t_rep - lag_s, t_rep, obs[:, i]),
-                    label=f'obs −{lag_s*1000:.0f} ms', linestyle=':', alpha=0.7)
-        if replay_log.get('success_t'):
-            ax.axvline(replay_log['success_t'], color='green', linestyle='--', alpha=0.6,
-                       label='success')
-        ax.set_title(f'[Replay] {lbl}', fontsize=8)
-        ax.set_xlabel('time (s)', fontsize=7)
-        ax.legend(fontsize=6)
-        ax.tick_params(labelsize=7)
+        for i, lbl in enumerate(['x (m)', 'y (m)', 'z (m)']):
+            ax = fig.add_subplot(gs[row, i])
+            ax.plot(log['t'], log['cmd'][:, i], label='cmd')
+            ax.plot(log['t'], log['obs'][:, i], label='obs', linestyle='--')
+            if log.get('success_t'):
+                ax.axvline(log['success_t'], color='green', linestyle='--', alpha=0.7)
+            ax.set_title(f'[{tag}] {lbl}', fontsize=7)
+            ax.set_xlabel('time (s)', fontsize=7)
+            ax.legend(fontsize=6)
+            ax.tick_params(labelsize=7)
 
-    ax_grip = fig.add_subplot(gs[1, 3])
-    ax_grip.plot(t_rep, replay_log['cmd_gripper'], label='commanded')
-    ax_grip.set_title('[Replay] Gripper', fontsize=8)
-    ax_grip.set_xlabel('time (s)', fontsize=7)
-    ax_grip.set_ylim(-0.05, 1.05)
-    ax_grip.legend(fontsize=7)
-    ax_grip.tick_params(labelsize=7)
+        ax_s = fig.add_subplot(gs[row, 3])
+        if live:
+            lag_ms = [s / live['hz'] * 1000 for s in live['lags_samples']]
+            ax_s.bar(live['axes'], lag_ms, color='darkorange')
+            ax_s.axhline(live['mean_lag_s'] * 1000, color='red', linestyle='--',
+                         label=f"mean {live['mean_lag_s']*1000:.0f} ms")
+            ax_s.set_ylabel('lag (ms)')
+            ax_s.legend(fontsize=7)
+        ax_s.set_title(f'[{tag}]\nLive lag', fontsize=7)
+        ax_s.tick_params(labelsize=7)
 
-    # ── Bottom row: live latency per axis + summary ────────────────────────────
-    ax_live_lat = fig.add_subplot(gs[2, :2])
-    if live:
-        lag_ms = [s / live['hz'] * 1000 for s in live['lags_samples']]
-        ax_live_lat.bar(live['axes'], lag_ms, color='darkorange')
-        ax_live_lat.axhline(live['mean_lag_s'] * 1000, color='red', linestyle='--',
-                            label=f'mean {live["mean_lag_s"]*1000:.1f} ms')
-        ax_live_lat.set_ylabel('lag (ms)')
-        ax_live_lat.set_title('Live replay latency\n(command→robot)', fontsize=8)
-        ax_live_lat.legend(fontsize=7)
-    ax_live_lat.tick_params(labelsize=7)
-
-    ax_summary = fig.add_subplot(gs[2, 2:])
-    ax_summary.axis('off')
-    lines = [
-        f'Episode:  {os.path.basename(episode_path)}',
-        '',
-    ]
-    if offline['latency']:
-        lat = offline['latency']
-        lines += [
-            f'Offline (HoloLens→robot):',
-            f'  {lat["mean_lag_s"]*1000:.1f} ms  ({lat["mean_lag_s"]*lat["hz"]:.1f} frames)',
-        ]
-    if live:
-        lines += [
-            '',
-            f'Live replay (cmd→robot):',
-            f'  {live["mean_lag_s"]*1000:.1f} ms  ({live["mean_lag_s"]*live["hz"]:.1f} frames)',
-        ]
-    if replay_log.get('success_t'):
-        lines += ['', f'Ball in bin at t = {replay_log["success_t"]:.2f} s']
-
-    ax_summary.text(0.05, 0.95, '\n'.join(lines), transform=ax_summary.transAxes,
-                    fontsize=9, verticalalignment='top', fontfamily='monospace')
-
-    fig.suptitle(f'End-to-end latency — {os.path.basename(episode_path)}', fontsize=11)
+    fig.suptitle(f'Latency tuning — {os.path.basename(episode_path)}', fontsize=11)
     plt.tight_layout()
 
     out_path = episode_path.replace('.hdf5', '_latency.png')
-    plt.savefig(out_path, dpi=150)
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
     print(f'\nFigure saved → {out_path}')
     plt.show()
 
@@ -410,29 +387,31 @@ def plot_results(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Replay a recorded episode and measure end-to-end latency'
+        description='Replay episode with time-offset tuning to compensate latency'
     )
-    parser.add_argument('episode', help='Path to episode_N.hdf5')
-    parser.add_argument('--robot-ip',   default='192.168.1.10')
-    parser.add_argument('--p-gain',     type=float, default=2.0)
-    parser.add_argument('--vel-alpha',  type=float, default=0.4)
-    parser.add_argument('--max-speed',  type=float, default=0.50, metavar='M/S')
-    parser.add_argument('--skip-reset', action='store_true',
-                        help='Skip home reset (robot must already be at home)')
+    parser.add_argument('episode',       help='Path to episode_N.hdf5')
+    parser.add_argument('--robot-ip',    default='192.168.1.10')
+    parser.add_argument('--p-gain',      type=float, default=2.0)
+    parser.add_argument('--vel-alpha',   type=float, default=0.4)
+    parser.add_argument('--max-speed',   type=float, default=0.50, metavar='M/S')
+    parser.add_argument('--offset',      type=int,   default=None,
+                        help='Starting time offset in samples (default: auto from offline lag)')
+    parser.add_argument('--skip-reset',  action='store_true',
+                        help='Skip home reset on the first attempt')
     args = parser.parse_args()
 
     # ── Load episode ───────────────────────────────────────────────────────────
     with h5py.File(args.episode, 'r') as f:
         T   = int(f.attrs.get('num_frames', 0) or f['action/pose'].shape[0])
         hz  = float(f.attrs.get('collection_rate_hz', 30))
-        action_pos     = f['action/pose'][:, :3].astype(np.float64)      # (T, 3)
-        action_gripper = f['action/gripper'][()].astype(np.float64)      # (T,)
-        obs_pos_rec    = f['observation/pose'][:, :3].astype(np.float64) # (T, 3)
+        action_pos     = f['action/pose'][:, :3].astype(np.float64)
+        action_gripper = f['action/gripper'][()].astype(np.float64)
+        obs_pos_rec    = f['observation/pose'][:, :3].astype(np.float64)
         hand_pos_rec   = f['hololens/hand_pose_robot_frame'][:, :3].astype(np.float64)
 
     print(f'Loaded {T} frames @ {hz:.0f} Hz  ({T/hz:.1f} s)  ←  {args.episode}')
 
-    # ── Offline latency (recorded hand → recorded robot) ──────────────────────
+    # ── Offline latency ────────────────────────────────────────────────────────
     print('\nComputing offline latency from recorded data …')
     rec_t = np.arange(T) / hz
     offline_lat = compute_latency(hand_pos_rec, obs_pos_rec, hz,
@@ -444,28 +423,92 @@ def main():
         'latency':  offline_lat,
     }
 
-    # ── Live replay ────────────────────────────────────────────────────────────
+    # Seed offset from offline lag if not given explicitly
+    if args.offset is not None:
+        offset = args.offset
+    elif offline_lat:
+        offset = round(offline_lat['mean_lag_s'] * CONTROL_HZ)
+        print(f'\nAuto-seeding offset from offline lag: {offset} samples '
+              f'({offset/CONTROL_HZ*1000:.0f} ms)')
+    else:
+        offset = 0
+
+    # ── Tuning loop ────────────────────────────────────────────────────────────
     print('\n' + '─' * 50)
-    print('Connecting to robot for live replay …')
+    print('Connecting to robot …')
+    attempts = []
+
     with KinovaConn(args.robot_ip) as conn:
-        if not args.skip_reset:
-            reset_to_home(conn)
-            print('\nPlace the ball on the table at its starting position, then press ENTER to start replay.')
+        attempt_num = 0
+        first       = True
+
+        while True:
+            attempt_num += 1
+            print(f'\n══ Attempt {attempt_num}  |  offset = {offset} samples '
+                  f'({offset/CONTROL_HZ*1000:.0f} ms) ══')
+
+            if not (first and args.skip_reset):
+                reset_to_home(conn)
+            first = False
+
+            print('Place the ball on the table at its starting position, '
+                  'then press ENTER to start replay.')
             input()
 
-        replay_log = replay(
-            conn, action_pos, action_gripper,
-            p_gain=args.p_gain,
-            vel_alpha=args.vel_alpha,
-            max_speed=args.max_speed,
-        )
+            pos_shifted, grip_shifted = apply_offset(action_pos, action_gripper, offset)
 
-    # ── Live latency ───────────────────────────────────────────────────────────
-    live_lat = compute_latency(replay_log['cmd'], replay_log['obs'],
-                               CONTROL_HZ, label='Live replay (cmd → robot obs)')
+            replay_log = replay(
+                conn, pos_shifted, grip_shifted,
+                p_gain=args.p_gain,
+                vel_alpha=args.vel_alpha,
+                max_speed=args.max_speed,
+            )
 
-    # ── Plot ───────────────────────────────────────────────────────────────────
-    plot_results(args.episode, offline, replay_log, live_lat)
+            live_lat = compute_latency(
+                replay_log['cmd'], replay_log['obs'],
+                CONTROL_HZ, label=f'Live (attempt {attempt_num})'
+            )
+
+            attempts.append({
+                'offset':     offset,
+                'replay_log': replay_log,
+                'live_lat':   live_lat,
+            })
+
+            if replay_log.get('success_t'):
+                print(f'\n✓ Success!  offset = {offset} samples '
+                      f'({offset/CONTROL_HZ*1000:.0f} ms)  '
+                      f'ball in bin at t = {replay_log["success_t"]:.2f} s')
+                break
+
+            if replay_log['aborted']:
+                print('Aborted — exiting tuning loop.')
+                break
+
+            # Suggest next offset
+            if live_lat:
+                suggested = offset + round(live_lat['mean_lag_s'] * CONTROL_HZ)
+                print(f'\nResidual live lag: {live_lat["mean_lag_s"]*1000:.0f} ms  '
+                      f'→ suggested next offset: {suggested} samples '
+                      f'({suggested/CONTROL_HZ*1000:.0f} ms)')
+            else:
+                suggested = offset
+
+            print(f'\nOptions:  r = retry with suggested offset ({suggested})'
+                  f'  |  <N> = custom offset  |  q = quit')
+            resp = input('> ').strip().lower()
+            if resp == 'q':
+                print('Exiting tuning loop.')
+                break
+            elif resp == 'r' or resp == '':
+                offset = suggested
+            elif resp.lstrip('-').isdigit():
+                offset = int(resp)
+            # else: keep current offset and retry
+
+    # ── Plot all attempts ──────────────────────────────────────────────────────
+    if attempts:
+        plot_results(args.episode, offline, attempts)
 
 
 if __name__ == '__main__':
