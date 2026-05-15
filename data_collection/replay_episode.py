@@ -450,7 +450,7 @@ def main():
     with KinovaConn(args.robot_ip) as conn:
         if not args.skip_reset:
             reset_to_home(conn)
-            print('\nPlace the ball in the gripper, then press ENTER to start replay.')
+            print('\nPlace the ball on the table at its starting position, then press ENTER to start replay.')
             input()
 
         replay_log = replay(
