@@ -55,6 +55,7 @@ def generate_launch_description(
     dji_device: int = 0,
     no_zed: bool = False,
     no_cameras: bool = False,
+    no_piezense: bool = False,
 ) -> LaunchDescription:
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -120,11 +121,11 @@ def generate_launch_description(
         ),
 
         # ── 6. Piezense pressure sensor controller ────────────────────────────
-        ExecuteProcess(
+        *([ExecuteProcess(
             cmd=['ros2', 'launch', 'piezense_ros', 'ar_teleop_piezense_launch.py'],
             name='piezense_driver',
             output='screen',
-        ),
+        )] if not no_piezense else []),
 
         # ── 7. HDF5 data collector (pygame UI runs here) ──────────────────────
         ExecuteProcess(
@@ -133,6 +134,7 @@ def generate_launch_description(
                 '--ros-args',
                 '-p', f'enable_zed:={str(not (no_zed or no_cameras)).lower()}',
                 '-p', f'enable_dji:={str(not no_cameras).lower()}',
+                '-p', f'enable_piezense:={str(not no_piezense).lower()}',
             ],
             name='hdf5_data_collector',
             output='screen',
@@ -189,6 +191,8 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('--no-cameras', action='store_true',
                         help='Skip all camera nodes and disable camera sync in the data collector. '
                              'Implies --no-zed. Use when cameras are unavailable.')
+    parser.add_argument('--no-piezense', action='store_true',
+                        help='Skip piezense driver and disable piezense recording.')
     args, launch_argv = parser.parse_known_args(argv)
 
     print('=' * 60)
@@ -218,6 +222,7 @@ def main(argv=sys.argv[1:]):
         dji_device=args.dji_device,
         no_zed=args.no_zed or args.no_cameras,
         no_cameras=args.no_cameras,
+        no_piezense=args.no_piezense,
     )
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)

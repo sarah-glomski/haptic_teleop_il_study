@@ -187,13 +187,17 @@ class HDF5DataCollector(Node):
         self.create_subscription(PoseStamped, '/hololens/gaze',        lambda m: setattr(self, '_latest_holo_gaze',  m), 10)
 
         # Piezense pressure input (latest-value side channel)
+        self._enable_piezense    = self.declare_parameter('enable_piezense', True).value
         self._latest_piezense_input = np.zeros(PIEZENSE_INPUT_CHANNELS, dtype=np.float32)
         self._piezense_last_seen    = None
         self._piezense_warned       = False
-        # Piezense driver publishes RELIABLE (default QoS); BEST_EFFORT is incompatible.
-        self.create_subscription(PiezenseSystemArray, 'piezense/data',
-                                 self._piezense_cb, 10)
-        self.create_timer(2.0, self._check_piezense_health)
+        if self._enable_piezense:
+            # Piezense driver publishes RELIABLE (default QoS); BEST_EFFORT is incompatible.
+            self.create_subscription(PiezenseSystemArray, 'piezense/data',
+                                     self._piezense_cb, 10)
+            self.create_timer(2.0, self._check_piezense_health)
+        else:
+            self.get_logger().info('Piezense disabled (enable_piezense=false)')
 
         # ── Camera health monitoring ──────────────────────────────────────────
         self._node_start_time = time.monotonic()
@@ -316,7 +320,8 @@ class HDF5DataCollector(Node):
             self._buf_hand_width.append(self._latest_hand_width)
 
             # Piezense pressure input (latest-value)
-            self._buf_piezense_input.append(self._latest_piezense_input.copy())
+            if self._enable_piezense:
+                self._buf_piezense_input.append(self._latest_piezense_input.copy())
 
             # Images
             if self._enable_zed:
@@ -376,6 +381,14 @@ class HDF5DataCollector(Node):
                    else ('waiting' if last is None else 'dead'))
             for name, last in self._cam_last_seen.items()
         }
+
+    def get_piezense_health(self) -> str:
+        if not self._enable_piezense:
+            return 'disabled'
+        now = time.monotonic()
+        if self._piezense_last_seen is None:
+            return 'waiting' if (now - self._node_start_time) < 5.0 else 'dead'
+        return 'ok' if (now - self._piezense_last_seen) < 3.0 else 'dead'
 
     # ── Collection controls ───────────────────────────────────────────────────
     def start_collection(self):
@@ -452,7 +465,8 @@ class HDF5DataCollector(Node):
             holo_gaze       = np.array(self._buf_holo_gaze_pose,  dtype=np.float32)
             finger_tips      = np.array(self._buf_finger_tips,      dtype=np.float32)
             hand_width       = np.array(self._buf_hand_width,       dtype=np.float32)
-            piezense_input   = np.array(self._buf_piezense_input,   dtype=np.float32)
+            if self._enable_piezense:
+                piezense_input = np.array(self._buf_piezense_input, dtype=np.float32)
             if self._enable_zed:
                 zed_front = np.array(self._buf_zed_front, dtype=np.uint8)
             if self._enable_dji:
@@ -481,10 +495,11 @@ class HDF5DataCollector(Node):
             # hand/pose (robot-frame palm) lives here too for easy access
             hl.create_dataset('hand_pose_robot_frame', data=hand_pose)
 
-            pz = f.create_group('piezense')
-            pz.create_dataset('pressure_input', data=piezense_input)
-            pz.attrs['channel_ids'] = PIEZENSE_INPUT_CHAN_IDS
-            pz.attrs['units'] = 'Pa'
+            if self._enable_piezense:
+                pz = f.create_group('piezense')
+                pz.create_dataset('pressure_input', data=piezense_input)
+                pz.attrs['channel_ids'] = PIEZENSE_INPUT_CHAN_IDS
+                pz.attrs['units'] = 'Pa'
 
             if self._enable_zed or self._enable_dji:
                 imgs = f.create_group('images')
@@ -540,14 +555,22 @@ def run_pygame(node: HDF5DataCollector):
         screen.blit(font.render(f'Frames: {n_frames}',          True, (200, 200, 200)), (20, 55))
         screen.blit(font.render(f'Next episode: {node.demo_count}', True, (200, 200, 200)), (20, 90))
 
-        # Camera health dots
-        health_colors = {'ok': (80, 200, 80), 'waiting': (255, 200, 50), 'dead': (220, 50, 50)}
+        # Sensor health dots (cameras + piezense)
+        health_colors = {
+            'ok':       ( 80, 200,  80),
+            'waiting':  (255, 200,  50),
+            'dead':     (220,  50,  50),
+            'disabled': ( 80,  80,  80),
+        }
         x_pos = 20
         for cam_name, cam_status in node.get_camera_health().items():
             color = health_colors[cam_status]
             pygame.draw.circle(screen, color, (x_pos + 6, 132), 6)
             screen.blit(small_font.render(cam_name, True, (200, 200, 200)), (x_pos + 16, 126))
             x_pos += 160
+        pz_color = health_colors[node.get_piezense_health()]
+        pygame.draw.circle(screen, pz_color, (x_pos + 6, 132), 6)
+        screen.blit(small_font.render('piezense', True, (200, 200, 200)), (x_pos + 16, 126))
 
         # Controls
         controls = [
