@@ -190,8 +190,9 @@ class HDF5DataCollector(Node):
         self._latest_piezense_input = np.zeros(PIEZENSE_INPUT_CHANNELS, dtype=np.float32)
         self._piezense_last_seen    = None
         self._piezense_warned       = False
+        # Piezense driver publishes RELIABLE (default QoS); BEST_EFFORT is incompatible.
         self.create_subscription(PiezenseSystemArray, 'piezense/data',
-                                 self._piezense_cb, qos_profile=sensor_qos)
+                                 self._piezense_cb, 10)
         self.create_timer(2.0, self._check_piezense_health)
 
         # ── Camera health monitoring ──────────────────────────────────────────
