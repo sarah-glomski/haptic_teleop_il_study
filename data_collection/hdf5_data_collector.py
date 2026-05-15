@@ -112,7 +112,9 @@ class HDF5DataCollector(Node):
         super().__init__('hdf5_data_collector')
         self.get_logger().info('Initializing HDF5 Data Collector …')
 
-        self._bridge = CvBridge()
+        self._enable_cameras = self.declare_parameter('enable_cameras', True).value
+
+        self._bridge = CvBridge() if self._enable_cameras else None
 
         sensor_qos = QoSProfile(
             depth=10,
@@ -121,30 +123,36 @@ class HDF5DataCollector(Node):
         )
 
         # ── Core synchronized subscribers ──────────────────────────────────────
-        # 7 streams: robot action/obs (pose + gripper) + hand/pose + 2 cameras
         self._sub_action_pose    = Subscriber(self, PoseStamped, 'robot_action/pose',    qos_profile=sensor_qos)
         self._sub_action_gripper = Subscriber(self, Float32,     'robot_action/gripper', qos_profile=sensor_qos)
         self._sub_obs_pose       = Subscriber(self, PoseStamped, 'robot_obs/pose',       qos_profile=sensor_qos)
         self._sub_obs_gripper    = Subscriber(self, Float32,     'robot_obs/gripper',    qos_profile=sensor_qos)
         self._sub_hand_pose      = Subscriber(self, PoseStamped, 'hand/pose',            qos_profile=sensor_qos)
-        self._sub_zed_front      = Subscriber(self, Image, CAMERA_STREAMS['zed_front'],  qos_profile=sensor_qos)
-        self._sub_dji_wrist       = Subscriber(self, Image, CAMERA_STREAMS['dji_wrist'],   qos_profile=sensor_qos)
+
+        sync_subs = [
+            self._sub_action_pose,
+            self._sub_action_gripper,
+            self._sub_obs_pose,
+            self._sub_obs_gripper,
+            self._sub_hand_pose,
+        ]
+
+        if self._enable_cameras:
+            self._sub_zed_front = Subscriber(self, Image, CAMERA_STREAMS['zed_front'], qos_profile=sensor_qos)
+            self._sub_dji_wrist = Subscriber(self, Image, CAMERA_STREAMS['dji_wrist'], qos_profile=sensor_qos)
+            sync_subs += [self._sub_zed_front, self._sub_dji_wrist]
 
         self._sync = ApproximateTimeSynchronizer(
-            [
-                self._sub_action_pose,
-                self._sub_action_gripper,
-                self._sub_obs_pose,
-                self._sub_obs_gripper,
-                self._sub_hand_pose,
-                self._sub_zed_front,
-                self._sub_dji_wrist,
-            ],
+            sync_subs,
             queue_size=100,
             slop=0.12,
             allow_headerless=True,
         )
-        self._sync.registerCallback(self._synced_callback)
+
+        if self._enable_cameras:
+            self._sync.registerCallback(self._synced_callback)
+        else:
+            self._sync.registerCallback(lambda *a: self._synced_callback(*a, None, None))
 
         # ── Side-channel subscriptions (latest-value at each sync tick) ──────
         # Robot joint states
@@ -179,16 +187,21 @@ class HDF5DataCollector(Node):
         self.create_timer(2.0, self._check_piezense_health)
 
         # ── Camera health monitoring ──────────────────────────────────────────
-        self._cam_last_seen  = {k: None for k in CAMERA_STREAMS}
-        self._cam_drop_warned = {k: False for k in CAMERA_STREAMS}
         self._node_start_time = time.monotonic()
-        for cam_name, topic in CAMERA_STREAMS.items():
-            self.create_subscription(
-                Image, topic,
-                lambda _msg, n=cam_name: self._cam_heartbeat(n),
-                qos_profile=sensor_qos,
-            )
-        self.create_timer(2.0, self._check_camera_health)
+        if self._enable_cameras:
+            self._cam_last_seen   = {k: None  for k in CAMERA_STREAMS}
+            self._cam_drop_warned = {k: False for k in CAMERA_STREAMS}
+            for cam_name, topic in CAMERA_STREAMS.items():
+                self.create_subscription(
+                    Image, topic,
+                    lambda _msg, n=cam_name: self._cam_heartbeat(n),
+                    qos_profile=sensor_qos,
+                )
+            self.create_timer(2.0, self._check_camera_health)
+        else:
+            self._cam_last_seen   = {}
+            self._cam_drop_warned = {}
+            self.get_logger().info('Cameras disabled (enable_cameras=false)')
 
         # ── Control publishers ─────────────────────────────────────────────────
         self.reset_pub = self.create_publisher(Bool, '/reset_kinova', 10)
@@ -268,8 +281,8 @@ class HDF5DataCollector(Node):
         obs_pose_msg: PoseStamped,
         obs_gripper_msg: Float32,
         hand_pose_msg: PoseStamped,
-        zed_front_msg: Image,
-        dji_wrist_msg: Image,
+        zed_front_msg=None,
+        dji_wrist_msg=None,
     ):
         if not self.is_collecting or self.is_paused:
             return
@@ -294,8 +307,9 @@ class HDF5DataCollector(Node):
             self._buf_piezense_input.append(self._latest_piezense_input.copy())
 
             # Images
-            self._buf_zed_front.append(self._decode_image(zed_front_msg))
-            self._buf_dji_wrist.append(self._decode_image(dji_wrist_msg))
+            if self._enable_cameras:
+                self._buf_zed_front.append(self._decode_image(zed_front_msg))
+                self._buf_dji_wrist.append(self._decode_image(dji_wrist_msg))
 
         count = len(self._buf_action_pose)
         if count % 30 == 0:
@@ -426,8 +440,9 @@ class HDF5DataCollector(Node):
             finger_tips      = np.array(self._buf_finger_tips,      dtype=np.float32)
             hand_width       = np.array(self._buf_hand_width,       dtype=np.float32)
             piezense_input   = np.array(self._buf_piezense_input,   dtype=np.float32)
-            zed_front        = np.array(self._buf_zed_front,        dtype=np.uint8)
-            dji_wrist         = np.array(self._buf_dji_wrist,         dtype=np.uint8)
+            if self._enable_cameras:
+                zed_front = np.array(self._buf_zed_front, dtype=np.uint8)
+                dji_wrist = np.array(self._buf_dji_wrist, dtype=np.uint8)
 
         os.makedirs(self._save_dir, exist_ok=True)
         filename = os.path.join(self._save_dir, f'episode_{self.demo_count}.hdf5')
@@ -457,9 +472,10 @@ class HDF5DataCollector(Node):
             pz.attrs['channel_ids'] = PIEZENSE_INPUT_CHAN_IDS
             pz.attrs['units'] = 'Pa'
 
-            imgs = f.create_group('images')
-            imgs.create_dataset('zed_front', data=zed_front, compression='lzf')
-            imgs.create_dataset('dji_wrist',  data=dji_wrist,  compression='lzf')
+            if self._enable_cameras:
+                imgs = f.create_group('images')
+                imgs.create_dataset('zed_front', data=zed_front, compression='lzf')
+                imgs.create_dataset('dji_wrist',  data=dji_wrist,  compression='lzf')
 
             f.attrs['num_frames']         = len(action_pose)
             f.attrs['collection_rate_hz'] = 30

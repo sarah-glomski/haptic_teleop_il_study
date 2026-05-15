@@ -53,6 +53,7 @@ def generate_launch_description(
     zed_serial: str = ZED_SERIAL,
     dji_device: int = 0,
     no_zed: bool = False,
+    no_cameras: bool = False,
 ) -> LaunchDescription:
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -64,6 +65,8 @@ def generate_launch_description(
 
         # ── 1. rosbridge WebSocket server ─────────────────────────────────────
         # The HoloLens Unity app connects to ws://<host-ip>:9090
+        # Force system python3 in PATH so the #!/usr/bin/env python3 shebang
+        # doesn't resolve to miniforge Python 3.13 (which lacks rclpy C extensions).
         Node(
             package='rosbridge_server',
             executable='rosbridge_websocket',
@@ -73,6 +76,12 @@ def generate_launch_description(
                 'port': 9090,
                 'address': '',
             }],
+            additional_env={
+                'PATH': ':'.join(
+                    p for p in os.environ.get('PATH', '').split(':')
+                    if 'miniforge' not in p and 'conda' not in p
+                ),
+            },
         ),
 
         # ── 2. HoloLens TF publisher ──────────────────────────────────────────
@@ -118,7 +127,10 @@ def generate_launch_description(
 
         # ── 7. HDF5 data collector (pygame UI runs here) ──────────────────────
         ExecuteProcess(
-            cmd=[_PYTHON, script('hdf5_data_collector.py')],
+            cmd=[
+                _PYTHON, script('hdf5_data_collector.py'),
+                *(['--ros-args', '-p', 'enable_cameras:=false'] if no_cameras else []),
+            ],
             name='hdf5_data_collector',
             output='screen',
         ),
@@ -145,10 +157,7 @@ def generate_launch_description(
         )] if not no_zed else []),
 
         # ── 8. DJI Osmo Action 4 — wrist-mounted camera ──────────────────────
-        # Publishes on /dji_wrist/dji_wrist/color/image_raw to match what the
-        # HDF5 data collector expects. Set --dji-device if /dev/video0 is wrong
-        # (run dji_camera_validate.py first to confirm the device index).
-        ExecuteProcess(
+        *([ExecuteProcess(
             cmd=[
                 _PYTHON, script('dji_camera_node.py'),
                 '--ros-args',
@@ -157,7 +166,7 @@ def generate_launch_description(
             ],
             name='dji_wrist_camera',
             output='screen',
-        ),
+        )] if not no_cameras else []),
     ])
 
 
@@ -174,6 +183,9 @@ def main(argv=sys.argv[1:]):
                              'Run dji_camera_validate.py first to confirm.')
     parser.add_argument('--no-zed', action='store_true',
                         help='Skip launching the ZED M camera node (e.g. if ZED SDK is not installed).')
+    parser.add_argument('--no-cameras', action='store_true',
+                        help='Skip all camera nodes and disable camera sync in the data collector. '
+                             'Implies --no-zed. Use when cameras are unavailable.')
     args, launch_argv = parser.parse_known_args(argv)
 
     print('=' * 60)
@@ -195,7 +207,8 @@ def main(argv=sys.argv[1:]):
         robot_ip=args.robot_ip,
         zed_serial=args.zed_serial,
         dji_device=args.dji_device,
-        no_zed=args.no_zed,
+        no_zed=args.no_zed or args.no_cameras,
+        no_cameras=args.no_cameras,
     )
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)
