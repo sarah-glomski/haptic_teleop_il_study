@@ -55,12 +55,10 @@ import os
 import threading
 import time
 
-import cv2
 import h5py
 import numpy as np
 import pygame
 import rclpy
-from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.executors import MultiThreadedExecutor
@@ -114,8 +112,6 @@ class HDF5DataCollector(Node):
 
         self._enable_zed = self.declare_parameter('enable_zed', True).value
         self._enable_dji = self.declare_parameter('enable_dji', True).value
-
-        self._bridge = CvBridge() if (self._enable_zed or self._enable_dji) else None
 
         sensor_qos = QoSProfile(
             depth=10,
@@ -334,9 +330,11 @@ class HDF5DataCollector(Node):
             self.get_logger().info(f'Collected {count} frames')
 
     def _decode_image(self, msg: Image) -> np.ndarray:
-        """Convert sensor_msgs/Image to CHW uint8 numpy array."""
-        rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-        return rgb.transpose(2, 0, 1)  # HWC → CHW
+        """Convert sensor_msgs/Image to CHW uint8 numpy array without cv_bridge."""
+        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+        if msg.encoding in ('bgr8', 'bgr24'):
+            frame = frame[:, :, ::-1]  # BGR → RGB
+        return np.ascontiguousarray(frame.transpose(2, 0, 1))  # HWC → CHW
 
     # ── Camera health ─────────────────────────────────────────────────────────
     def _cam_heartbeat(self, name: str):

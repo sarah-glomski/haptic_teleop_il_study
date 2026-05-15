@@ -32,11 +32,11 @@ Usage:
 import threading
 
 import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
 
 
 class DJICameraNode(Node):
@@ -56,9 +56,8 @@ class DJICameraNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
-        self._pub    = self.create_publisher(Image, '/wrist_cam/image_raw', sensor_qos)
-        self._bridge = CvBridge()
-        self._cap    = None
+        self._pub = self.create_publisher(Image, '/wrist_cam/image_raw', sensor_qos)
+        self._cap = None
 
         # Latest frame shared between capture thread and publish timer
         self._latest_frame = None
@@ -113,9 +112,15 @@ class DJICameraNode(Node):
         if frame is None:
             return
 
-        msg = self._bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+        msg              = Image()
         msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id
+        msg.height       = frame.shape[0]
+        msg.width        = frame.shape[1]
+        msg.encoding     = 'bgr8'
+        msg.is_bigendian = False
+        msg.step         = frame.shape[1] * frame.shape[2]
+        msg.data         = frame.tobytes()
         self._pub.publish(msg)
 
     def destroy_node(self):
