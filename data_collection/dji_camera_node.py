@@ -45,8 +45,8 @@ class DJICameraNode(Node):
         super().__init__('dji_camera_node')
 
         self.device_index = self.declare_parameter('device_index', 0).value
-        self.width        = self.declare_parameter('width',        1280).value
-        self.height       = self.declare_parameter('height',        720).value
+        self.width        = self.declare_parameter('width',        640).value
+        self.height       = self.declare_parameter('height',       480).value
         fps               = self.declare_parameter('fps',           30.0).value
         self.frame_id     = self.declare_parameter('frame_id',     'wrist_cam').value
 
