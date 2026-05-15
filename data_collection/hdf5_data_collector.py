@@ -126,37 +126,34 @@ class HDF5DataCollector(Node):
         self._sub_obs_gripper    = Subscriber(self, Float32,     'robot_obs/gripper',    qos_profile=sensor_qos)
         self._sub_hand_pose      = Subscriber(self, PoseStamped, 'hand/pose',            qos_profile=sensor_qos)
 
-        sync_subs = [
-            self._sub_action_pose,
-            self._sub_action_gripper,
-            self._sub_obs_pose,
-            self._sub_obs_gripper,
-            self._sub_hand_pose,
-        ]
+        # Cameras are latest-value side channels — NOT in the sync — so a camera
+        # dropout never stalls the synchronizer or blocks data collection.
+        self._latest_zed_frame = None
+        self._latest_dji_frame = None
         if self._enable_zed:
-            self._sub_zed_isometric = Subscriber(self, Image, CAMERA_STREAMS['zed_isometric'], qos_profile=sensor_qos)
-            sync_subs.append(self._sub_zed_isometric)
+            self.create_subscription(
+                Image, CAMERA_STREAMS['zed_isometric'],
+                self._zed_cb, qos_profile=sensor_qos,
+            )
         if self._enable_dji:
-            self._sub_dji_wrist = Subscriber(self, Image, CAMERA_STREAMS['dji_wrist'], qos_profile=sensor_qos)
-            sync_subs.append(self._sub_dji_wrist)
+            self.create_subscription(
+                Image, CAMERA_STREAMS['dji_wrist'],
+                self._dji_cb, qos_profile=sensor_qos,
+            )
 
         self._sync = ApproximateTimeSynchronizer(
-            sync_subs,
+            [
+                self._sub_action_pose,
+                self._sub_action_gripper,
+                self._sub_obs_pose,
+                self._sub_obs_gripper,
+                self._sub_hand_pose,
+            ],
             queue_size=100,
             slop=0.12,
             allow_headerless=True,
         )
-
-        # Dispatch: positional args from sync are (base×5 [, zed] [, dji])
-        _ez, _ed = self._enable_zed, self._enable_dji
-        def _dispatch(*args):
-            it = iter(args[5:])
-            self._synced_callback(
-                *args[:5],
-                next(it) if _ez else None,
-                next(it) if _ed else None,
-            )
-        self._sync.registerCallback(_dispatch)
+        self._sync.registerCallback(self._synced_callback)
 
         # ── Side-channel subscriptions (latest-value at each sync tick) ──────
         # Robot joint states
@@ -286,6 +283,12 @@ class HDF5DataCollector(Node):
                 )
 
     # ── Core synced callback ──────────────────────────────────────────────────
+    def _zed_cb(self, msg: Image):
+        self._latest_zed_frame = self._decode_image(msg)
+
+    def _dji_cb(self, msg: Image):
+        self._latest_dji_frame = self._decode_image(msg)
+
     def _synced_callback(
         self,
         action_pose_msg: PoseStamped,
@@ -293,8 +296,6 @@ class HDF5DataCollector(Node):
         obs_pose_msg: PoseStamped,
         obs_gripper_msg: Float32,
         hand_pose_msg: PoseStamped,
-        zed_isometric_msg=None,
-        dji_wrist_msg=None,
     ):
         if not self.is_collecting or self.is_paused:
             return
@@ -319,11 +320,11 @@ class HDF5DataCollector(Node):
             if self._enable_piezense:
                 self._buf_piezense_input.append(self._latest_piezense_input.copy())
 
-            # Images
-            if self._enable_zed:
-                self._buf_zed_isometric.append(self._decode_image(zed_isometric_msg))
-            if self._enable_dji:
-                self._buf_dji_wrist.append(self._decode_image(dji_wrist_msg))
+            # Images (latest-value — decoupled from sync so dropouts don't stall)
+            if self._enable_zed and self._latest_zed_frame is not None:
+                self._buf_zed_isometric.append(self._latest_zed_frame.copy())
+            if self._enable_dji and self._latest_dji_frame is not None:
+                self._buf_dji_wrist.append(self._latest_dji_frame.copy())
 
         count = len(self._buf_action_pose)
         if count % 30 == 0:
@@ -469,10 +470,11 @@ class HDF5DataCollector(Node):
             hand_width       = np.array(self._buf_hand_width,       dtype=np.float32)
             if self._enable_piezense:
                 piezense_input = np.array(self._buf_piezense_input, dtype=np.float32)
-            if self._enable_zed:
-                zed_isometric = np.array(self._buf_zed_isometric, dtype=np.uint8)
-            if self._enable_dji:
-                dji_wrist = np.array(self._buf_dji_wrist, dtype=np.uint8)
+            T = len(action_pose)
+            if self._enable_zed and self._buf_zed_isometric:
+                zed_isometric = np.array(self._buf_zed_isometric[:T], dtype=np.uint8)
+            if self._enable_dji and self._buf_dji_wrist:
+                dji_wrist = np.array(self._buf_dji_wrist[:T], dtype=np.uint8)
 
         os.makedirs(self._save_dir, exist_ok=True)
         filename = os.path.join(self._save_dir, f'episode_{self.demo_count}.hdf5')
@@ -503,11 +505,12 @@ class HDF5DataCollector(Node):
                 pz.attrs['channel_ids'] = PIEZENSE_INPUT_CHAN_IDS
                 pz.attrs['units'] = 'Pa'
 
-            if self._enable_zed or self._enable_dji:
+            if (self._enable_zed and self._buf_zed_isometric) or \
+               (self._enable_dji and self._buf_dji_wrist):
                 imgs = f.create_group('images')
-                if self._enable_zed:
+                if self._enable_zed and self._buf_zed_isometric:
                     imgs.create_dataset('zed_isometric', data=zed_isometric, compression='lzf')
-                if self._enable_dji:
+                if self._enable_dji and self._buf_dji_wrist:
                     imgs.create_dataset('dji_wrist', data=dji_wrist, compression='lzf')
 
             f.attrs['num_frames']         = len(action_pose)
