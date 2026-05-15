@@ -35,6 +35,7 @@ Keyboard controls (in the pygame window):
 
 import argparse
 import os
+import subprocess
 import sys
 
 from launch import LaunchDescription, LaunchService
@@ -204,6 +205,12 @@ def main(argv=sys.argv[1:]):
     print('  R - Reset robot   S - Start   D - Done/Save')
     print('  P - Pause         U - Unpause Q - Quit')
     print('=' * 60)
+
+    # Kill any stale process holding port 9090 (e.g. a previous rosbridge run).
+    result = subprocess.run(['fuser', '-k', '9090/tcp'],
+                            stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    if result.returncode == 0:
+        print('Killed stale process on port 9090')
 
     ld = generate_launch_description(
         robot_ip=args.robot_ip,
