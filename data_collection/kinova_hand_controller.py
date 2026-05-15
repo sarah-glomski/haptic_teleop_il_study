@@ -198,7 +198,7 @@ class KinovaHandController(Node):
 
         # ── Subscriptions ───────────────────────────────────────────────────────
         self.create_subscription(PoseStamped, 'hand/pose',            self._hand_pose_cb,       10)
-        self.create_subscription(Float32,     'hand/gripper_cmd',     self._gripper_cb,         10)
+        self.create_subscription(Float32,     'hand/gripper_cmd',     self._gripper_cb,         1)
         self.create_subscription(Bool,        'hand/tracking_active', self._tracking_status_cb, 10)
         self.create_subscription(Bool,        '/reset_kinova',        self._reset_cb,           10)
         self.create_subscription(Bool,        '/pause_kinova',        self._pause_cb,           10)
@@ -393,9 +393,23 @@ class KinovaHandController(Node):
         if self.is_resetting or self.is_paused or not self.gripper_enabled or self._is_faulted:
             return
 
-        # Only update the target — the 30 Hz control loop sends GRIPPER_SPEED commands.
         self.gripper_cmd = goal_gripper
         self.action_gripper_pub.publish(Float32(data=self.gripper_cmd))
+
+        # Send immediately — no timer wait — to eliminate up to 33 ms of scheduling jitter.
+        try:
+            gc = Base_pb2.GripperCommand()
+            gc.mode = Base_pb2.GRIPPER_POSITION
+            f = gc.gripper.finger.add()
+            f.finger_identifier = 1
+            f.value = self.gripper_cmd
+            self._base.SendGripperCommand(gc)
+        except Exception as e:
+            err_str = str(e)
+            if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
+                self._enter_fault_state()
+            else:
+                self.get_logger().error(f'Gripper callback error: {e}')
 
     # ── Live parameter updates ────────────────────────────────────────────────
     def _on_parameter_change(self, params):
@@ -562,12 +576,8 @@ class KinovaHandController(Node):
             self._try_clear_fault()
             return
 
-        blocked = self.is_paused or self.is_resetting
-        arm_active = not blocked and self.target_position is not None
-        gripper_active = not blocked and self.gripper_enabled
-
         # ── Arm control ───────────────────────────────────────────────────────
-        if not arm_active:
+        if self.is_paused or self.is_resetting or self.target_position is None:
             self._smoothed_vel[:] = 0.0
             self._send_zero_twist()
         else:
@@ -627,22 +637,6 @@ class KinovaHandController(Node):
                 else:
                     self.get_logger().error(f'Arm control loop error: {e}')
                     self._send_zero_twist()
-
-        # ── Gripper control (independent of arm state) ────────────────────────
-        if gripper_active:
-            try:
-                gc = Base_pb2.GripperCommand()
-                gc.mode = Base_pb2.GRIPPER_POSITION
-                f = gc.gripper.finger.add()
-                f.finger_identifier = 1
-                f.value = float(self.gripper_cmd)
-                self._base.SendGripperCommand(gc)
-            except Exception as e:
-                err_str = str(e)
-                if 'ROBOT_IN_FAULT' in err_str or 'IN_FAULT' in err_str:
-                    self._enter_fault_state()
-                else:
-                    self.get_logger().error(f'Gripper control loop error: {e}')
 
     def _send_zero_twist(self):
         """Zero-velocity command with watchdog duration (safe stop)."""

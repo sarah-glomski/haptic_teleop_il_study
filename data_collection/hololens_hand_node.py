@@ -122,7 +122,7 @@ class HoloLensHandNode(Node):
 
         # ── Publishers ──────────────────────────────────────────────────────────
         self.hand_pose_pub    = self.create_publisher(PoseStamped,      'hand/pose',            10)
-        self.gripper_pub      = self.create_publisher(Float32,          'hand/gripper_cmd',     10)
+        self.gripper_pub      = self.create_publisher(Float32,          'hand/gripper_cmd',     1)
         self.hand_width_pub   = self.create_publisher(Float32,          'hand/hand_width',      10)
         self.finger_tips_pub  = self.create_publisher(Float32MultiArray,'hand/finger_tips',     10)
         self.tracking_pub     = self.create_publisher(Bool,             'hand/tracking_active', 10)
@@ -131,9 +131,9 @@ class HoloLensHandNode(Node):
         self.create_subscription(PoseStamped, '/hololens/palm/right',
                                  self._palm_cb,   10)
         self.create_subscription(PoseStamped, '/hololens/thumb/right',
-                                 self._thumb_cb,  10)
+                                 self._thumb_cb,  1)
         self.create_subscription(PoseStamped, '/hololens/index/right',
-                                 self._index_cb,  10)
+                                 self._index_cb,  1)
         self.create_subscription(PoseStamped, '/hololens/middle/right',
                                  self._middle_cb, 10)
         self.create_subscription(PoseStamped, '/hololens/ring/right',
@@ -156,8 +156,28 @@ class HoloLensHandNode(Node):
         self._palm_msg = msg
         self._last_palm_t = time.monotonic()
 
-    def _thumb_cb(self,  msg: PoseStamped): self._thumb_msg  = msg
-    def _index_cb(self,  msg: PoseStamped): self._index_msg  = msg
+    def _thumb_cb(self, msg: PoseStamped):
+        self._thumb_msg = msg
+
+    def _index_cb(self, msg: PoseStamped):
+        self._index_msg = msg
+        # Event-driven gripper: compute and publish immediately on each new index pose,
+        # bypassing the 30 Hz timer to eliminate up to 33 ms of scheduling jitter.
+        if self._thumb_msg is None or not self._is_tracking():
+            return
+        thumb_pos = self._pos_from_msg(self._thumb_msg)
+        index_pos = self._pos_from_msg(msg)
+        hand_width = float(np.linalg.norm(thumb_pos - index_pos))
+        self.hand_width_pub.publish(Float32(data=hand_width))
+        if hand_width <= self.pinch_close_m:
+            raw_grip = 1.0
+        elif hand_width >= self.pinch_open_m:
+            raw_grip = 0.0
+        else:
+            span = self.pinch_open_m - self.pinch_close_m
+            raw_grip = 1.0 - (hand_width - self.pinch_close_m) / span
+        gripper_cmd = float(self._grip_filter.filter(np.array([raw_grip]))[0])
+        self.gripper_pub.publish(Float32(data=gripper_cmd))
     def _middle_cb(self, msg: PoseStamped): self._middle_msg = msg
     def _ring_cb(self,   msg: PoseStamped): self._ring_msg   = msg
     def _pinky_cb(self,  msg: PoseStamped): self._pinky_msg  = msg
@@ -239,28 +259,6 @@ class HoloLensHandNode(Node):
         # Keep the palm orientation from HoloLens for wrist rotation tracking
         pose_msg.pose.orientation = self._palm_msg.pose.orientation
         self.hand_pose_pub.publish(pose_msg)
-
-        # ── hand/hand_width + hand/gripper_cmd — from pinch gesture ─────────
-        if self._thumb_msg is not None and self._index_msg is not None:
-            thumb_pos = self._pos_from_msg(self._thumb_msg)
-            index_pos = self._pos_from_msg(self._index_msg)
-            hand_width = float(np.linalg.norm(thumb_pos - index_pos))
-
-            self.hand_width_pub.publish(Float32(data=hand_width))
-
-            # Map hand_width to gripper command with linear interpolation
-            if hand_width <= self.pinch_close_m:
-                raw_grip = 1.0
-            elif hand_width >= self.pinch_open_m:
-                raw_grip = 0.0
-            else:
-                span = self.pinch_open_m - self.pinch_close_m
-                raw_grip = 1.0 - (hand_width - self.pinch_close_m) / span
-
-            gripper_cmd = float(
-                self._grip_filter.filter(np.array([raw_grip]))[0]
-            )
-            self.gripper_pub.publish(Float32(data=gripper_cmd))
 
         # ── hand/finger_tips — 5 × 3 = 15 floats (zeros if not tracked) ────
         tips = np.zeros(15, dtype=np.float32)
