@@ -348,7 +348,7 @@ class HDF5DataCollector(Node):
         uptime = now - self._node_start_time
         banner = '!' * 50
 
-        for name in CAMERA_STREAMS:
+        for name in self._cam_last_seen:
             last = self._cam_last_seen[name]
             if last is None:
                 if uptime > 5.0 and not self._cam_drop_warned[name]:
