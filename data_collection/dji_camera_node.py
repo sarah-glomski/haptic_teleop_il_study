@@ -116,6 +116,8 @@ class DJICameraNode(Node):
 
             if ret:
                 consecutive_failures = 0
+                if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                    frame = cv2.resize(frame, (self.width, self.height))
                 with self._frame_lock:
                     self._latest_frame = frame
                 # Yield briefly — avoids spinning the CPU at 100% between frames

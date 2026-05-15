@@ -361,17 +361,12 @@ class HDF5DataCollector(Node):
                     self.get_logger().error(
                         f'\n{banner}\n  CAMERA {name} has NEVER published!\n{banner}'
                     )
-            elif (now - last) > 3.0 and not self._cam_drop_warned[name]:
+            elif (now - last) > 6.0 and not self._cam_drop_warned[name]:
                 self._cam_drop_warned[name] = True
-                msg = (
+                self.get_logger().warn(
                     f'\n{banner}\n  CAMERA {name} STOPPED (last frame '
-                    f'{now - last:.1f}s ago)\n'
+                    f'{now - last:.1f}s ago) — recording continues\n{banner}'
                 )
-                if self.is_collecting:
-                    n = len(self._buf_action_pose)
-                    self.end_collection()
-                    msg += f'  Trial AUTO-STOPPED after {n} frames.\n'
-                self.get_logger().error(msg + banner)
 
     def get_camera_health(self) -> dict:
         now = time.monotonic()
@@ -381,7 +376,7 @@ class HDF5DataCollector(Node):
                 result[name] = 'disabled'
             else:
                 last = self._cam_last_seen[name]
-                result[name] = ('ok' if last is not None and (now - last) < 3.0
+                result[name] = ('ok' if last is not None and (now - last) < 6.0
                                 else ('waiting' if last is None else 'dead'))
         return result
 
