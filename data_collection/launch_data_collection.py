@@ -129,7 +129,9 @@ def generate_launch_description(
         ExecuteProcess(
             cmd=[
                 _PYTHON, script('hdf5_data_collector.py'),
-                *(['--ros-args', '-p', 'enable_cameras:=false'] if no_cameras else []),
+                '--ros-args',
+                '-p', f'enable_zed:={str(not (no_zed or no_cameras)).lower()}',
+                '-p', f'enable_dji:={str(not no_cameras).lower()}',
             ],
             name='hdf5_data_collector',
             output='screen',

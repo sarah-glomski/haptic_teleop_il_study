@@ -29,6 +29,8 @@ Usage:
   /usr/bin/python3.12 dji_camera_node.py --ros-args -r /wrist_cam/image_raw:=/dji_wrist/dji_wrist/color/image_raw
 """
 
+import threading
+
 import cv2
 import rclpy
 from rclpy.node import Node
@@ -43,9 +45,9 @@ class DJICameraNode(Node):
         super().__init__('dji_camera_node')
 
         self.device_index = self.declare_parameter('device_index', 0).value
-        self.width        = self.declare_parameter('width',        1920).value
-        self.height       = self.declare_parameter('height',       1080).value
-        fps               = self.declare_parameter('fps',          30.0).value
+        self.width        = self.declare_parameter('width',        1280).value
+        self.height       = self.declare_parameter('height',        720).value
+        fps               = self.declare_parameter('fps',           30.0).value
         self.frame_id     = self.declare_parameter('frame_id',     'wrist_cam').value
 
         # Sensor-data QoS: best-effort, keep-last-1 — matches camera drivers
@@ -58,7 +60,17 @@ class DJICameraNode(Node):
         self._bridge = CvBridge()
         self._cap    = None
 
+        # Latest frame shared between capture thread and publish timer
+        self._latest_frame = None
+        self._frame_lock   = threading.Lock()
+        self._running      = True
+
         self._open_camera()
+
+        # Capture thread reads continuously so cap.read() never blocks the timer
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
+
         self.create_timer(1.0 / fps, self._publish_frame)
         self.get_logger().info(
             f'DJI camera node started — /dev/video{self.device_index} '
@@ -83,13 +95,22 @@ class DJICameraNode(Node):
         actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.get_logger().info(f'Capture resolution: {actual_w}×{actual_h}')
 
-    def _publish_frame(self):
-        if self._cap is None or not self._cap.isOpened():
-            return
+    def _capture_loop(self):
+        """Runs in a daemon thread — continuously drains the V4L2 buffer."""
+        while self._running:
+            if self._cap is None or not self._cap.isOpened():
+                break
+            ret, frame = self._cap.read()
+            if ret:
+                with self._frame_lock:
+                    self._latest_frame = frame
+            else:
+                self.get_logger().warn('Frame grab failed — camera disconnected?')
 
-        ret, frame = self._cap.read()
-        if not ret:
-            self.get_logger().warn('Frame grab failed — camera disconnected?')
+    def _publish_frame(self):
+        with self._frame_lock:
+            frame = self._latest_frame
+        if frame is None:
             return
 
         msg = self._bridge.cv2_to_imgmsg(frame, encoding='bgr8')
@@ -98,6 +119,7 @@ class DJICameraNode(Node):
         self._pub.publish(msg)
 
     def destroy_node(self):
+        self._running = False
         if self._cap is not None:
             self._cap.release()
         super().destroy_node()
