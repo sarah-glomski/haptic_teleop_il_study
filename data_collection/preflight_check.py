@@ -222,6 +222,10 @@ def check_topics(robot_ip: str, duration: float):
                     tracking_active = last.data
                 if topic == 'hand/pose':
                     hand_pose_hz = hz
+            elif hz > 0:
+                hint = _no_data_hint(topic)
+                print(f'  {warn(f"{label:<42} {hz:5.1f} Hz  (low — expected ≥ {min_hz:.0f} Hz){hint}")}')
+                all_ok = False
             else:
                 hint = _no_data_hint(topic)
                 print(f'  {fail(f"{label:<42} no data{hint}")}')
