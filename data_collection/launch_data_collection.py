@@ -52,6 +52,7 @@ def generate_launch_description(
     robot_ip: str = '192.168.1.10',
     zed_serial: str = ZED_SERIAL,
     dji_device: int = 0,
+    no_zed: bool = False,
 ) -> LaunchDescription:
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -123,10 +124,7 @@ def generate_launch_description(
         ),
 
         # ── 7. ZED M camera — front view ──────────────────────────────────────
-        # Topics produced:
-        #   /zed_front/zed_node/left/image_rect_color   (used by data collector)
-        #   /zed_front/zed_node/depth/depth_registered  (available for future use)
-        Node(
+        *([Node(
             package='zed_wrapper',
             executable='zed_wrapper',
             name='zed_node',
@@ -144,7 +142,7 @@ def generate_launch_description(
                 'depth.depth_mode':      1,               # PERFORMANCE
                 'video.extrinsic_in_camera_frame': False,
             }],
-        ),
+        )] if not no_zed else []),
 
         # ── 8. DJI Osmo Action 4 — wrist-mounted camera ──────────────────────
         # Publishes on /dji_wrist/dji_wrist/color/image_raw to match what the
@@ -174,6 +172,8 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('--dji-device', type=int, default=0,
                         help='V4L2 device index for DJI Osmo Action 4 (default: 0). '
                              'Run dji_camera_validate.py first to confirm.')
+    parser.add_argument('--no-zed', action='store_true',
+                        help='Skip launching the ZED M camera node (e.g. if ZED SDK is not installed).')
     args, launch_argv = parser.parse_known_args(argv)
 
     print('=' * 60)
@@ -195,6 +195,7 @@ def main(argv=sys.argv[1:]):
         robot_ip=args.robot_ip,
         zed_serial=args.zed_serial,
         dji_device=args.dji_device,
+        no_zed=args.no_zed,
     )
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)
