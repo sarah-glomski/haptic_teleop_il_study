@@ -63,7 +63,7 @@ ROS2 Parameters:
   max_linear_speed_mps        float  0.50   m/s   hard velocity cap
   max_angular_speed_dps       float  15.0   deg/s hard angular cap
   vel_alpha                   float  0.4    velocity smoothing (0=very smooth)
-  workspace_x_min / x_max     float  0.40 / 0.50  m
+  workspace_x_min / x_max     float  0.30 / 0.60  m
   workspace_y_min / y_max     float -0.37 / 0.37  m
   workspace_z_min / z_max     float  0.025 / 0.30  m
   workspace_soft_margin_m     float  0.04   soft deceleration zone (m from wall)
@@ -126,8 +126,8 @@ class KinovaHandController(Node):
         self.max_angular_speed     = self.declare_parameter('max_angular_speed_dps',   15.0).value
         self.vel_alpha             = self.declare_parameter('vel_alpha',               0.7).value
 
-        self.x_min = self.declare_parameter('workspace_x_min',  0.40).value
-        self.x_max = self.declare_parameter('workspace_x_max',  0.50).value
+        self.x_min = self.declare_parameter('workspace_x_min',  0.30).value
+        self.x_max = self.declare_parameter('workspace_x_max',  0.60).value
         self.y_min = self.declare_parameter('workspace_y_min', -0.37).value
         self.y_max = self.declare_parameter('workspace_y_max',  0.37).value
         self.z_min = self.declare_parameter('workspace_z_min',  0.025).value
