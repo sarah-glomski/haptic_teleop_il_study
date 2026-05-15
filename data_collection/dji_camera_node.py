@@ -35,8 +35,9 @@ import threading
 import cv2
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image
+from std_msgs.msg import Bool
 
 
 class DJICameraNode(Node):
@@ -64,19 +65,28 @@ class DJICameraNode(Node):
         self._actual_width  = self.width
         self._actual_height = self.height
         self._frame_lock    = threading.Lock()
+        self._cap_lock      = threading.Lock()
         self._running       = True
+        self._enabled       = False  # starts disabled; collector publishes True to stream
 
-        self._open_camera()
+        # TransientLocal so a late-subscribing collector still gets the current state
+        enable_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
+        self.create_subscription(Bool, '/dji_camera/enable', self._enable_cb, enable_qos)
 
-        # Capture thread reads continuously so cap.read() never blocks the timer.
-        # Auto-reconnects when the UVC stream silently restarts.
+        # Capture thread idles until enabled, then reads continuously and auto-reconnects.
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
 
         self.create_timer(1.0 / fps, self._publish_frame)
         self.get_logger().info(
-            f'DJI camera node started — /dev/video{self.device_index} '
-            f'{self._actual_width}×{self._actual_height} @ {fps:.0f} Hz'
+            f'DJI camera node ready — /dev/video{self.device_index} '
+            f'{self.width}×{self.height} @ {fps:.0f} Hz '
+            f'(idle; waiting for /dji_camera/enable)'
         )
 
     def _open_camera(self):
@@ -103,16 +113,46 @@ class DJICameraNode(Node):
             f'(requested {self.width}×{self.height})'
         )
 
+    def _enable_cb(self, msg: Bool):
+        if msg.data and not self._enabled:
+            try:
+                with self._cap_lock:
+                    self._open_camera()
+                self._enabled = True
+                self.get_logger().info(
+                    f'DJI camera enabled — {self._actual_width}×{self._actual_height}'
+                )
+            except Exception as e:
+                self.get_logger().error(f'DJI camera enable failed: {e}')
+        elif not msg.data and self._enabled:
+            self._enabled = False          # capture loop checks this before acquiring cap_lock
+            with self._cap_lock:
+                if self._cap is not None:
+                    self._cap.release()
+                    self._cap = None
+            with self._frame_lock:
+                self._latest_frame = None
+            self.get_logger().info('DJI camera disabled')
+
     def _capture_loop(self):
-        """Runs in a daemon thread. Drains V4L2 buffer and auto-reconnects on failure."""
+        """Runs in a daemon thread. Idles when disabled; auto-reconnects on failure."""
         consecutive_failures = 0
 
         while self._running:
-            if self._cap is None or not self._cap.isOpened():
-                time.sleep(1.0)
+            if not self._enabled:
+                time.sleep(0.1)
+                consecutive_failures = 0
                 continue
 
-            ret, frame = self._cap.read()
+            with self._cap_lock:
+                if not self._enabled or self._cap is None or not self._cap.isOpened():
+                    ret, frame = False, None
+                else:
+                    ret, frame = self._cap.read()
+
+            if not self._enabled or frame is None:
+                time.sleep(0.01)
+                continue
 
             if ret:
                 consecutive_failures = 0
@@ -120,7 +160,6 @@ class DJICameraNode(Node):
                     frame = cv2.resize(frame, (self.width, self.height))
                 with self._frame_lock:
                     self._latest_frame = frame
-                # Yield briefly — avoids spinning the CPU at 100% between frames
                 time.sleep(0.001)
             else:
                 consecutive_failures += 1
@@ -130,7 +169,8 @@ class DJICameraNode(Node):
                         '— attempting reconnect …'
                     )
                 try:
-                    self._open_camera()
+                    with self._cap_lock:
+                        self._open_camera()
                     consecutive_failures = 0
                     self.get_logger().info('Camera reconnected successfully')
                 except Exception:
@@ -155,8 +195,11 @@ class DJICameraNode(Node):
 
     def destroy_node(self):
         self._running = False
-        if self._cap is not None:
-            self._cap.release()
+        self._enabled = False
+        with self._cap_lock:
+            if self._cap is not None:
+                self._cap.release()
+                self._cap = None
         super().destroy_node()
 
 

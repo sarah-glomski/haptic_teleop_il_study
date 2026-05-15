@@ -63,7 +63,7 @@ from geometry_msgs.msg import PoseStamped
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Bool, Float32, Float32MultiArray
 from piezense_interfaces.msg import PiezenseSystemArray
@@ -112,6 +112,17 @@ class HDF5DataCollector(Node):
 
         self._enable_zed = self.declare_parameter('enable_zed', True).value
         self._enable_dji = self.declare_parameter('enable_dji', True).value
+        self._dji_cam_active = False  # tracks whether we have told the DJI node to stream
+
+        if self._enable_dji:
+            enable_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                depth=1,
+            )
+            self._dji_enable_pub = self.create_publisher(Bool, '/dji_camera/enable', enable_qos)
+            self._dji_enable_pub.publish(Bool(data=False))
 
         sensor_qos = QoSProfile(
             depth=10,
@@ -374,6 +385,8 @@ class HDF5DataCollector(Node):
         for name in CAMERA_STREAMS:
             if name not in self._cam_last_seen:
                 result[name] = 'disabled'
+            elif name == 'dji_wrist' and not self._dji_cam_active:
+                result[name] = 'idle'
             else:
                 last = self._cam_last_seen[name]
                 result[name] = ('ok' if last is not None and (now - last) < 6.0
@@ -396,11 +409,17 @@ class HDF5DataCollector(Node):
             self.is_collecting = True
             self.is_paused     = False
             self.episode_start = self.get_clock().now()
+            if self._enable_dji:
+                self._dji_cam_active = True
+                self._dji_enable_pub.publish(Bool(data=True))
             self.get_logger().info(f'Started recording episode {self.demo_count}')
 
     def end_collection(self):
         if self.is_collecting:
             self.is_collecting = False
+            if self._enable_dji:
+                self._dji_cam_active = False
+                self._dji_enable_pub.publish(Bool(data=False))
             self._save_episode()
             dur = (self.get_clock().now() - self.episode_start).nanoseconds / 1e9
             n   = len(self._buf_action_pose)
@@ -560,6 +579,7 @@ def run_pygame(node: HDF5DataCollector):
             'ok':       ( 80, 200,  80),
             'waiting':  (255, 200,  50),
             'dead':     (220,  50,  50),
+            'idle':     ( 60, 100, 160),  # dim blue — intentionally off between episodes
             'disabled': ( 80,  80,  80),
         }
         x_pos = 20
