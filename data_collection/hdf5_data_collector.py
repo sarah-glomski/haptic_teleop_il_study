@@ -6,7 +6,7 @@ Adapted from Robomimic/data_collection/hdf5_data_collector.py.
 Collects time-synchronized data from:
   - Kinova Gen3: commanded pose/gripper (robot_action/*) + observed pose/gripper (robot_obs/*)
   - HoloLens hand: palm pose in robot frame (hand/pose)
-  - ZED M camera: front view (images/zed_front)
+  - ZED M camera: front view (images/zed_isometric)
   - DJI Osmo Action 4: wrist-mounted camera (images/dji_wrist)
   - Piezense: 2-channel pressure sensor input (piezense/data)
 
@@ -35,7 +35,7 @@ HDF5 schema (per episode):
   ├── piezense/
   │   └── pressure_input: (T, 2) float32   input channel pressures (Pa)
   └── images/
-      ├── zed_front:     (T, 3, H, W) uint8  LZF-compressed CHW
+      ├── zed_isometric:     (T, 3, H, W) uint8  LZF-compressed CHW
       └── dji_wrist:      (T, 3, H, W) uint8  LZF-compressed CHW
 
 Pygame keyboard controls:
@@ -73,7 +73,7 @@ from piezense_interfaces.msg import PiezenseSystemArray
 
 # ── Camera topic configuration ─────────────────────────────────────────────────
 CAMERA_STREAMS = {
-    'zed_front': '/zed_front/zed_node/left/image_rect_color',
+    'zed_isometric': '/zed_isometric/zed_node/left/image_rect_color',
     'dji_wrist':  '/dji_wrist/dji_wrist/color/image_raw',
 }
 
@@ -138,8 +138,8 @@ class HDF5DataCollector(Node):
             self._sub_hand_pose,
         ]
         if self._enable_zed:
-            self._sub_zed_front = Subscriber(self, Image, CAMERA_STREAMS['zed_front'], qos_profile=sensor_qos)
-            sync_subs.append(self._sub_zed_front)
+            self._sub_zed_isometric = Subscriber(self, Image, CAMERA_STREAMS['zed_isometric'], qos_profile=sensor_qos)
+            sync_subs.append(self._sub_zed_isometric)
         if self._enable_dji:
             self._sub_dji_wrist = Subscriber(self, Image, CAMERA_STREAMS['dji_wrist'], qos_profile=sensor_qos)
             sync_subs.append(self._sub_dji_wrist)
@@ -203,7 +203,7 @@ class HDF5DataCollector(Node):
         self._node_start_time = time.monotonic()
         active_cams = {
             k: v for k, v in CAMERA_STREAMS.items()
-            if (k == 'zed_front' and self._enable_zed) or
+            if (k == 'zed_isometric' and self._enable_zed) or
                (k == 'dji_wrist' and self._enable_dji)
         }
         self._cam_last_seen   = {k: None  for k in active_cams}
@@ -250,7 +250,7 @@ class HDF5DataCollector(Node):
         self._buf_finger_tips      = []
         self._buf_hand_width       = []
         self._buf_piezense_input   = []
-        self._buf_zed_front        = []
+        self._buf_zed_isometric        = []
         self._buf_dji_wrist         = []
 
     # ── Side-channel callbacks ────────────────────────────────────────────────
@@ -297,7 +297,7 @@ class HDF5DataCollector(Node):
         obs_pose_msg: PoseStamped,
         obs_gripper_msg: Float32,
         hand_pose_msg: PoseStamped,
-        zed_front_msg=None,
+        zed_isometric_msg=None,
         dji_wrist_msg=None,
     ):
         if not self.is_collecting or self.is_paused:
@@ -325,7 +325,7 @@ class HDF5DataCollector(Node):
 
             # Images
             if self._enable_zed:
-                self._buf_zed_front.append(self._decode_image(zed_front_msg))
+                self._buf_zed_isometric.append(self._decode_image(zed_isometric_msg))
             if self._enable_dji:
                 self._buf_dji_wrist.append(self._decode_image(dji_wrist_msg))
 
@@ -472,7 +472,7 @@ class HDF5DataCollector(Node):
             if self._enable_piezense:
                 piezense_input = np.array(self._buf_piezense_input, dtype=np.float32)
             if self._enable_zed:
-                zed_front = np.array(self._buf_zed_front, dtype=np.uint8)
+                zed_isometric = np.array(self._buf_zed_isometric, dtype=np.uint8)
             if self._enable_dji:
                 dji_wrist = np.array(self._buf_dji_wrist, dtype=np.uint8)
 
@@ -508,7 +508,7 @@ class HDF5DataCollector(Node):
             if self._enable_zed or self._enable_dji:
                 imgs = f.create_group('images')
                 if self._enable_zed:
-                    imgs.create_dataset('zed_front', data=zed_front, compression='lzf')
+                    imgs.create_dataset('zed_isometric', data=zed_isometric, compression='lzf')
                 if self._enable_dji:
                     imgs.create_dataset('dji_wrist', data=dji_wrist, compression='lzf')
 

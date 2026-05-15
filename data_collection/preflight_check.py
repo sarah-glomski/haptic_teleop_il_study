@@ -89,15 +89,14 @@ def check_robot_tcp(ip: str, port: int = 10000, timeout: float = 1.0):
 
 class TopicProbe:
     """Subscribe to one topic, track Hz and last message summary."""
-    def __init__(self, node, topic, msg_type, summarise_fn=None):
+    def __init__(self, node, topic, msg_type, summarise_fn=None, qos_profile=10):
         self.count  = 0
         self.t0     = None
         self.last   = None
         self._lock  = threading.Lock()
         self._summarise = summarise_fn or (lambda _: '')
 
-        node.create_subscription(msg_type, topic,
-                                 self._cb, 10)
+        node.create_subscription(msg_type, topic, self._cb, qos_profile)
 
     def _cb(self, msg):
         now = time.monotonic()
@@ -136,35 +135,54 @@ def _piezense_summary(msg):
             return f'ch2={sys.pressure_pa[2]} Pa  ch3={sys.pressure_pa[3]} Pa'
     return '(no system 0 data)'
 
+def _image_summary(msg):
+    return f'{msg.width}×{msg.height}  {msg.encoding}'
+
 
 def check_topics(robot_ip: str, duration: float):
     import rclpy
     from rclpy.node import Node
     from rclpy.executors import SingleThreadedExecutor
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
     from geometry_msgs.msg import PoseStamped
+    from sensor_msgs.msg import Image
     from std_msgs.msg import Bool, Float32
     from piezense_interfaces.msg import PiezenseSystemArray
 
-    print(hdr(f'ROS2 Topics  (listening {duration:.0f} s — make sure launch_teleop.py is running)'))
+    # BEST_EFFORT subscriber is compatible with both RELIABLE and BEST_EFFORT publishers,
+    # which is needed since sensor/camera topics use BEST_EFFORT while control topics
+    # use the default RELIABLE.
+    sensor_qos = QoSProfile(
+        depth=10,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+    )
+
+    print(hdr(f'ROS2 Topics  (listening {duration:.0f} s)'))
 
     rclpy.init()
     node = Node('preflight_checker')
 
-    # topic name → (probe, label, min_expected_hz)
-    specs = [
-        ('/hololens/palm/right',   'HoloLens palm/right (raw)',       PoseStamped,       _pose_summary,      10.0),
-        ('/hololens/thumb/right',  'HoloLens thumb/right (raw)',      PoseStamped,       _pose_summary,       5.0),
-        ('/hololens/index/right',  'HoloLens index/right (raw)',      PoseStamped,       _pose_summary,       5.0),
-        ('hand/pose',              'hand/pose (robot-frame)',          PoseStamped,       _pose_summary,      10.0),
-        ('hand/gripper_cmd',       'hand/gripper_cmd  (0–1)',         Float32,           _float_summary,      5.0),
-        ('hand/tracking_active',   'hand/tracking_active',            Bool,              _bool_summary,       1.0),
-        ('robot_obs/pose',         'robot_obs/pose (kinova state)',   PoseStamped,       _pose_summary,      25.0),
-        ('piezense/data',          'piezense/data (pressure input)',  PiezenseSystemArray, _piezense_summary, 10.0),
+    # Specs split by which launch file provides them.
+    # topic → (probe, label, min_expected_hz)
+    teleop_specs = [
+        ('/hololens/palm/right',   'HoloLens palm/right (raw)',       PoseStamped,         _pose_summary,      10.0),
+        ('/hololens/thumb/right',  'HoloLens thumb/right (raw)',      PoseStamped,         _pose_summary,       5.0),
+        ('/hololens/index/right',  'HoloLens index/right (raw)',      PoseStamped,         _pose_summary,       5.0),
+        ('hand/pose',              'hand/pose (robot-frame)',          PoseStamped,         _pose_summary,      10.0),
+        ('hand/gripper_cmd',       'hand/gripper_cmd  (0–1)',         Float32,             _float_summary,      5.0),
+        ('hand/tracking_active',   'hand/tracking_active',            Bool,                _bool_summary,       1.0),
+        ('robot_obs/pose',         'robot_obs/pose (kinova state)',   PoseStamped,         _pose_summary,      25.0),
+        ('piezense/data',          'piezense/data (pressure input)',  PiezenseSystemArray, _piezense_summary,  10.0),
+    ]
+    camera_specs = [
+        ('/zed_isometric/zed_node/left/image_rect_color', 'ZED M front camera', Image, _image_summary, 25.0),
+        ('/dji_wrist/dji_wrist/color/image_raw',       'DJI wrist camera',   Image, _image_summary, 25.0),
     ]
 
     probes = {}
-    for topic, label, mtype, sumfn, min_hz in specs:
-        probes[topic] = (TopicProbe(node, topic, mtype, sumfn), label, min_hz)
+    for topic, label, mtype, sumfn, min_hz in teleop_specs + camera_specs:
+        probes[topic] = (TopicProbe(node, topic, mtype, sumfn, sensor_qos), label, min_hz)
 
     executor = SingleThreadedExecutor()
     executor.add_node(node)
@@ -187,24 +205,32 @@ def check_topics(robot_ip: str, duration: float):
     stop_evt.set()
     spin_thread.join(timeout=1.0)
 
-    # Report
+    # Report — two groups so it's clear which launch file is needed
     all_ok = True
     tracking_active = False
     hand_pose_hz    = 0.0
 
-    for topic, (probe, label, min_hz) in probes.items():
-        hz, last = probe.snapshot()
-        if hz >= min_hz * 0.5:   # allow 50 % slack
-            summary = probe._summarise(last) if last else ''
-            print(f'  {ok(f"{label:<42} {hz:5.1f} Hz  {summary}")}')
-            if topic == 'hand/tracking_active' and last:
-                tracking_active = last.data
-            if topic == 'hand/pose':
-                hand_pose_hz = hz
-        else:
-            hint = _no_data_hint(topic)
-            print(f'  {fail(f"{label:<42} no data{hint}")}')
-            all_ok = False
+    def _report_group(specs):
+        nonlocal all_ok, tracking_active, hand_pose_hz
+        for topic, label, *_ in specs:
+            probe, _, min_hz = probes[topic]
+            hz, last = probe.snapshot()
+            if hz >= min_hz * 0.5:   # allow 50 % slack
+                summary = probe._summarise(last) if last else ''
+                print(f'  {ok(f"{label:<42} {hz:5.1f} Hz  {summary}")}')
+                if topic == 'hand/tracking_active' and last:
+                    tracking_active = last.data
+                if topic == 'hand/pose':
+                    hand_pose_hz = hz
+            else:
+                hint = _no_data_hint(topic)
+                print(f'  {fail(f"{label:<42} no data{hint}")}')
+                all_ok = False
+
+    print(f'  {BOLD}launch_teleop.py{RESET}')
+    _report_group(teleop_specs)
+    print(f'\n  {BOLD}launch_data_collection.py  (cameras){RESET}')
+    _report_group(camera_specs)
 
     # Diagnostic hints
     print(hdr('Diagnostics'))
@@ -247,6 +273,8 @@ def _no_data_hint(topic):
         'hand/pose':             ' → hololens_hand_node not running or no palm data',
         'hand/tracking_active':  ' → hololens_hand_node not running',
         'robot_obs/pose':        ' → kinova_state_publisher not connected to robot',
+        '/zed_isometric/zed_node/left/image_rect_color': ' → ZED wrapper not running or camera disconnected',
+        '/dji_wrist/dji_wrist/color/image_raw':       ' → dji_camera_node not running (cameras only start with launch_data_collection.py)',
     }
     h = hints.get(topic, '')
     return f'  {YELLOW}{h}{RESET}' if h else ''

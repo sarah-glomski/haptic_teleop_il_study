@@ -9,7 +9,7 @@ Launches the full pipeline:
   4. kinova_state_publisher— Reads Kinova Gen3 state → robot_obs/*
   5. kinova_hand_controller— Hand-tracking → Kinova velocity commands → robot_action/*
   6. hdf5_data_collector   — Synchronized data recording with pygame UI
-  7. ZED M camera          — /zed_front/zed_node/left/image_rect_color
+  7. ZED M camera          — /zed_isometric/zed_node/left/image_rect_color
   8. DJI Osmo Action 4      — /dji_wrist/dji_wrist/color/image_raw (wrist camera)
 
 Prerequisites (install once):
@@ -145,11 +145,11 @@ def generate_launch_description(
             package='zed_wrapper',
             executable='zed_wrapper',
             name='zed_node',
-            namespace='zed_front',
+            namespace='zed_isometric',
             output='screen',
             parameters=[{
                 'camera_model':          'zedm',          # ZED Mini / ZED M
-                'camera_name':           'zed_front',
+                'camera_name':           'zed_isometric',
                 'serial_number':         int(zed_serial) if zed_serial else 0,
                 'grab_resolution':       'HD720',          # 1280×720
                 'grab_frame_rate':       30,

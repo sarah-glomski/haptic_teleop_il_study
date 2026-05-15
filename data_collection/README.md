@@ -15,7 +15,7 @@ HoloLens 2  ──rosbridge──▶  hololens_tf_publisher
 Kinova Gen3 ◀── kinova_hand_controller ◀── hand/pose
             ──▶  kinova_state_publisher ──▶  robot_obs/pose
 
-ZED M (front)   ──▶  /zed_front/zed_node/left/image_rect_color
+ZED M (front)   ──▶  /zed_isometric/zed_node/left/image_rect_color
 DJI Osmo Action 4 ──▶  /dji_wrist/dji_wrist/color/image_raw
 
 hdf5_data_collector  ──▶  episode_N.hdf5
@@ -171,7 +171,7 @@ episode_N.hdf5
 │   ├── finger_tips     (T, 15)  float32
 │   └── hand_width      (T,)     float32
 └── images/
-    ├── zed_front  (T, 3, H, W)  uint8  LZF-compressed, CHW
+    ├── zed_isometric  (T, 3, H, W)  uint8  LZF-compressed, CHW
     └── dji_wrist   (T, 3, H, W)  uint8  LZF-compressed, CHW
 ```
 
@@ -189,7 +189,7 @@ Zarr output (UMI-style flat concatenation):
 ```
 output.zarr/
 ├── data/
-│   ├── zed_front_rgb    (N, H, W, 3)  uint8   HWC
+│   ├── zed_isometric_rgb    (N, H, W, 3)  uint8   HWC
 │   ├── dji_wrist_rgb     (N, H, W, 3)  uint8   HWC
 │   ├── pose             (N, 10)       float32  [x,y,z, rot6d(6), gripper]
 │   ├── action           (N, 10)       float32
