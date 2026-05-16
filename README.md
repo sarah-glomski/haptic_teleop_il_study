@@ -407,7 +407,109 @@ ros2 launch piezense_ros ar_teleop_piezense_launch.py
 
 ---
 
-## 7. Key Parameters for Tuning
+## 7. End-to-End Latency Characterization
+
+A key open question is how much total latency exists between a human hand motion and the
+corresponding robot motion, and whether that latency is consistent enough to compensate
+for during replay or policy rollout.
+
+### 7.1 Motivation
+
+When a demonstration is replayed from the HDF5 buffer, the robot's TCP lags behind the
+commanded trajectory by the full system latency.  For slow, quasi-static tasks this is
+acceptable.  For dynamic tasks (e.g. a ballistic throw), mistiming the gripper release
+by even 100 ms causes the ball to land at the wrong position.  Characterizing and
+compensating for the lag is therefore a prerequisite before training a policy on
+throw demonstrations.
+
+### 7.2 Measurement Methodology
+
+Two complementary latency estimates are computed by `data_collection/replay_episode.py`:
+
+**Offline estimate (from the recorded HDF5 file)**
+
+Cross-correlate the HoloLens hand position (`hololens/hand_pose_robot_frame`) against
+the observed robot TCP (`observation/pose`) over the length of the episode:
+
+```
+lag = argmax( xcorr(obs_tcp, hand_pos) )
+```
+
+A positive lag means the robot state at time `t` matches the hand command from
+`t − lag`.  This gives the full pipeline latency at **recording time**:
+
+```
+HoloLens sensing
+  → WiFi → rosbridge
+  → hololens_hand_node (frame transform)
+  → kinova_hand_controller (P-loop, 30 Hz)
+  → Kortex SDK → joint servoing
+  → robot TCP response
+```
+
+**Live estimate (during replay)**
+
+Replay the recorded `action/pose` trajectory through the same 30 Hz P-loop velocity
+controller used during data collection, and cross-correlate the commanded TCP positions
+against the observed TCP positions logged in real time:
+
+```
+lag = argmax( xcorr(obs_tcp_replay, cmd_tcp) )
+```
+
+This isolates the **control-loop latency** at replay time (command → robot response),
+removing the HoloLens and WiFi contribution.
+
+### 7.3 Results on Episode 9 (ball throw)
+
+| Estimate | X | Y | Z | Mean |
+|---|---|---|---|---|
+| Offline (HoloLens → robot) | +267 ms | +233 ms | +233 ms | **244 ms** |
+| Live replay (cmd → robot) | +267 ms | +267 ms | +233 ms | **256 ms** |
+
+At 30 Hz, 244–256 ms corresponds to **~7–8 frames** of lag.
+
+### 7.4 Compensation Strategy
+
+To pre-compensate for the lag, the replay script shifts the entire action sequence
+(position + gripper) forward by `offset` samples.  At control step `t` the robot
+receives `action[t + offset]` instead of `action[t]`, so it arrives at each waypoint
+`offset` frames earlier:
+
+```python
+# In replay_episode.py:
+idx = np.clip(np.arange(T) + offset, 0, T - 1)
+action_pos_shifted    = action_pos[idx]
+action_gripper_shifted = action_gripper[idx]
+```
+
+The script runs an interactive tuning loop:
+
+1. Compute offline lag from the HDF5 file and auto-seed `offset` from it.
+2. Reset robot to home; operator places ball in gripper.
+3. Replay with current offset; operator presses `s` if ball lands in bin.
+4. If failed, the residual live lag is measured and added to the current offset
+   as the suggested next value.
+5. Repeat until success or the operator quits.
+
+```bash
+python3.12 data_collection/replay_episode.py demo_data/episode_N.hdf5
+# or with an explicit starting offset:
+python3.12 data_collection/replay_episode.py demo_data/episode_N.hdf5 --offset 7
+```
+
+### 7.5 Current Status
+
+- Episode 9 (pick + throw) was used for initial latency measurement.
+- A throw-only episode (ball pre-loaded into gripper) is being recorded to isolate
+  the throw timing without a pick phase, since a large position offset breaks the
+  careful approach required for grasping.
+- Once a successful replay offset is found, the same value will be applied as an
+  inference-time action delay to compensate for policy rollout latency.
+
+---
+
+## 8. Key Parameters for Tuning
 
 ### Latency / Responsiveness
 
@@ -444,7 +546,7 @@ ros2 launch piezense_ros ar_teleop_piezense_launch.py
 
 ---
 
-## 8. File Map
+## 9. File Map
 
 ```
 haptic_teleop_il_study/
@@ -459,7 +561,9 @@ haptic_teleop_il_study/
 │   ├── dji_camera_node.py           — DJI Osmo → ROS2 Image
 │   ├── dji_camera_validate.py       — verify DJI device index
 │   ├── launch_teleop.py             — teleoperation only (no recording)
-│   └── preflight_check.py           — topic/sensor health check
+│   ├── preflight_check.py           — topic/sensor health check
+│   ├── replay_episode.py            — episode replay + end-to-end latency tuning loop
+│   └── visualize_episode.py         — HDF5 episode viewer (images + time-series plots)
 │
 ├── training/
 │   ├── convert_data.py              — HDF5 → flat UMI-style zarr (for training)
@@ -485,7 +589,7 @@ five keys needed for training.
 
 ---
 
-## 9. Dependencies
+## 10. Dependencies
 
 ```
 # ROS2 packages
