@@ -43,7 +43,7 @@ for the HoloLens 2 + Kinova Gen3 + PieZense imitation learning study.
 | `robot_action/gripper` | `Float32` | kinova_hand_controller | hdf5_data_collector |
 | `hand/pose` | `PoseStamped` | hololens_hand_node | kinova_hand_controller, hdf5_data_collector |
 | `hand/gripper_cmd` | `Float32` | hololens_hand_node | kinova_hand_controller |
-| `/zed_front/zed_node/left/image_rect_color` | `Image` | zed_wrapper | hdf5_data_collector, inference |
+| `/zed_isometric/zed_node/left/image_rect_color` | `Image` | zed_wrapper | hdf5_data_collector, inference |
 | `/dji_wrist/dji_wrist/color/image_raw` | `Image` | dji_camera_node | hdf5_data_collector, inference |
 | `piezense/data` | `PiezenseSystemArray` | ar_teleop_piezense_launch | hdf5_data_collector, inference |
 
@@ -69,7 +69,7 @@ Pygame window controls: **R** Reset · **S** Start · **D** Done/Save · **P** P
 - `robot_action/pose`, `robot_action/gripper`
 - `robot_obs/pose`, `robot_obs/gripper`
 - `hand/pose`
-- `/zed_front/...`, `/dji_wrist/...`
+- `/zed_isometric/...`, `/dji_wrist/...`
 
 **Slop:** 120 ms. This is intentionally wide because ZED, DJI, and Kinova poll on
 independent clocks. Tighten if synchronization quality is a concern.
@@ -101,7 +101,7 @@ episode_N.hdf5
 ├── piezense/
 │   └── pressure_input:     (T, 2)   float32  Pa — channels 2 & 3 of system 0
 └── images/
-    ├── zed_front:          (T, 3, H, W) uint8  CHW, LZF-compressed
+    ├── zed_isometric:      (T, 3, H, W) uint8  CHW, LZF-compressed
     └── dji_wrist:           (T, 3, H, W) uint8  CHW, LZF-compressed
 ```
 
@@ -154,7 +154,7 @@ euler_xyz_deg = Rotation.from_matrix([c1,c2,c3]).as_euler('xyz', degrees=True)
 ```
 kinova_teleop.zarr/
 ├── data/
-│   ├── zed_front_rgb:      (N, 224, 224, 3)  uint8   HWC
+│   ├── zed_isometric_rgb:  (N, 224, 224, 3)  uint8   HWC
 │   ├── dji_wrist_rgb:      (N, 224, 224, 3)  uint8   HWC
 │   ├── pose:               (N, 10)            float32 [xyz, rot6d, gripper_obs]
 │   ├── action:             (N, 10)            float32 [xyz, rot6d, gripper_cmd]
@@ -205,7 +205,7 @@ Noisy action ──► 1D-UNet (temporal) ─────┘──► denoised a
 
 | Key | Shape | Role |
 |---|---|---|
-| `zed_front_rgb` | `(B, 2, 3, 224, 224)` | front camera, obs_horizon=2 |
+| `zed_isometric_rgb` | `(B, 2, 3, 224, 224)` | front camera, obs_horizon=2 |
 | `dji_wrist_rgb` | `(B, 2, 3, 224, 224)` | wrist camera, obs_horizon=2 |
 | `pose` | `(B, 2, 10)` | TCP pose history, obs_horizon=2 |
 | `piezense_pressure` | `(B, 2, 2)` | pressure history, obs_horizon=2 |
@@ -386,8 +386,8 @@ misses ~6 ticks (node crash/freeze), the Kortex SDK stops the robot automaticall
 
 | Axis | Min (m) | Max (m) |
 |---|---|---|
-| X | 0.40 | 0.50 |
-| Y | -0.27 | 0.27 |
+| X | 0.30 | 0.60 |
+| Y | -0.37 | 0.37 |
 | Z | 0.025 | 0.30 |
 
 **Home position:** `(0.474, 0.02, 0.107)` m, `(-179.3°, -0.4°, 89.3°)` Euler XYZ.

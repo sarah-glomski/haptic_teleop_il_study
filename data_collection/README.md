@@ -136,7 +136,7 @@ source /opt/ros/jazzy/setup.bash
 /usr/bin/python3.12 launch_data_collection.py \
     --robot-ip 192.168.1.10 \
     --zed-serial <ZED_SERIAL> \
-    --rs-wrist <REALSENSE_SERIAL>
+    --dji-device <DEVICE_INDEX>
 ```
 
 Keyboard controls (pygame window):
@@ -206,10 +206,10 @@ output.zarr/
 Edit these parameters in `kinova_hand_controller.py` to match your setup:
 
 ```python
-workspace_x_min = 0.40   # metres from robot base
-workspace_x_max = 0.50
-workspace_y_min = -0.27
-workspace_y_max =  0.27
+workspace_x_min = 0.30   # metres from robot base
+workspace_x_max = 0.60
+workspace_y_min = -0.37
+workspace_y_max =  0.37
 workspace_z_min = 0.025
 workspace_z_max = 0.30
 ```
