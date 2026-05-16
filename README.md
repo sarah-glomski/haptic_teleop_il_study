@@ -563,7 +563,10 @@ haptic_teleop_il_study/
 │   ├── launch_teleop.py             — teleoperation only (no recording)
 │   ├── preflight_check.py           — topic/sensor health check
 │   ├── replay_episode.py            — episode replay + end-to-end latency tuning loop
-│   └── visualize_episode.py         — HDF5 episode viewer (images + time-series plots)
+│   ├── visualize_episode.py         — HDF5 episode viewer (images + time-series plots)
+│   ├── view_cameras.py              — standalone live camera viewer (ZED + DJI)
+│   ├── handtracking.md              — analysis notes: Unity→ROS hand tracking transform
+│   └── README.md                    — data collection subsystem docs
 │
 ├── training/
 │   ├── convert_data.py              — HDF5 → flat UMI-style zarr (for training)
