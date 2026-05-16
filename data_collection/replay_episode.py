@@ -157,19 +157,13 @@ def apply_offset(
     offset: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Shift action sequence forward by `offset` samples.
-
-    At step t the robot receives action[t + offset].  The last frame is held
-    for the final `offset` steps so the trajectory length stays the same.
-    A negative offset shifts backward (command earlier actions later).
+    Shift the entire action sequence (position + gripper) forward by `offset`
+    samples.  At step t the robot receives action[t + offset], so it reaches
+    each waypoint offset frames earlier, compensating for system latency.
     """
     if offset == 0:
         return action_pos, action_gripper
-    T = len(action_pos)
-    if offset > 0:
-        idx = np.clip(np.arange(T) + offset, 0, T - 1)
-    else:
-        idx = np.clip(np.arange(T) + offset, 0, T - 1)
+    idx = np.clip(np.arange(len(action_pos)) + offset, 0, len(action_pos) - 1)
     return action_pos[idx], action_gripper[idx]
 
 
@@ -451,7 +445,7 @@ def main():
                 reset_to_home(conn)
             first = False
 
-            print('Place the ball on the table at its starting position, '
+            print('Place the ball in the gripper, '
                   'then press ENTER to start replay.')
             input()
 
