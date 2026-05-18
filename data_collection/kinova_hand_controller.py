@@ -485,10 +485,13 @@ class KinovaHandController(Node):
 
     def _do_reset(self):
         try:
-            # _reset_cb sends a zero-velocity TwistCommand (watchdog = 200 ms) before
-            # starting this thread.  Once the watchdog expires the robot exits
-            # SINGLE_LEVEL_SERVOING automatically and accepts ExecuteAction.
-            time.sleep(0.25)
+            # ExecuteAction (reach_pose) requires HIGH_LEVEL_SERVOING.
+            # Explicitly switch mode rather than relying on the watchdog auto-exit,
+            # which is unreliable in practice.
+            mode = Base_pb2.ServoingModeInformation()
+            mode.servoing_mode = Base_pb2.HIGH_LEVEL_SERVOING
+            self._base.SetServoingMode(mode)
+            time.sleep(0.5)  # let mode transition settle and flush stale action events
 
             action = Base_pb2.Action()
             action.name = 'Home'
@@ -511,8 +514,6 @@ class KinovaHandController(Node):
             action_started = threading.Event()
 
             def _on_action(notif, ev=finished, started=action_started):
-                # Ignore stale events queued before this action was issued
-                # (e.g. ACTION_END from tracking disable or mode transitions).
                 if started.is_set() and notif.action_event in (
                     Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT
                 ):
@@ -520,7 +521,7 @@ class KinovaHandController(Node):
 
             self._base.OnNotificationActionTopic(_on_action, Base_pb2.NotificationOptions())
             self._base.ExecuteAction(action)
-            action_started.set()  # only accept events from this point on
+            action_started.set()
 
             if not finished.wait(timeout=30.0):
                 self.get_logger().warn('Home reset timed out — aborting')
