@@ -213,12 +213,30 @@ def check_topics(robot_ip: str, duration: float):
     dji_enable_pub.publish(Bool(data=True))
     time.sleep(0.5)   # give the node time to open the device before counting Hz
 
-    # Progress bar
-    print(f'  {CYAN}Collecting…{RESET}', end='', flush=True)
-    for _ in range(int(duration * 4)):
-        time.sleep(0.25)
-        print('.', end='', flush=True)
+    # Live DJI preview — decode sensor_msgs/Image (bgr8) and show with OpenCV.
+    # Runs in the main thread so cv2.imshow works on all platforms.
+    import cv2
+    import numpy as np
+    dji_probe = probes['/dji_wrist/dji_wrist/color/image_raw'][0]
+    WIN = 'DJI wrist camera — preflight (q to skip)'
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, 640, 480)
+
+    print(f'  {CYAN}Collecting…{RESET}  (DJI preview window open — press q to close it early)', flush=True)
+    ticks = int(duration * 4)
+    for i in range(ticks):
+        _, last_msg = dji_probe.snapshot()
+        if last_msg is not None:
+            frame = np.frombuffer(last_msg.data, dtype=np.uint8).reshape(
+                last_msg.height, last_msg.width, -1)
+            cv2.imshow(WIN, frame)
+        key = cv2.waitKey(250) & 0xFF   # 250 ms ≈ one tick
+        if key == ord('q'):
+            break
+        if i % 4 == 0:
+            print('.', end='', flush=True)
     print()
+    cv2.destroyWindow(WIN)
 
     stop_evt.set()
     spin_thread.join(timeout=1.0)
