@@ -485,12 +485,10 @@ class KinovaHandController(Node):
 
     def _do_reset(self):
         try:
-            # ExecuteAction requires the default (unspecified) servoing mode.
-            # SINGLE_LEVEL_SERVOING blocks it, so switch back first.
-            mode = Base_pb2.ServoingModeInformation()
-            mode.servoing_mode = Base_pb2.UNSPECIFIED_SERVOING_MODE
-            self._base.SetServoingMode(mode)
-            time.sleep(0.2)
+            # _reset_cb sends a zero-velocity TwistCommand (watchdog = 200 ms) before
+            # starting this thread.  Once the watchdog expires the robot exits
+            # SINGLE_LEVEL_SERVOING automatically and accepts ExecuteAction.
+            time.sleep(0.25)
 
             action = Base_pb2.Action()
             action.name = 'Home'
