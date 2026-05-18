@@ -302,7 +302,7 @@ class HDF5DataCollector(Node):
         now = time.monotonic()
         if self._holo_last_seen is None:
             return 'waiting' if (now - self._node_start_time) < 5.0 else 'dead'
-        return 'ok' if (now - self._holo_last_seen) < 3.0 else 'dead'
+        return 'ready' if (now - self._holo_last_seen) < 3.0 else 'dead'
 
     # ── Core synced callback ──────────────────────────────────────────────────
     def _zed_cb(self, msg: Image):
@@ -402,7 +402,7 @@ class HDF5DataCollector(Node):
                 result[name] = 'idle'
             else:
                 last = self._cam_last_seen[name]
-                result[name] = ('ok' if last is not None and (now - last) < 6.0
+                result[name] = ('ready' if last is not None and (now - last) < 6.0
                                 else ('waiting' if last is None else 'dead'))
         return result
 
@@ -412,7 +412,7 @@ class HDF5DataCollector(Node):
         now = time.monotonic()
         if self._piezense_last_seen is None:
             return 'waiting' if (now - self._node_start_time) < 5.0 else 'dead'
-        return 'ok' if (now - self._piezense_last_seen) < 3.0 else 'dead'
+        return 'ready' if (now - self._piezense_last_seen) < 3.0 else 'dead'
 
     # ── Collection controls ───────────────────────────────────────────────────
     def start_collection(self):
@@ -575,7 +575,7 @@ def run_pygame(node: HDF5DataCollector):
 
         # Color key (top right)
         key = [
-            ('ok',       ( 80, 200,  80)),
+            ('ready',       ( 80, 200,  80)),
             ('waiting',  (255, 200,  50)),
             ('dead',     (220,  50,  50)),
             ('idle',     ( 60, 100, 160)),
@@ -603,7 +603,7 @@ def run_pygame(node: HDF5DataCollector):
 
         # Sensor health dots (cameras + piezense)
         health_colors = {
-            'ok':       ( 80, 200,  80),
+            'ready':       ( 80, 200,  80),
             'waiting':  (255, 200,  50),
             'dead':     (220,  50,  50),
             'idle':     ( 60, 100, 160),  # dim blue — intentionally off between episodes
