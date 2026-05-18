@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import os
 import socket
 import subprocess
 import sys
@@ -219,8 +220,15 @@ def check_topics(robot_ip: str, duration: float):
     import numpy as np
     dji_probe = probes['/dji_wrist/dji_wrist/color/image_raw'][0]
     WIN = 'DJI wrist camera — preflight (q to skip)'
+    # Qt-build OpenCV prints "Cannot find font directory" to C-level stderr on
+    # first window creation.  Suppress it with an OS fd redirect; Python's
+    # sys.stderr redirect can't catch C library output.
+    _null_fd  = os.open(os.devnull, os.O_WRONLY)
+    _saved_fd = os.dup(2)
+    os.dup2(_null_fd, 2); os.close(_null_fd)
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, 640, 480)
+    os.dup2(_saved_fd, 2); os.close(_saved_fd)
 
     print(f'  {CYAN}Collecting…{RESET}  (DJI preview window open — press q to close it early)', flush=True)
     ticks = int(duration * 4)
