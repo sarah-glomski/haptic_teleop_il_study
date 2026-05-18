@@ -286,13 +286,11 @@ class HDF5DataCollector(Node):
                 break
 
     def _check_piezense_health(self):
-        uptime = time.monotonic() - self._node_start_time
-        if self._piezense_last_seen is None:
-            if uptime > 5.0 and not self._piezense_warned:
-                self._piezense_warned = True
-                self.get_logger().warn(
-                    'Piezense: no data on piezense/data — is piezense_driver running?'
-                )
+        if self._piezense_last_seen is None and self.is_collecting and not self._piezense_warned:
+            self._piezense_warned = True
+            self.get_logger().warn(
+                'Piezense: no data on piezense/data — is piezense_driver running?'
+            )
 
     def _holo_palm_cb(self, msg: PoseStamped):
         self._latest_holo_palm = msg
