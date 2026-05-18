@@ -507,14 +507,20 @@ class KinovaHandController(Node):
             pose.theta_y = self.home_ty
             pose.theta_z = self.home_tz
 
-            finished = threading.Event()
+            finished       = threading.Event()
+            action_started = threading.Event()
 
-            def _on_action(notif, ev=finished):
-                if notif.action_event in (Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT):
+            def _on_action(notif, ev=finished, started=action_started):
+                # Ignore stale events queued before this action was issued
+                # (e.g. ACTION_END from tracking disable or mode transitions).
+                if started.is_set() and notif.action_event in (
+                    Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT
+                ):
                     ev.set()
 
             self._base.OnNotificationActionTopic(_on_action, Base_pb2.NotificationOptions())
             self._base.ExecuteAction(action)
+            action_started.set()  # only accept events from this point on
 
             if not finished.wait(timeout=30.0):
                 self.get_logger().warn('Home reset timed out — aborting')
