@@ -489,7 +489,7 @@ class KinovaHandController(Node):
             # Explicitly switch mode rather than relying on the watchdog auto-exit,
             # which is unreliable in practice.
             mode = Base_pb2.ServoingModeInformation()
-            mode.servoing_mode = Base_pb2.HIGH_LEVEL_SERVOING
+            mode.servoing_mode = Base_pb2.UNSPECIFIED_SERVOING_MODE
             self._base.SetServoingMode(mode)
             time.sleep(0.5)  # let mode transition settle and flush stale action events
 
