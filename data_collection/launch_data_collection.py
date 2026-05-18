@@ -216,6 +216,13 @@ def main(argv=sys.argv[1:]):
     print('  P - Pause         U - Unpause Q - Quit')
     print('=' * 60)
 
+    # Kill any stale piezense driver processes from previous launches.
+    if not args.no_piezense:
+        result = subprocess.run(['pkill', '-f', 'piezense_driver'],
+                                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        if result.returncode == 0:
+            print('Killed stale piezense_driver process(es)')
+
     # Auto-detect a running rosbridge so we don't kill it.
     # If --no-rosbridge was not explicitly passed but something is already on
     # port 9090, treat it as an intentional persistent rosbridge and leave it alone.
