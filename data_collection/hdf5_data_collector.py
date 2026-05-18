@@ -367,7 +367,9 @@ class HDF5DataCollector(Node):
         for name in self._cam_last_seen:
             last = self._cam_last_seen[name]
             if last is None:
-                if uptime > 5.0 and not self._cam_drop_warned[name]:
+                if name == 'dji_wrist' and not self._dji_cam_active:
+                    pass  # idle by design — only streams during recording
+                elif uptime > 5.0 and not self._cam_drop_warned[name]:
                     self._cam_drop_warned[name] = True
                     self.get_logger().error(
                         f'\n{banner}\n  CAMERA {name} has NEVER published!\n{banner}'
