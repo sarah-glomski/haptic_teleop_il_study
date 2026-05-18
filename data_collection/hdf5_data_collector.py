@@ -185,10 +185,11 @@ class HDF5DataCollector(Node):
         self._latest_holo_thumb = None
         self._latest_holo_index = None
         self._latest_holo_gaze  = None
-        self.create_subscription(PoseStamped, '/hololens/palm/right',  lambda m: setattr(self, '_latest_holo_palm',  m), 10)
-        self.create_subscription(PoseStamped, '/hololens/thumb/right', lambda m: setattr(self, '_latest_holo_thumb', m), 10)
-        self.create_subscription(PoseStamped, '/hololens/index/right', lambda m: setattr(self, '_latest_holo_index', m), 10)
-        self.create_subscription(PoseStamped, '/hololens/gaze',        lambda m: setattr(self, '_latest_holo_gaze',  m), 10)
+        self._holo_last_seen    = None
+        self.create_subscription(PoseStamped, '/hololens/palm/right',  self._holo_palm_cb,                                    10)
+        self.create_subscription(PoseStamped, '/hololens/thumb/right', lambda m: setattr(self, '_latest_holo_thumb', m),      10)
+        self.create_subscription(PoseStamped, '/hololens/index/right', lambda m: setattr(self, '_latest_holo_index', m),      10)
+        self.create_subscription(PoseStamped, '/hololens/gaze',        lambda m: setattr(self, '_latest_holo_gaze',  m),      10)
 
         # Piezense pressure input (latest-value side channel)
         self._enable_piezense    = self.declare_parameter('enable_piezense', True).value
@@ -292,6 +293,16 @@ class HDF5DataCollector(Node):
                 self.get_logger().warn(
                     'Piezense: no data on piezense/data — is piezense_driver running?'
                 )
+
+    def _holo_palm_cb(self, msg: PoseStamped):
+        self._latest_holo_palm = msg
+        self._holo_last_seen   = time.monotonic()
+
+    def get_hololens_health(self) -> str:
+        now = time.monotonic()
+        if self._holo_last_seen is None:
+            return 'waiting' if (now - self._node_start_time) < 5.0 else 'dead'
+        return 'ok' if (now - self._holo_last_seen) < 3.0 else 'dead'
 
     # ── Core synced callback ──────────────────────────────────────────────────
     def _zed_cb(self, msg: Image):
@@ -541,7 +552,7 @@ class HDF5DataCollector(Node):
 def run_pygame(node: HDF5DataCollector):
     """Pygame keyboard control loop. Runs in the main thread."""
     pygame.init()
-    screen     = pygame.display.set_mode((520, 300))
+    screen     = pygame.display.set_mode((620, 300))
     pygame.display.set_caption('Haptic Teleop IL — Data Collection')
     font       = pygame.font.Font(None, 32)
     small_font = pygame.font.Font(None, 24)
@@ -593,6 +604,10 @@ def run_pygame(node: HDF5DataCollector):
         pz_color = health_colors[node.get_piezense_health()]
         pygame.draw.circle(screen, pz_color, (x_pos + 6, 132), 6)
         screen.blit(small_font.render('piezense', True, (200, 200, 200)), (x_pos + 16, 126))
+        x_pos += 100
+        hl_color = health_colors[node.get_hololens_health()]
+        pygame.draw.circle(screen, hl_color, (x_pos + 6, 132), 6)
+        screen.blit(small_font.render('hololens', True, (200, 200, 200)), (x_pos + 16, 126))
 
         # Controls
         controls = [
