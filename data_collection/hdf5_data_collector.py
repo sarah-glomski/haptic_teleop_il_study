@@ -595,19 +595,16 @@ def run_pygame(node: HDF5DataCollector):
             'idle':     ( 60, 100, 160),  # dim blue — intentionally off between episodes
             'disabled': ( 80,  80,  80),
         }
-        x_pos = 20
-        for cam_name, cam_status in node.get_camera_health().items():
-            color = health_colors[cam_status]
-            pygame.draw.circle(screen, color, (x_pos + 6, 132), 6)
-            screen.blit(small_font.render(cam_name, True, (200, 200, 200)), (x_pos + 16, 126))
-            x_pos += 160
-        pz_color = health_colors[node.get_piezense_health()]
-        pygame.draw.circle(screen, pz_color, (x_pos + 6, 132), 6)
-        screen.blit(small_font.render('piezense', True, (200, 200, 200)), (x_pos + 16, 126))
-        x_pos += 100
-        hl_color = health_colors[node.get_hololens_health()]
-        pygame.draw.circle(screen, hl_color, (x_pos + 6, 132), 6)
-        screen.blit(small_font.render('hololens', True, (200, 200, 200)), (x_pos + 16, 126))
+        health_items = list(node.get_camera_health().items())
+        health_items.append(('piezense', node.get_piezense_health()))
+        health_items.append(('hololens', node.get_hololens_health()))
+        row_left  = 20
+        row_right = screen.get_width() - 20
+        step = (row_right - row_left) // len(health_items)
+        for i, (label, status) in enumerate(health_items):
+            x = row_left + i * step
+            pygame.draw.circle(screen, health_colors[status], (x + 6, 132), 6)
+            screen.blit(small_font.render(label, True, (200, 200, 200)), (x + 16, 126))
 
         # Controls
         controls = [
