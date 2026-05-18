@@ -573,6 +573,20 @@ def run_pygame(node: HDF5DataCollector):
 
         screen.fill((40, 44, 52))
 
+        # Color key (top right)
+        key = [
+            ('ok',       ( 80, 200,  80)),
+            ('waiting',  (255, 200,  50)),
+            ('dead',     (220,  50,  50)),
+            ('idle',     ( 60, 100, 160)),
+            ('disabled', ( 80,  80,  80)),
+        ]
+        kx = screen.get_width() - 90
+        for row, (label, kcolor) in enumerate(key):
+            ky = 12 + row * 18
+            pygame.draw.circle(screen, kcolor, (kx, ky + 5), 4)
+            screen.blit(small_font.render(label, True, (140, 140, 140)), (kx + 10, ky))
+
         # Status
         if not node.is_collecting:
             status, color = 'IDLE',      (150, 150, 150)
