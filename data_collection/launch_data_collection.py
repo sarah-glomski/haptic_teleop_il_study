@@ -56,6 +56,7 @@ def generate_launch_description(
     no_zed: bool = False,
     no_cameras: bool = False,
     no_piezense: bool = False,
+    no_rosbridge: bool = False,
 ) -> LaunchDescription:
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -66,10 +67,12 @@ def generate_launch_description(
     return LaunchDescription([
 
         # ── 1. rosbridge WebSocket server ─────────────────────────────────────
-        # The HoloLens Unity app connects to ws://<host-ip>:9090
+        # The HoloLens Unity app connects to ws://<host-ip>:9090.
+        # Skip with --no-rosbridge when rosbridge is already running so the
+        # HoloLens stays connected across pipeline restarts.
         # Force system python3 in PATH so the #!/usr/bin/env python3 shebang
         # doesn't resolve to miniforge Python 3.13 (which lacks rclpy C extensions).
-        Node(
+        *([Node(
             package='rosbridge_server',
             executable='rosbridge_websocket',
             name='rosbridge_websocket',
@@ -84,7 +87,7 @@ def generate_launch_description(
                     if 'miniforge' not in p and 'conda' not in p
                 ),
             },
-        ),
+        )] if not no_rosbridge else []),
 
         # ── 2. HoloLens TF publisher ──────────────────────────────────────────
         ExecuteProcess(
@@ -193,6 +196,9 @@ def main(argv=sys.argv[1:]):
                              'Implies --no-zed. Use when cameras are unavailable.')
     parser.add_argument('--no-piezense', action='store_true',
                         help='Skip piezense driver and disable piezense recording.')
+    parser.add_argument('--no-rosbridge', action='store_true',
+                        help='Skip launching rosbridge (use when it is already running '
+                             'so the HoloLens stays connected across pipeline restarts).')
     args, launch_argv = parser.parse_known_args(argv)
 
     print('=' * 60)
@@ -210,11 +216,13 @@ def main(argv=sys.argv[1:]):
     print('  P - Pause         U - Unpause Q - Quit')
     print('=' * 60)
 
-    # Kill any stale process holding port 9090 (e.g. a previous rosbridge run).
-    result = subprocess.run(['fuser', '-k', '9090/tcp'],
-                            stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    if result.returncode == 0:
-        print('Killed stale process on port 9090')
+    # Kill any stale process holding port 9090 — only when we are launching rosbridge
+    # ourselves. Skip when --no-rosbridge is set so the existing session stays alive.
+    if not args.no_rosbridge:
+        result = subprocess.run(['fuser', '-k', '9090/tcp'],
+                                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        if result.returncode == 0:
+            print('Killed stale process on port 9090')
 
     ld = generate_launch_description(
         robot_ip=args.robot_ip,
@@ -223,6 +231,7 @@ def main(argv=sys.argv[1:]):
         no_zed=args.no_zed or args.no_cameras,
         no_cameras=args.no_cameras,
         no_piezense=args.no_piezense,
+        no_rosbridge=args.no_rosbridge,
     )
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)
