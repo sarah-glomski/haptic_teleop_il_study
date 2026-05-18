@@ -384,11 +384,14 @@ class HDF5DataCollector(Node):
                         f'\n{banner}\n  CAMERA {name} has NEVER published!\n{banner}'
                     )
             elif (now - last) > 6.0 and not self._cam_drop_warned[name]:
-                self._cam_drop_warned[name] = True
-                self.get_logger().warn(
-                    f'\n{banner}\n  CAMERA {name} STOPPED (last frame '
-                    f'{now - last:.1f}s ago) — recording continues\n{banner}'
-                )
+                if name == 'dji_wrist' and not self._dji_cam_active:
+                    pass  # idle by design — disabled after end of episode
+                else:
+                    self._cam_drop_warned[name] = True
+                    self.get_logger().warn(
+                        f'\n{banner}\n  CAMERA {name} STOPPED (last frame '
+                        f'{now - last:.1f}s ago) — recording continues\n{banner}'
+                    )
 
     def get_camera_health(self) -> dict:
         now = time.monotonic()
@@ -422,6 +425,7 @@ class HDF5DataCollector(Node):
             self.episode_start = self.get_clock().now()
             if self._enable_dji:
                 self._dji_cam_active = True
+                self._cam_drop_warned['dji_wrist'] = False  # re-arm warning for this episode
                 self._dji_enable_pub.publish(Bool(data=True))
             self.get_logger().info(f'Started recording episode {self.demo_count}')
 
