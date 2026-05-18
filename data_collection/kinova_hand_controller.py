@@ -485,13 +485,9 @@ class KinovaHandController(Node):
 
     def _do_reset(self):
         try:
-            # ExecuteAction (reach_pose) requires HIGH_LEVEL_SERVOING.
-            # Explicitly switch mode rather than relying on the watchdog auto-exit,
-            # which is unreliable in practice.
-            mode = Base_pb2.ServoingModeInformation()
-            mode.servoing_mode = Base_pb2.UNSPECIFIED_SERVOING_MODE
-            self._base.SetServoingMode(mode)
-            time.sleep(0.5)  # let mode transition settle and flush stale action events
+            # Wait for the twist watchdog (200 ms) to fire and the arm to reach a
+            # controlled stop before issuing the position action.
+            time.sleep(1.0)
 
             action = Base_pb2.Action()
             action.name = 'Home'
@@ -510,18 +506,23 @@ class KinovaHandController(Node):
             pose.theta_y = self.home_ty
             pose.theta_z = self.home_tz
 
-            finished       = threading.Event()
-            action_started = threading.Event()
+            finished      = threading.Event()
+            execute_time  = [None]  # set after ExecuteAction; list for closure mutability
 
-            def _on_action(notif, ev=finished, started=action_started):
-                if started.is_set() and notif.action_event in (
-                    Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT
-                ):
-                    ev.set()
+            def _on_action(notif, ev=finished, t=execute_time):
+                if t[0] is None:
+                    return
+                if notif.action_event not in (Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT):
+                    return
+                # A genuine arm move to home takes at least 2 s at 0.08 m/s.
+                # Instant completions are stale events or silent rejections — ignore.
+                if time.monotonic() - t[0] < 2.0:
+                    return
+                ev.set()
 
             self._base.OnNotificationActionTopic(_on_action, Base_pb2.NotificationOptions())
             self._base.ExecuteAction(action)
-            action_started.set()
+            execute_time[0] = time.monotonic()
 
             if not finished.wait(timeout=30.0):
                 self.get_logger().warn('Home reset timed out — aborting')
