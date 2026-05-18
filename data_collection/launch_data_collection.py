@@ -216,12 +216,24 @@ def main(argv=sys.argv[1:]):
     print('  P - Pause         U - Unpause Q - Quit')
     print('=' * 60)
 
-    # Kill any stale piezense driver processes from previous launches.
+    # Kill stale processes from previous launches so they don't accumulate.
+    stale_patterns = [
+        ('hololens_tf_publisher_ros2', 'hololens_tf_publisher'),
+        ('hololens_hand_node',         'hololens_hand_node'),
+        ('kinova_state_publisher',     'kinova_state_publisher'),
+        ('kinova_hand_controller',     'kinova_hand_controller'),
+        ('hdf5_data_collector',        'hdf5_data_collector'),
+        ('dji_camera_node',            'dji_camera_node'),
+    ]
     if not args.no_piezense:
-        result = subprocess.run(['pkill', '-f', 'piezense_driver'],
+        stale_patterns.append(('ar_teleop_piezense_launch', 'piezense_launch'))
+        stale_patterns.append(('piezense_ros/lib/piezense_ros', 'piezense_driver'))
+
+    for pattern, label in stale_patterns:
+        result = subprocess.run(['pkill', '-f', pattern],
                                 stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         if result.returncode == 0:
-            print('Killed stale piezense_driver process(es)')
+            print(f'Killed stale {label} process(es)')
 
     # Auto-detect a running rosbridge so we don't kill it.
     # If --no-rosbridge was not explicitly passed but something is already on
