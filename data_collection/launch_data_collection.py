@@ -216,13 +216,15 @@ def main(argv=sys.argv[1:]):
     print('  P - Pause         U - Unpause Q - Quit')
     print('=' * 60)
 
-    # Kill any stale process holding port 9090 — only when we are launching rosbridge
-    # ourselves. Skip when --no-rosbridge is set so the existing session stays alive.
+    # Auto-detect a running rosbridge so we don't kill it.
+    # If --no-rosbridge was not explicitly passed but something is already on
+    # port 9090, treat it as an intentional persistent rosbridge and leave it alone.
     if not args.no_rosbridge:
-        result = subprocess.run(['fuser', '-k', '9090/tcp'],
-                                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        if result.returncode == 0:
-            print('Killed stale process on port 9090')
+        probe = subprocess.run(['fuser', '9090/tcp'],
+                               stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        if probe.returncode == 0:
+            print('Rosbridge already running on port 9090 — skipping launch (HoloLens connection preserved)')
+            args.no_rosbridge = True
 
     ld = generate_launch_description(
         robot_ip=args.robot_ip,
