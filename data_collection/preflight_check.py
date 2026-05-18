@@ -158,6 +158,15 @@ def check_topics(robot_ip: str, duration: float):
         history=HistoryPolicy.KEEP_LAST,
     )
 
+    from rclpy.qos import DurabilityPolicy
+    # TransientLocal so dji_camera_node receives the enable even if it subscribed first.
+    enable_qos = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+
     print(hdr(f'ROS2 Topics  (listening {duration:.0f} s)'))
 
     rclpy.init()
@@ -184,6 +193,10 @@ def check_topics(robot_ip: str, duration: float):
     for topic, label, mtype, sumfn, min_hz in teleop_specs + camera_specs:
         probes[topic] = (TopicProbe(node, topic, mtype, sumfn, sensor_qos), label, min_hz)
 
+    # Enable DJI wrist camera for the duration of the check so we can verify
+    # it's actually streaming.  Publish False afterward to leave it disabled.
+    dji_enable_pub = node.create_publisher(Bool, '/dji_camera/enable', enable_qos)
+
     executor = SingleThreadedExecutor()
     executor.add_node(node)
 
@@ -195,6 +208,11 @@ def check_topics(robot_ip: str, duration: float):
     spin_thread = threading.Thread(target=_spin, daemon=True)
     spin_thread.start()
 
+    # Enable DJI camera now that the executor is running
+    print(f'  {CYAN}Enabling DJI wrist camera…{RESET}')
+    dji_enable_pub.publish(Bool(data=True))
+    time.sleep(0.5)   # give the node time to open the device before counting Hz
+
     # Progress bar
     print(f'  {CYAN}Collecting…{RESET}', end='', flush=True)
     for _ in range(int(duration * 4)):
@@ -204,6 +222,9 @@ def check_topics(robot_ip: str, duration: float):
 
     stop_evt.set()
     spin_thread.join(timeout=1.0)
+
+    # Disable DJI camera — leave it off so it doesn't keep running (heat)
+    dji_enable_pub.publish(Bool(data=False))
 
     # Report — two groups so it's clear which launch file is needed
     all_ok = True
