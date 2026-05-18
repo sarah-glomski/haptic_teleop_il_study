@@ -485,9 +485,10 @@ class KinovaHandController(Node):
 
     def _do_reset(self):
         try:
-            # ExecuteAction requires HIGH_LEVEL_SERVOING; switch out of velocity-control mode.
+            # ExecuteAction requires the default (unspecified) servoing mode.
+            # SINGLE_LEVEL_SERVOING blocks it, so switch back first.
             mode = Base_pb2.ServoingModeInformation()
-            mode.servoing_mode = Base_pb2.HIGH_LEVEL_SERVOING
+            mode.servoing_mode = Base_pb2.UNSPECIFIED_SERVOING_MODE
             self._base.SetServoingMode(mode)
             time.sleep(0.2)
 
