@@ -270,7 +270,7 @@ def check_topics(robot_ip: str, duration: float):
                 if topic == 'hand/pose':
                     hand_pose_hz = hz
             elif hz > 0:
-                hint = _no_data_hint(topic)
+                hint = _low_hz_hint(topic)
                 print(f'  {warn(f"{label:<42} {hz:5.1f} Hz  (low — expected ≥ {min_hz:.0f} Hz){hint}")}')
                 all_ok = False
             else:
@@ -325,7 +325,17 @@ def _no_data_hint(topic):
         'hand/tracking_active':  ' → hololens_hand_node not running',
         'robot_obs/pose':        ' → kinova_state_publisher not connected to robot',
         '/zed_isometric/zed_node/left/image_rect_color': ' → ZED wrapper not running or camera disconnected',
-        '/dji_wrist/dji_wrist/color/image_raw':       ' → dji_camera_node not running (cameras only start with launch_data_collection.py)',
+        '/dji_wrist/dji_wrist/color/image_raw':          ' → dji_camera_node not running (cameras only start with launch_data_collection.py)',
+    }
+    h = hints.get(topic, '')
+    return f'  {YELLOW}{h}{RESET}' if h else ''
+
+
+def _low_hz_hint(topic):
+    hints = {
+        '/zed_isometric/zed_node/left/image_rect_color': ' → ZED wrapper running but slow; check USB3 bandwidth',
+        '/dji_wrist/dji_wrist/color/image_raw':          ' → camera just enabled; rate may still be ramping up',
+        'robot_obs/pose':        ' → kinova_state_publisher connected but lagging',
     }
     h = hints.get(topic, '')
     return f'  {YELLOW}{h}{RESET}' if h else ''
