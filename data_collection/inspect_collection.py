@@ -333,6 +333,9 @@ def main():
                         help='Camera frames shown in detail view (default 8)')
     parser.add_argument('--detail', nargs='*', metavar='N',
                         help='Episode numbers to open in detail view (e.g. --detail 3 7)')
+    parser.add_argument('--exclude', nargs='*', metavar='N',
+                        help='Write an exclude list (e.g. --exclude 0 4 6). '
+                             'Omit numbers to be prompted interactively.')
     args = parser.parse_args()
 
     paths = _sort(glob.glob(os.path.join(args.collection, 'episode_*.hdf5')))
@@ -352,6 +355,27 @@ def main():
     rows = flag_outliers(rows)
     print_table(rows)
     plot_dashboard(rows, args.collection, args.num_steps)
+
+    # Exclude list
+    if args.exclude is not None:
+        if args.exclude:
+            to_exclude = args.exclude
+        else:
+            print('\nEnter episode numbers to exclude (space-separated), then ENTER:')
+            to_exclude = input('> ').split()
+
+        valid_names = {r['name'].replace('episode_', '').replace('.hdf5', '') for r in rows}
+        bad = [e for e in to_exclude if e not in valid_names]
+        if bad:
+            print(f'[WARN] Unknown episode numbers (ignored): {bad}')
+        to_exclude = [e for e in to_exclude if e in valid_names]
+
+        out = os.path.join(args.collection, 'exclude.txt')
+        with open(out, 'w') as f:
+            for e in sorted(to_exclude, key=lambda s: int(s)):
+                f.write(f'episode_{e}\n')
+        print(f'\nExclude list written → {out}')
+        print('  ' + '  '.join(f'episode_{e}' for e in sorted(to_exclude, key=lambda s: int(s))))
 
     # Detail view — load images only for requested episodes
     if args.detail is not None:
