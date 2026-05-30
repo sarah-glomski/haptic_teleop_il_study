@@ -2,7 +2,7 @@
 KinovaImageDataset — flat UMI-style zarr dataset for diffusion policy training.
 
 Reads the flat zarr format produced by convert_data.py:
-  data/zed_front_rgb       (N, 224, 224, 3) uint8
+  # data/zed_isometric_rgb   (N, 224, 224, 3) uint8
   data/dji_wrist_rgb       (N, 224, 224, 3) uint8
   data/pose                (N, 10) float32
   data/action              (N, 10) float32
@@ -11,7 +11,7 @@ Reads the flat zarr format produced by convert_data.py:
 
 Each __getitem__ returns:
   obs:
-    zed_front_rgb:      (obs_horizon, 3, 224, 224)  float32  [0, 1]
+    # zed_isometric_rgb: (obs_horizon, 3, 224, 224)  float32  [0, 1]
     dji_wrist_rgb:      (obs_horizon, 3, 224, 224)  float32  [0, 1]
     pose:               (obs_horizon, 10)            float32
     piezense_pressure:  (obs_horizon, 2)             float32  Pa
@@ -23,12 +23,12 @@ from __future__ import annotations
 import numpy as np
 import torch
 import zarr
-from torch.utils.data import Dataset
 
-from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.dataset.base_dataset import BaseImageDataset
+from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 
 
-class KinovaImageDataset(Dataset):
+class KinovaImageDataset(BaseImageDataset):
     def __init__(
         self,
         shape_meta: dict,
@@ -100,13 +100,13 @@ class KinovaImageDataset(Dataset):
         def load(key, s, e):
             return data[key][s:e]
 
-        # Images: (obs_horizon, H, W, 3) uint8 -> (obs_horizon, 3, H, W) float [0,1]
+        # Images: (obs_horizon, 224, 224, 3) uint8 -> (obs_horizon, 3, 224, 224) float [0,1]
         def load_img(key):
-            imgs = load(key, t_start, t_obs_end)  # (obs_h, H, W, 3)
+            imgs = load(key, t_start, t_obs_end)  # (obs_h, 224, 224, 3)
             return torch.from_numpy(imgs.copy()).permute(0, 3, 1, 2).float() / 255.0
 
         obs = {
-            "zed_front_rgb":     load_img("zed_front_rgb"),
+            # "zed_isometric_rgb": load_img("zed_isometric_rgb"),
             "dji_wrist_rgb":     load_img("dji_wrist_rgb"),
             "pose":              torch.from_numpy(load("pose",              t_start, t_obs_end).copy()).float(),
             "piezense_pressure": torch.from_numpy(load("piezense_pressure", t_start, t_obs_end).copy()).float(),
@@ -145,14 +145,15 @@ class KinovaImageDataset(Dataset):
         normalizer = LinearNormalizer()
         normalizer.fit(
             data={
-                "obs": {
-                    "pose":              torch.from_numpy(np.concatenate(pose_all)),
-                    "piezense_pressure": torch.from_numpy(np.concatenate(piezense_all)),
-                },
-                "action": torch.from_numpy(np.concatenate(action_all)),
+                "pose":              torch.from_numpy(np.concatenate(pose_all)),
+                "piezense_pressure": torch.from_numpy(np.concatenate(piezense_all)),
+                "action":            torch.from_numpy(np.concatenate(action_all)),
             },
             last_n_dims=1,
             mode=mode,
             **kwargs,
         )
+        # Images are already [0, 1] floats — identity passthrough
+        # normalizer["zed_isometric_rgb"] = SingleFieldLinearNormalizer.create_identity()
+        normalizer["dji_wrist_rgb"] = SingleFieldLinearNormalizer.create_identity()
         return normalizer

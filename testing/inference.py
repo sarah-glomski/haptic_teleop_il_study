@@ -51,11 +51,11 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 import message_filters
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Bool
 from cv_bridge import CvBridge
 from scipy.spatial.transform import Rotation as R
 from piezense_interfaces.msg import PiezenseSystemArray
@@ -98,9 +98,13 @@ TWIST_WATCHDOG_MS = 200    # ms — Kortex auto-stops if we miss this many ms
 IMG_SIZE     = 224
 OBS_HORIZON  = 2
 
-CAMERA_KEYS = ["zed_front_rgb", "dji_wrist_rgb"]
+# CAMERA_KEYS = ["zed_front_rgb", "dji_wrist_rgb"]
+CAMERA_KEYS = ["dji_wrist_rgb"]
+# CAMERA_TOPICS = {
+#     "zed_front_rgb": ZED_FRONT_TOPIC,
+#     "dji_wrist_rgb":  DJI_WRIST_TOPIC,
+# }
 CAMERA_TOPICS = {
-    "zed_front_rgb": ZED_FRONT_TOPIC,
     "dji_wrist_rgb":  DJI_WRIST_TOPIC,
 }
 
@@ -108,29 +112,44 @@ CAMERA_TOPICS = {
 # ── Rotation helpers ───────────────────────────────────────────────────────────
 
 def pose_msg_to_10d(pose_msg: PoseStamped, gripper: float) -> np.ndarray:
-    """Convert PoseStamped + gripper scalar to 10D [xyz, rot6d, grip]."""
+    """Convert PoseStamped + gripper scalar to 10D [xyz, rot6d, grip].
+
+    Encoding must match hdf5_to_zarr.py (RotationTransformer with pytorch3d):
+      - pytorch3d quaternion_to_matrix expects [w,x,y,z] but received [qx,qy,qz,qw],
+        so it treats qx as w.  Replicate: scipy from_quat([qy, qz, qw, qx]).
+      - pytorch3d matrix_to_rotation_6d takes first two ROWS (not columns).
+    """
     pos = np.array([pose_msg.pose.position.x,
                     pose_msg.pose.position.y,
                     pose_msg.pose.position.z])
-    quat_xyzw = np.array([pose_msg.pose.orientation.x,
-                           pose_msg.pose.orientation.y,
-                           pose_msg.pose.orientation.z,
-                           pose_msg.pose.orientation.w])
-    rot_mat = R.from_quat(quat_xyzw).as_matrix()  # (3, 3)
-    rot6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]])  # (6,)
+    q = np.array([pose_msg.pose.orientation.x,
+                  pose_msg.pose.orientation.y,
+                  pose_msg.pose.orientation.z,
+                  pose_msg.pose.orientation.w])  # [qx, qy, qz, qw]
+    # Replicate pytorch3d's misinterpretation: treat qx as w
+    q_as_training = np.array([q[1], q[2], q[3], q[0]])  # scipy [x,y,z,w] = [qy, qz, qw, qx]
+    rot_mat = R.from_quat(q_as_training).as_matrix()    # (3, 3)
+    rot6d = np.concatenate([rot_mat[0, :], rot_mat[1, :]])  # first two ROWS  (6,)
     return np.concatenate([pos, rot6d, [gripper]]).astype(np.float32)  # (10,)
 
 
 def rot6d_to_euler_xyz(rot6d: np.ndarray) -> np.ndarray:
-    """Convert 6D rotation representation to Euler XYZ angles in degrees."""
-    c1 = rot6d[:3]
-    c2 = rot6d[3:6]
-    c1 = c1 / (np.linalg.norm(c1) + 1e-8)
-    c2 = c2 - np.dot(c2, c1) * c1
-    c2 = c2 / (np.linalg.norm(c2) + 1e-8)
-    c3 = np.cross(c1, c2)
-    mat = np.column_stack([c1, c2, c3])  # (3, 3)
-    return R.from_matrix(mat).as_euler("xyz", degrees=True)  # [tx, ty, tz] degrees
+    """Decode training-encoded rot6d → Euler XYZ degrees.
+
+    Training encoding (pytorch3d rows convention):
+      rot6d = [row0, row1] of the *wrong* rotation matrix
+      (wrong = built from [qx,qy,qz,qw] misread as pytorch3d [w,x,y,z]).
+    To recover physical Euler: reconstruct wrong_mat, extract its scipy quaternion
+    [qy,qz,qw,qx], then roll right by 1 to get physical [qx,qy,qz,qw].
+    """
+    r0 = rot6d[:3] / (np.linalg.norm(rot6d[:3]) + 1e-8)
+    r1 = rot6d[3:6] - np.dot(rot6d[3:6], r0) * r0
+    r1 = r1 / (np.linalg.norm(r1) + 1e-8)
+    r2 = np.cross(r0, r1)
+    wrong_mat = np.row_stack([r0, r1, r2])                  # rows, not columns
+    wrong_quat_scipy = R.from_matrix(wrong_mat).as_quat()   # [qy, qz, qw, qx]
+    physical_quat = np.roll(wrong_quat_scipy, 1)            # [qx, qy, qz, qw]
+    return R.from_quat(physical_quat).as_euler("xyz", degrees=True)
 
 
 # ── Model loading ──────────────────────────────────────────────────────────────
@@ -197,23 +216,34 @@ class PolicyNode(Node):
 
         self.pose_sub     = message_filters.Subscriber(self, PoseStamped, POSE_TOPIC,      qos_profile=sensor_qos)
         self.gripper_sub  = message_filters.Subscriber(self, Float32,     GRIPPER_TOPIC,   qos_profile=sensor_qos)
-        self.zed_sub      = message_filters.Subscriber(self, Image,       ZED_FRONT_TOPIC, qos_profile=sensor_qos)
+        # self.zed_sub      = message_filters.Subscriber(self, Image,       ZED_FRONT_TOPIC, qos_profile=sensor_qos)
         self.wrist_sub    = message_filters.Subscriber(self, Image,       DJI_WRIST_TOPIC,  qos_profile=sensor_qos)
 
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            [self.pose_sub, self.gripper_sub, self.zed_sub, self.wrist_sub],
+            # [self.pose_sub, self.gripper_sub, self.zed_sub, self.wrist_sub],
+            [self.pose_sub, self.gripper_sub, self.wrist_sub],
             queue_size=100,
             slop=0.05,
             allow_headerless=True,
         )
         self.sync.registerCallback(self.synced_obs_callback)
 
+        # ── Enable DJI camera ────────────────────────────────────────────────
+        _dji_enable_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
+        self._dji_enable_pub = self.create_publisher(Bool, '/dji_camera/enable', _dji_enable_qos)
+        self.create_timer(0.5, self._enable_dji_camera)
+
         # ── Observation buffers ──────────────────────────────────────────────
         self.pose_buffer = []
         self.cam_buffers = {k: [] for k in CAMERA_KEYS}
 
         # ── Piezense side-channel (latest-value, not synchronized) ───────────
-        self._latest_piezense = np.zeros(PIEZENSE_INPUT_CHANNELS, dtype=np.float32)
+        self._latest_piezense = np.array([111337.0, 110375.0], dtype=np.float32)  # training mean fallback
         self.piezense_buffer  = []
         self.create_subscription(
             PiezenseSystemArray, PIEZENSE_TOPIC, self._piezense_cb, 10
@@ -266,7 +296,7 @@ class PolicyNode(Node):
 
     # ── Observation callbacks ─────────────────────────────────────────────────
 
-    def synced_obs_callback(self, pose_msg, gripper_msg, zed_msg, wrist_msg):
+    def synced_obs_callback(self, pose_msg, gripper_msg, wrist_msg):  # zed_msg removed
         now = time.monotonic() - self.start_time
         self.gripper_state = gripper_msg.data
 
@@ -277,7 +307,8 @@ class PolicyNode(Node):
             self.pose_buffer.pop(0)
 
         # Camera images
-        for cam_key, msg in [("zed_front_rgb", zed_msg), ("dji_wrist_rgb", wrist_msg)]:
+        # for cam_key, msg in [("zed_front_rgb", zed_msg), ("dji_wrist_rgb", wrist_msg)]:
+        for cam_key, msg in [("dji_wrist_rgb", wrist_msg)]:
             img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
             img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
             img = img.astype(np.float32) / 255.0
@@ -286,6 +317,11 @@ class PolicyNode(Node):
             buf.append((img, now))
             if len(buf) > OBS_HORIZON:
                 buf.pop(0)
+
+    def _enable_dji_camera(self):
+        msg = Bool()
+        msg.data = True
+        self._dji_enable_pub.publish(msg)
 
     def _piezense_cb(self, msg: PiezenseSystemArray):
         for sys_msg in msg.system:
@@ -311,6 +347,18 @@ class PolicyNode(Node):
                 return
 
         pose_slice = self.pose_buffer[-OBS_HORIZON:]
+
+        # One-time diagnostic: log the obs rot6d vs expected training value
+        if not getattr(self, '_obs_logged', False):
+            self._obs_logged = True
+            p10d = pose_slice[-1][0]
+            obs_euler = rot6d_to_euler_xyz(p10d[3:9])
+            self.get_logger().info(
+                f"OBS diagnostic — pose rot6d={np.round(p10d[3:9], 4)}  "
+                f"→ decoded theta_xyz={np.round(obs_euler, 2)}  "
+                f"(expected ≈ [-179.3, -0.4, 89.3])"
+            )
+
         obs_dict = {
             "pose": torch.from_numpy(
                 np.stack([p[0] for p in pose_slice])
@@ -344,8 +392,20 @@ class PolicyNode(Node):
 
     def control_callback(self):
         """30 Hz: consume next target from shared_obs and drive the arm toward it."""
-        if self.paused or self.is_resetting or self.current_target_xyz is None:
+        if self.is_resetting:
+            # _do_home_reset owns all twist state during reset — sending zero here
+            # would continuously renew the watchdog and prevent ExecuteAction.
             self._smoothed_vel[:] = 0.0
+            return
+        if self.paused:
+            self._smoothed_vel[:] = 0.0
+            self._send_zero_twist()
+            return
+
+        # Snapshot targets once to avoid race with action_executor / reset threads
+        target_xyz   = self.current_target_xyz
+        target_euler = self.current_target_euler
+        if target_xyz is None:
             self._send_zero_twist()
             return
 
@@ -359,7 +419,7 @@ class PolicyNode(Node):
             current_tz = feedback.base.tool_pose_theta_z
 
             # Linear P-loop
-            pos_err = self.current_target_xyz - current_xyz
+            pos_err = target_xyz - current_xyz
             raw_vel = P_GAIN * pos_err
             speed = np.linalg.norm(raw_vel)
             if speed > MAX_LINEAR_SPEED:
@@ -372,13 +432,18 @@ class PolicyNode(Node):
             if smooth_speed > MAX_LINEAR_SPEED:
                 send_vel *= MAX_LINEAR_SPEED / smooth_speed
 
-            # Angular P-loop (theta_z only; keep theta_x / theta_y from target)
-            target_tz = self.current_target_euler[2] if self.current_target_euler is not None else current_tz
-            tz_err = (target_tz - current_tz + 180.0) % 360.0 - 180.0
-            ang_vel_z = float(np.clip(P_GAIN * tz_err, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
+            # Angular P-loop in world/base frame.
+            # CARTESIAN_REFERENCE_FRAME_BASE puts angular_z in the world Z axis,
+            # so the P-loop sign is correct regardless of tool orientation.
+            # (CARTESIAN_REFERENCE_FRAME_MIXED uses tool-frame angular, which at
+            # theta_x≈-180° maps world +Z → tool -Z, inverting the sign.)
+            ang_vel_z = 0.0
+            if target_euler is not None:
+                tz_err = (target_euler[2] - current_tz + 180.0) % 360.0 - 180.0
+                ang_vel_z = float(np.clip(P_GAIN * tz_err, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
 
             cmd = Base_pb2.TwistCommand()
-            cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED
+            cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
             cmd.duration = TWIST_WATCHDOG_MS
             cmd.twist.linear_x  = float(send_vel[0])
             cmd.twist.linear_y  = float(send_vel[1])
@@ -406,6 +471,13 @@ class PolicyNode(Node):
         self.current_target_euler = euler_deg
         self.current_gripper_cmd  = grip
 
+        if not getattr(self, '_action_logged', False):
+            self._action_logged = True
+            self.get_logger().info(
+                f"First action target: xyz={np.round(pos, 4)}  "
+                f"theta_xyz={np.round(euler_deg, 2)}  grip={grip:.3f}"
+            )
+
         # Gripper command
         try:
             gc = Base_pb2.GripperCommand()
@@ -432,6 +504,8 @@ class PolicyNode(Node):
         self.shared_obs["paused"] = False
 
     def reset_to_home(self):
+        if self.is_resetting:
+            return
         self.get_logger().info("Resetting to home...")
         self.paused = True
         self.shared_obs["paused"] = True
@@ -443,10 +517,10 @@ class PolicyNode(Node):
     def _do_home_reset(self):
         try:
             self._send_zero_twist()
-            # Switch to position mode for the home move
-            mode = Base_pb2.ServoingModeInformation()
-            mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
-            # Use reach_pose action
+            # 1 s gives the watchdog time to expire AND lets any in-flight
+            # ACTION_END/ABORT notifications drain before we register the new listener.
+            time.sleep(1.0)
+
             action = Base_pb2.Action()
             action.name = "Home"
             action.application_data = ""
@@ -459,12 +533,14 @@ class PolicyNode(Node):
             pose.theta_x, pose.theta_y, pose.theta_z = HOME_TX, HOME_TY, HOME_TZ
 
             finished = threading.Event()
+
             def _on_action(notif, ev=finished):
                 if notif.action_event in (Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT):
                     ev.set()
 
             self._base.OnNotificationActionTopic(_on_action, Base_pb2.NotificationOptions())
             self._base.ExecuteAction(action)
+
             if not finished.wait(timeout=30.0):
                 self.get_logger().warn("Home reset timed out")
                 self._base.StopAction()
@@ -499,17 +575,25 @@ class PolicyNode(Node):
 # ── Inference process ──────────────────────────────────────────────────────────
 
 def inference_loop(model_path, shared_obs, action_queue,
-                   action_horizon=6, device="cuda", start_time=0,
-                   dt=0.033, num_inference_steps=16):
+                   action_horizon=8, device="cuda", start_time=0,
+                   dt=0.033, num_inference_steps=16,
+                   latency_offset_s=0.0):
     """GPU process: load model and run inference, posting targets to the main process."""
+    import sys as _sys
+    _sys.stdout.reconfigure(line_buffering=True)  # force line-flush in spawned subprocess
+
+    latency_steps = max(0, round(latency_offset_s / dt))
+    if latency_steps:
+        print(f"Latency offset: {latency_offset_s*1000:.0f} ms = {latency_steps} steps at dt={dt}s", flush=True)
+
     policy = load_policy(model_path, num_inference_steps)
     model_obs_keys = load_obs_keys(model_path)
-    print(f"Model expects obs keys: {model_obs_keys}")
+    print(f"Model expects obs keys: {model_obs_keys}", flush=True)
 
     # Wait for first observation
     while shared_obs.get("obs") is None:
         time.sleep(0.05)
-        print("Waiting for first observation...")
+        print("Waiting for first observation...", flush=True)
 
     # Track timestamp freshness
     prev_timestamps = {}
@@ -521,7 +605,8 @@ def inference_loop(model_path, shared_obs, action_queue,
         if ts_key in obs_now:
             prev_timestamps[cam_key] = obs_now[ts_key][-1]
 
-    print("Inference loop started.")
+    print("Inference loop started.", flush=True)
+    _actions_logged = False
 
     while True:
         if shared_obs.get("paused", True):
@@ -547,7 +632,7 @@ def inference_loop(model_path, shared_obs, action_queue,
                 break
             elapsed = time.time() - wait_start
             if elapsed > 1.0 and int(elapsed) != int(elapsed - 0.001):
-                print(f"Waiting for new sensor data ({elapsed:.1f}s)...")
+                print(f"Waiting for new sensor data ({elapsed:.1f}s)...", flush=True)
             time.sleep(0.001)
 
         wait_time = time.time() - wait_start
@@ -573,16 +658,26 @@ def inference_loop(model_path, shared_obs, action_queue,
             actions = policy.predict_action(model_obs)["action"][0].detach().cpu().numpy()
         infer_time = time.time() - t_infer
 
-        # Schedule action_horizon steps with timestamps
+        if not _actions_logged:
+            _actions_logged = True
+            print(f"predict_action output: {actions.shape[0]} steps × {actions.shape[1]} dims", flush=True)
+
+        # Schedule action_horizon steps with timestamps, skipping latency_steps
+        # to account for system delay between observation capture and execution.
         t_start = time.monotonic()
         action_queue.put(("CLEAR_PENDING", t_start))
-        for i, act in enumerate(actions[:action_horizon]):
-            ts = t_start + (i + 1) * dt
+        start_idx = min(latency_steps, len(actions) - 1)
+        for i, act in enumerate(actions[start_idx: start_idx + action_horizon]):
+            ts = t_start + i * dt
             action_queue.put((act, ts))
 
+        # Debug: log first predicted action in physical Euler angles
+        a0 = actions[start_idx]
+        euler = rot6d_to_euler_xyz(a0[3:9])
+        print(f"Inference: {infer_time*1000:.0f}ms | act[0] xyz={a0[:3]} theta_xyz={euler}", flush=True)
+
         total_time = time.time() - loop_start
-        print(f"Inference: {infer_time*1000:.0f}ms | Wait: {wait_time*1000:.0f}ms | "
-              f"Total: {total_time*1000:.0f}ms | Actions: {action_horizon}")
+        print(f"  Wait: {wait_time*1000:.0f}ms | Total: {total_time*1000:.0f}ms | Actions: {action_horizon}", flush=True)
 
         time.sleep(dt)
 
@@ -651,30 +746,38 @@ def main():
     parser.add_argument("--dt",              type=float, default=0.033, help="Action step period (s)")
     parser.add_argument("--action-horizon",  type=int,   default=6,    help="Actions per inference cycle")
     parser.add_argument("--diffusion-steps", type=int,   default=16,   help="DDIM inference steps")
+    parser.add_argument("--latency-offset-s", type=float, default=0.0,
+                        help="System latency to compensate (seconds). Skips this many steps at the "
+                             "start of each predicted action sequence. Measure with latency_calculation.py.")
     parser.add_argument("--no-pygame",       action="store_true",      help="Disable pygame window")
     args = parser.parse_args()
 
     multiprocessing.set_start_method("spawn", force=True)
-    rclpy.init()
 
     manager   = Manager()
     shared_obs = manager.dict(obs=None, paused=True)
     action_queue = Queue()
     start_time = time.monotonic()
 
+    rclpy.init()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Model:           {args.model}")
     print(f"dt:              {args.dt}s  ({1/args.dt:.0f} Hz)")
+    print(f"Obs horizon:     {OBS_HORIZON}")
     print(f"Action horizon:  {args.action_horizon}")
     print(f"Diffusion steps: {args.diffusion_steps}")
+    if args.latency_offset_s:
+        print(f"Latency offset:  {args.latency_offset_s*1000:.0f} ms "
+              f"({round(args.latency_offset_s / args.dt)} steps)")
 
     # GPU inference process
     inf_proc = Process(
         target=inference_loop,
         args=(args.model, shared_obs, action_queue,
               args.action_horizon, device, start_time,
-              args.dt, args.diffusion_steps),
+              args.dt, args.diffusion_steps, args.latency_offset_s),
         daemon=True,
     )
     inf_proc.start()
@@ -687,7 +790,7 @@ def main():
         while True:
             while not action_queue.empty():
                 item = action_queue.get()
-                if isinstance(item, tuple) and item[0] == "CLEAR_PENDING":
+                if isinstance(item, tuple) and isinstance(item[0], str) and item[0] == "CLEAR_PENDING":
                     pending.clear()
                 else:
                     pending.append(item)

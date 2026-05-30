@@ -22,14 +22,10 @@ Source HDF5 schema (per episode_N.hdf5):
 Target zarr schema (UMI-style flat concatenation):
   output.zarr/
   ├── data/
-  │   ├── zed_isometric_rgb:        (N, H, W, 3)  uint8    HWC
-  │   ├── dji_wrist_rgb:         (N, H, W, 3)  uint8    HWC
+  │   ├── zed_isometric_rgb:        (N, 224, 224, 3)  uint8    HWC
+  │   ├── dji_wrist_rgb:         (N, 224, 224, 3)  uint8    HWC
   │   ├── pose:                 (N, 10)        float32  [x,y,z,rot6d(6),gripper]  obs
   │   ├── action:               (N, 10)        float32  [x,y,z,rot6d(6),gripper]  act
-  │   ├── joint_states:         (N, 7)         float32  joint angles (rad)
-  │   ├── holo_palm_pose:       (N, 7)         float32  [xyz, qxyzw]
-  │   ├── holo_hand_width:      (N,)           float32
-  │   ├── holo_finger_tips:     (N, 15)        float32
   │   └── piezense_pressure:    (N, 2)         float32  Pa — sensor input channels
   └── meta/
       └── episode_ends:         (num_episodes,) int64  cumulative end indices
@@ -43,16 +39,12 @@ import glob
 import os
 import sys
 
+import cv2
 import h5py
 import numpy as np
 import zarr
 from natsort import natsorted
 
-# Add dt_ag-main to path for RotationTransformer (same as original script)
-sys.path.insert(
-    0,
-    os.path.join(os.path.dirname(__file__), '..', 'Robomimic', 'dt_ag-main', 'dt_ag'),
-)
 from rotation_transformer import RotationTransformer
 
 rot_tf = RotationTransformer(from_rep='quaternion', to_rep='rotation_6d')
@@ -80,10 +72,6 @@ def load_episode(h5_path: str) -> dict:
     Keys:
       pose              (T, 10)  float32  — observation TCP
       action            (T, 10)  float32  — commanded TCP
-      joint_states      (T, 7)   float32
-      holo_palm_pose       (T, 7)   float32
-      holo_hand_width      (T,)     float32
-      holo_finger_tips     (T, 15)  float32
       piezense_pressure    (T, 2)   float32  — input channel pressures (Pa)
       zed_isometric_rgb        (T, H, W, 3) uint8  — CHW→HWC
       dji_wrist_rgb         (T, H, W, 3) uint8  — CHW→HWC
@@ -99,18 +87,6 @@ def load_episode(h5_path: str) -> dict:
         data['pose']   = quat_pose_gripper_to_10d(obs_pose, obs_grip)
         data['action'] = quat_pose_gripper_to_10d(act_pose, act_grip)
 
-        # ── Kinematics passthrough ────────────────────────────────────────────
-        if 'observation/joint_states' in f:
-            data['joint_states'] = f['observation/joint_states'][()].astype(np.float32)
-
-        # ── HoloLens passthrough ──────────────────────────────────────────────
-        if 'hololens/palm_pose' in f:
-            data['holo_palm_pose']   = f['hololens/palm_pose'][()].astype(np.float32)
-        if 'hololens/hand_width' in f:
-            data['holo_hand_width']  = f['hololens/hand_width'][()].astype(np.float32)
-        if 'hololens/finger_tips' in f:
-            data['holo_finger_tips'] = f['hololens/finger_tips'][()].astype(np.float32)
-
         # ── Piezense pressure passthrough ─────────────────────────────────────
         if 'piezense/pressure_input' in f:
             data['piezense_pressure'] = f['piezense/pressure_input'][()].astype(np.float32)
@@ -123,7 +99,12 @@ def load_episode(h5_path: str) -> dict:
         for h5_key, zarr_key in img_map.items():
             if h5_key in f:
                 chw = f[h5_key][()]              # (T, 3, H, W)
-                data[zarr_key] = np.moveaxis(chw, 1, -1)  # (T, H, W, 3)
+                hwc = np.moveaxis(chw, 1, -1)   # (T, H, W, 3)
+                resized = np.stack([
+                    cv2.resize(frame, (224, 224), interpolation=cv2.INTER_AREA)
+                    for frame in hwc
+                ])                               # (T, 224, 224, 3)
+                data[zarr_key] = resized
 
     return data
 
@@ -182,10 +163,20 @@ def main():
         print(f'Error: No episode_*.hdf5 files in {args.input_dir}')
         sys.exit(1)
 
+    # Skip episodes listed in exclude.txt if present
+    exclude_file = os.path.join(args.input_dir, 'exclude.txt')
+    if os.path.exists(exclude_file):
+        with open(exclude_file) as ef:
+            excluded = {line.strip() for line in ef if line.strip()}
+        before = len(h5_files)
+        h5_files = [p for p in h5_files
+                    if os.path.basename(p).replace('.hdf5', '') not in excluded]
+        print(f'Skipping {before - len(h5_files)} excluded episode(s): {", ".join(sorted(excluded))}')
+
     if args.max_episodes is not None:
         h5_files = h5_files[:args.max_episodes]
 
-    print(f'Found {len(h5_files)} episode(s) in {args.input_dir}')
+    print(f'Found {len(h5_files)} episode(s) to convert in {args.input_dir}')
 
     root = zarr.open(args.output_zarr, mode='w')
 

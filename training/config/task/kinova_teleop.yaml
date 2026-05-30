@@ -4,11 +4,11 @@ action_horizon: 16
 
 shape_meta: &shape_meta
   obs:
-    zed_front_rgb:
-      shape: [3, 224, 224]
-      type: rgb
-      horizon: ${task.img_obs_horizon}
-      down_sample_steps: 1
+    # zed_isometric_rgb:
+    #   shape: [3, 224, 224]
+    #   type: rgb
+    #   horizon: ${task.img_obs_horizon}
+    #   down_sample_steps: 1
     dji_wrist_rgb:
       shape: [3, 224, 224]
       type: rgb

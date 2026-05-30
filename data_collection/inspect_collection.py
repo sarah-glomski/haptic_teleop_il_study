@@ -288,7 +288,8 @@ def plot_episode_detail(row: dict, num_steps: int):
         imgs = row['dji_wrist']
         for col, t_i in enumerate(idx):
             ax = fig.add_subplot(gs[0, col])
-            ax.imshow(np.moveaxis(imgs[t_i], 0, -1))
+            frame = np.ascontiguousarray(np.moveaxis(imgs[t_i], 0, -1))
+            ax.imshow(frame, aspect='auto')
             ax.set_xticks([]); ax.set_yticks([])
             if col == 0: ax.set_ylabel('dji_wrist', fontsize=8)
             ax.set_title(f't={t_i}', fontsize=7)
@@ -319,9 +320,9 @@ def plot_episode_detail(row: dict, num_steps: int):
     if has_cam:
         del row['dji_wrist']   # free memory after plotting
 
-    fig.suptitle(row['name'], fontsize=10)
-    plt.tight_layout()
-    plt.show()
+    fig.suptitle(row['name'], fontsize=10, y=1.01)
+    fig.tight_layout()
+    plt.show(block=True)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -342,6 +343,18 @@ def main():
     if not paths:
         print(f'No episode_*.hdf5 files found in {args.collection}')
         sys.exit(1)
+
+    # Skip episodes already in exclude.txt
+    exclude_file = os.path.join(args.collection, 'exclude.txt')
+    excluded = set()
+    if os.path.exists(exclude_file):
+        with open(exclude_file) as f:
+            excluded = {line.strip() for line in f if line.strip()}
+        if excluded:
+            print(f'Skipping {len(excluded)} excluded episodes: {", ".join(sorted(excluded))}')
+    paths = [p for p in paths
+             if os.path.basename(p).replace('.hdf5', '') not in excluded]
+
     print(f'Loading {len(paths)} episodes from {args.collection} …')
 
     # Load stats (no images yet — keep memory low)
@@ -376,6 +389,8 @@ def main():
                 f.write(f'episode_{e}\n')
         print(f'\nExclude list written → {out}')
         print('  ' + '  '.join(f'episode_{e}' for e in sorted(to_exclude, key=lambda s: int(s))))
+
+    plt.close('all')   # clear dashboard before opening detail windows
 
     # Detail view — load images only for requested episodes
     if args.detail is not None:
