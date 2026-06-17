@@ -191,12 +191,12 @@ Setup (once per session):
 
 Per demo (repeat for each episode):
 
-9. Place the hacky sack on the start tape. Press **`s`** on the keyboard to start the trial.
-10. Stand on the floor tape, hold out your arm, and say **"gripper"** then **"arm"** — *order matters*.
-11. Collect the demo. When finished, say **"arm"** then **"gripper"** — *order matters* — to freeze
+10. Place the hacky sack on the start tape. Press **`s`** on the keyboard to start the trial.
+11. Stand on the floor tape, hold out your arm, and say **"gripper"** then **"arm"** — *order matters*.
+12. Collect the demo. When finished, say **"arm"** then **"gripper"** — *order matters* — to freeze
     data collection.
-12. Walk over and press **`d`** to end the trial, then **`r`** to reset the robot to home.
-13. Repeat steps 9–12 for each demo.
+13. Walk over and press **`d`** to end the trial, then **`r`** to reset the robot to home.
+14. Repeat steps 9–12 for each demo.
 
 ## HDF5 Schema
 
