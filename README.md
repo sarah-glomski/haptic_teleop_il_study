@@ -101,8 +101,8 @@ episode_N.hdf5
 ├── piezense/
 │   └── pressure_input:     (T, 2)   float32  Pa — channels 2 & 3 of system 0
 └── images/
-    ├── zed_isometric:      (T, 3, H, W) uint8  CHW, LZF-compressed
-    └── dji_wrist:           (T, 3, H, W) uint8  CHW, LZF-compressed
+    ├── zed_isometric:      (T, 3, H, W)     uint8  CHW, LZF-compressed
+    └── dji_wrist:          (T, 3, 224, 224) uint8  CHW, LZF-compressed  (resized in dji_camera_node)
 ```
 
 **Collection rate:** ~30 Hz (set by ApproximateTimeSynchronizer throughput).
@@ -558,8 +558,8 @@ haptic_teleop_il_study/
 │   ├── hololens_hand_node.py        — hand joint → hand/pose, hand/gripper_cmd
 │   ├── hololens_tf_publisher_ros2.py— HoloLens joints → TF2
 │   ├── hdf5_to_zarr.py              — HDF5 → flat (UMI-style) zarr (alt format)
-│   ├── dji_camera_node.py           — DJI Osmo → ROS2 Image
-│   ├── dji_camera_validate.py       — verify DJI device index
+│   ├── dji_camera_node.py           — DJI Osmo → ROS2 Image (1280×720 capture → 224×224 publish)
+│   ├── dji_camera_validate.py       — verify DJI device/feed (--model-view shows the 224×224 policy input)
 │   ├── launch_teleop.py             — teleoperation only (no recording)
 │   ├── preflight_check.py           — topic/sensor health check
 │   ├── replay_episode.py            — episode replay + end-to-end latency tuning loop

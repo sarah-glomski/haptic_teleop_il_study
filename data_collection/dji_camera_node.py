@@ -13,8 +13,11 @@ Published topics:
 
 ROS2 Parameters:
   device_index   int     0       V4L2 device index (/dev/videoN)
-  width          int   640       Requested capture width
-  height         int   480       Requested capture height
+  width          int   224       Published (output) width  — model input; INTER_AREA
+  height         int   224       Published (output) height — model input; INTER_AREA
+  capture_width  int  1280       Capture width requested from the camera
+  capture_height int   720       Capture height requested from the camera
+                                  (DJI webcam only offers 1280x720 / 1920x1080)
   fps            float 30.0      Target publish rate
   frame_id       str  'wrist_cam'  TF frame for image header
 
@@ -46,8 +49,18 @@ class DJICameraNode(Node):
         super().__init__('dji_camera_node')
 
         self.device_index = self.declare_parameter('device_index', 0).value
-        self.width        = self.declare_parameter('width',        640).value
-        self.height       = self.declare_parameter('height',       480).value
+        # Published / output size. Frames are resized down to this once, here, so
+        # both data collection and inference consume the exact same pixels with
+        # the same latency (no per-consumer resize). Defaults to the 224x224
+        # model input. Resize uses INTER_AREA to match the training pipeline.
+        self.width        = self.declare_parameter('width',        224).value
+        self.height       = self.declare_parameter('height',       224).value
+        # Capture size requested from the camera. The DJI Osmo Action 4 webcam
+        # only offers 1280x720 and 1920x1080 over UVC; anything else is silently
+        # clamped by the driver. Request a real native mode (720p = lowest
+        # bandwidth) instead of relying on that clamp.
+        self.capture_width  = self.declare_parameter('capture_width',  1280).value
+        self.capture_height = self.declare_parameter('capture_height',  720).value
         fps               = self.declare_parameter('fps',           30.0).value
         self.frame_id     = self.declare_parameter('frame_id',     'wrist_cam').value
 
@@ -85,6 +98,7 @@ class DJICameraNode(Node):
         self.create_timer(1.0 / fps, self._publish_frame)
         self.get_logger().info(
             f'DJI camera node ready — /dev/video{self.device_index} '
+            f'capture {self.capture_width}×{self.capture_height} → publish '
             f'{self.width}×{self.height} @ {fps:.0f} Hz '
             f'(idle; waiting for /dji_camera/enable)'
         )
@@ -102,15 +116,19 @@ class DJICameraNode(Node):
             )
             raise RuntimeError(f'Failed to open /dev/video{self.device_index}')
 
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        # Force MJPG, then request a native capture resolution. BUFFERSIZE=2 is
+        # deliberate: on the Osmo Action 4 over V4L2, BUFFERSIZE=1 halves the
+        # delivered rate to 15 fps; >=2 gives the full 30 fps.
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.capture_width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
         self._actual_width  = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self._actual_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.get_logger().info(
             f'Camera opened: {self._actual_width}×{self._actual_height} '
-            f'(requested {self.width}×{self.height})'
+            f'(requested {self.capture_width}×{self.capture_height})'
         )
 
     def _enable_cb(self, msg: Bool):
@@ -157,7 +175,11 @@ class DJICameraNode(Node):
             if ret:
                 consecutive_failures = 0
                 if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                    frame = cv2.resize(frame, (self.width, self.height))
+                    # INTER_AREA must match the resize used in inference.py and the
+                    # offline conversion (convert_data.py / hdf5_to_zarr.py) so the
+                    # policy sees identical pixels in training and at inference.
+                    frame = cv2.resize(frame, (self.width, self.height),
+                                       interpolation=cv2.INTER_AREA)
                 with self._frame_lock:
                     self._latest_frame = frame
                 time.sleep(0.001)
