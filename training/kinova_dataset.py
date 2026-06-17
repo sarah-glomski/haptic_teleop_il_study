@@ -39,6 +39,7 @@ class KinovaImageDataset(BaseImageDataset):
         val_ratio: float = 0.05,
         seed: int = 42,
         preload: bool = False,
+        downsample: int = 1,
         _split: str = "train",
     ):
         self.zarr_path = zarr_path
@@ -46,15 +47,19 @@ class KinovaImageDataset(BaseImageDataset):
         self.horizon = horizon
         self.obs_horizon = obs_horizon
         self.action_horizon = action_horizon
+        self.downsample = downsample
 
         store = zarr.open(zarr_path, mode="r")
         episode_ends   = store["meta/episode_ends"][:]                  # (E,) int64
         episode_starts = np.concatenate([[0], episode_ends[:-1]])       # (E,)
 
+        # Minimum native frames needed to fit one full downsampled window
+        min_ep_len = downsample * (horizon - 1) + 1
+
         # Gather valid episodes as (ep_idx, global_start, global_end)
         all_episodes = []
         for ep_idx, (s, e) in enumerate(zip(episode_starts.tolist(), episode_ends.tolist())):
-            if int(e) - int(s) >= horizon:
+            if int(e) - int(s) >= min_ep_len:
                 all_episodes.append((ep_idx, int(s), int(e)))
 
         # Reproducible train/val split by episode
@@ -72,18 +77,26 @@ class KinovaImageDataset(BaseImageDataset):
         self.samples: list[int] = []
         for _, ep_start, ep_end in self.episodes:
             T = ep_end - ep_start
-            for t in range(T - horizon + 1):
+            for t in range(T - min_ep_len + 1):
                 self.samples.append(ep_start + t)
-
-        self._store = store
 
         # Optionally preload all data arrays into RAM
         self._preloaded: dict | None = None
         if preload:
             self._preloaded = {k: store["data"][k][:] for k in store["data"].array_keys()}
 
+        # Do NOT keep the store open — dataloader workers are forked after __init__,
+        # and a shared zarr handle across forked processes causes non-deterministic
+        # segfaults. Each worker opens its own handle lazily in _get_store().
+        self._store = None
+
         self._val_ratio = val_ratio
         self._seed = seed
+
+    def _get_store(self):
+        if self._store is None:
+            self._store = zarr.open(self.zarr_path, mode="r")
+        return self._store
 
     # ── Dataset interface ─────────────────────────────────────────────────────
 
@@ -92,13 +105,14 @@ class KinovaImageDataset(BaseImageDataset):
 
     def __getitem__(self, idx: int) -> dict:
         t_start = self.samples[idx]
-        t_obs_end = t_start + self.obs_horizon
-        t_act_end = t_start + self.action_horizon
+        ds = self.downsample
+        t_obs_end = t_start + self.obs_horizon * ds
+        t_act_end = t_start + self.action_horizon * ds
 
-        data = self._preloaded if self._preloaded is not None else self._store["data"]
+        data = self._preloaded if self._preloaded is not None else self._get_store()["data"]
 
         def load(key, s, e):
-            return data[key][s:e]
+            return data[key][s:e:ds]
 
         # Images: (obs_horizon, 224, 224, 3) uint8 -> (obs_horizon, 3, 224, 224) float [0,1]
         def load_img(key):
@@ -129,12 +143,13 @@ class KinovaImageDataset(BaseImageDataset):
             action_horizon=self.action_horizon,
             val_ratio=self._val_ratio,
             seed=self._seed,
+            downsample=self.downsample,
             _split="val",
         )
 
     def get_normalizer(self, mode: str = "limits", **kwargs) -> LinearNormalizer:
         """Compute per-key linear normalizers from the split's episodes."""
-        data_grp = self._store["data"]
+        data_grp = self._get_store()["data"]
         pose_all, action_all, piezense_all = [], [], []
 
         for _, ep_start, ep_end in self.episodes:
