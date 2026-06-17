@@ -48,9 +48,9 @@ from kortex_api.autogen.messages import Session_pb2, Base_pb2
 
 CONTROL_HZ  = 30.0
 WATCHDOG_MS = 200
-HOME_POS    = (0.474, 0.02, 0.107)   # m
-HOME_ANGLES = (-179.3, -0.4, 89.3)   # deg
-WS_BOUNDS   = dict(x=(0.30, 0.60), y=(-0.37, 0.37), z=(0.025, 0.30))
+HOME_POS    = (0.35, 0.0, 0.12)   # m
+HOME_ANGLES = (-180.0, 0.0, 90.0)   # deg
+WS_BOUNDS   = dict(x=(0.25, 0.45), y=(-0.35, 0.35), z=(0.025, 0.25))
 MARGIN      = 0.005  # m
 
 

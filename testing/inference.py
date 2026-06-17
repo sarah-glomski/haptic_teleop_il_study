@@ -82,12 +82,12 @@ PIEZENSE_INPUT_CHAN_IDS = [2, 3]
 KINOVA_IP = "192.168.1.10"
 
 # Workspace bounds (metres) — must match data collection controller params
-WS_X = (0.40, 0.50)
-WS_Y = (-0.27, 0.27)
-WS_Z = (0.025, 0.30)
+WS_X = (0.25, 0.45)
+WS_Y = (-0.35, 0.35)
+WS_Z = (0.025, 0.25)
 
-HOME_X, HOME_Y, HOME_Z   = 0.474, 0.02, 0.107
-HOME_TX, HOME_TY, HOME_TZ = -179.3, -0.4, 89.3   # Euler XYZ degrees
+HOME_X, HOME_Y, HOME_Z   = 0.35, 0.0, 0.12
+HOME_TX, HOME_TY, HOME_TZ = -180.0, 0.0, 90.0   # Euler XYZ degrees
 
 MAX_LINEAR_SPEED  = 0.10   # m/s
 MAX_ANGULAR_SPEED = 15.0   # deg/s

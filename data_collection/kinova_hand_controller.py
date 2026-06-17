@@ -63,16 +63,16 @@ ROS2 Parameters:
   max_linear_speed_mps        float  0.50   m/s   hard velocity cap
   max_angular_speed_dps       float  15.0   deg/s hard angular cap
   vel_alpha                   float  0.4    velocity smoothing (0=very smooth)
-  workspace_x_min / x_max     float  0.30 / 0.60  m
-  workspace_y_min / y_max     float -0.37 / 0.37  m
-  workspace_z_min / z_max     float  0.025 / 0.30  m
+  workspace_x_min / x_max     float  0.25 / 0.45  m
+  workspace_y_min / y_max     float -0.35 / 0.35  m
+  workspace_z_min / z_max     float  0.025 / 0.25  m
   workspace_soft_margin_m     float  0.04   soft deceleration zone (m from wall)
   ── EEF orientation ──────────────────────────────────────────────────────
   position_scale              float  1.0   hand-motion → robot-motion scale (all axes)
   p_gain                      float  2.0
   ── Home position (m / deg) ──────────────────────────────────────────────
-  home_x / home_y / home_z    float  0.474 / 0.02 / 0.107
-  home_tx / home_ty / home_tz float  -179.3 / -0.4 / 89.3
+  home_x / home_y / home_z    float  0.35 / 0.0 / 0.12
+  home_tx / home_ty / home_tz float  -180.0 / 0.0 / 90.0
 """
 
 import math
@@ -126,23 +126,23 @@ class KinovaHandController(Node):
         self.max_angular_speed     = self.declare_parameter('max_angular_speed_dps',   15.0).value
         self.vel_alpha             = self.declare_parameter('vel_alpha',               0.7).value
 
-        self.x_min = self.declare_parameter('workspace_x_min',  0.30).value
-        self.x_max = self.declare_parameter('workspace_x_max',  0.60).value
-        self.y_min = self.declare_parameter('workspace_y_min', -0.37).value
-        self.y_max = self.declare_parameter('workspace_y_max',  0.37).value
+        self.x_min = self.declare_parameter('workspace_x_min',  0.25).value
+        self.x_max = self.declare_parameter('workspace_x_max',  0.45).value
+        self.y_min = self.declare_parameter('workspace_y_min', -0.35).value
+        self.y_max = self.declare_parameter('workspace_y_max',  0.35).value
         self.z_min = self.declare_parameter('workspace_z_min',  0.025).value
-        self.z_max = self.declare_parameter('workspace_z_max',  0.30).value
+        self.z_max = self.declare_parameter('workspace_z_max',  0.25).value
         self.soft_margin = self.declare_parameter('workspace_soft_margin_m', 0.01).value
 
         self.position_scale       = self.declare_parameter('position_scale',              1.0).value
         self.p_gain               = self.declare_parameter('p_gain',                    2.0).value
 
-        self.home_x  = self.declare_parameter('home_x',   0.474).value
-        self.home_y  = self.declare_parameter('home_y',   0.02).value
-        self.home_z  = self.declare_parameter('home_z',   0.107).value
-        self.home_tx = self.declare_parameter('home_tx', -179.3).value
-        self.home_ty = self.declare_parameter('home_ty',   -0.4).value
-        self.home_tz = self.declare_parameter('home_tz',   89.3).value
+        self.home_x  = self.declare_parameter('home_x',   0.35).value
+        self.home_y  = self.declare_parameter('home_y',   0.0).value
+        self.home_z  = self.declare_parameter('home_z',   0.12).value
+        self.home_tx = self.declare_parameter('home_tx', -180.0).value
+        self.home_ty = self.declare_parameter('home_ty',   0.0).value
+        self.home_tz = self.declare_parameter('home_tz',   90.0).value
 
         # ── Connect and configure robot ─────────────────────────────────────────
         self.get_logger().info(f'Connecting to Kinova Gen3 at {self.robot_ip} …')
