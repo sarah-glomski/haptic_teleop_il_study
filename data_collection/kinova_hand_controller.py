@@ -470,17 +470,20 @@ class KinovaHandController(Node):
             self._ref_holo_pos = None
             self._ref_robot_pos = None
             self._arm_enabled_at = time.monotonic()  # re-settle when tracking resumes
-            self._send_zero_twist()
-            self.get_logger().warn('Hand tracking lost — robot stopped; will re-settle on re-acquisition')
+            self._send_zero_twist()  # no-op during reset (reset owns the arm)
+            if self.is_resetting:
+                self.get_logger().warn('Hand tracking lost during reset — reset continues')
+            else:
+                self.get_logger().warn('Hand tracking lost — robot stopped; will re-settle on re-acquisition')
 
     def _reset_cb(self, msg: Bool):
         if not msg.data or self.is_resetting:
             return
         self.get_logger().info('Resetting Kinova Gen3 to home …')
-        self.is_resetting = True
         self.target_position = None
         self._smoothed_vel[:] = 0.0
-        self._send_zero_twist()
+        self._send_zero_twist()      # prompt stop — sent while is_resetting is still False
+        self.is_resetting = True     # now lock out async twist senders for the whole reset
         threading.Thread(target=self._do_reset, daemon=True).start()
 
     def _do_reset(self):
@@ -506,28 +509,34 @@ class KinovaHandController(Node):
             pose.theta_y = self.home_ty
             pose.theta_z = self.home_tz
 
-            finished      = threading.Event()
-            execute_time  = [None]  # set after ExecuteAction; list for closure mutability
-
-            def _on_action(notif, ev=finished, t=execute_time):
-                if t[0] is None:
-                    return
-                if notif.action_event not in (Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT):
-                    return
-                # A genuine arm move to home takes at least 2 s at 0.08 m/s.
-                # Instant completions are stale events or silent rejections — ignore.
-                if time.monotonic() - t[0] < 2.0:
-                    return
-                ev.set()
-
-            self._base.OnNotificationActionTopic(_on_action, Base_pb2.NotificationOptions())
             self._base.ExecuteAction(action)
-            execute_time[0] = time.monotonic()
 
-            if not finished.wait(timeout=30.0):
-                self.get_logger().warn('Home reset timed out — aborting')
-                self._base.StopAction()
-            else:
+            # Confirm arrival by polling the TCP pose rather than relying on action
+            # notifications (which get missed or arrive as stale events, causing
+            # false timeouts). The control loop stays off the router during reset,
+            # so _do_reset owns it and these RefreshFeedback calls are safe.
+            home      = np.array([self.home_x, self.home_y, self.home_z])
+            deadline  = time.monotonic() + 30.0
+            start_pos = None
+            reached   = False
+            moved     = False
+            while time.monotonic() < deadline:
+                try:
+                    fb  = self._base_cyclic.RefreshFeedback()
+                    cur = np.array([fb.base.tool_pose_x, fb.base.tool_pose_y, fb.base.tool_pose_z])
+                except Exception:
+                    time.sleep(0.1)
+                    continue
+                if start_pos is None:
+                    start_pos = cur
+                elif np.linalg.norm(cur - start_pos) > 0.01:
+                    moved = True
+                if np.linalg.norm(cur - home) < 0.015:
+                    reached = True
+                    break
+                time.sleep(0.1)
+
+            if reached:
                 # Open gripper
                 gc = Base_pb2.GripperCommand()
                 gc.mode = Base_pb2.GRIPPER_POSITION
@@ -537,6 +546,18 @@ class KinovaHandController(Node):
                 self._base.SendGripperCommand(gc)
                 time.sleep(1.0)
                 self.get_logger().info('Reset complete — gripper open')
+            elif moved:
+                self.get_logger().warn('Home reset timed out — arm moved but never reached home')
+            else:
+                self.get_logger().warn(
+                    'Home reset failed — arm never moved; ExecuteAction was likely '
+                    'rejected (check for a robot fault or unreachable pose)'
+                )
+            if not reached:
+                try:
+                    self._base.StopAction()
+                except Exception:
+                    pass
 
         except Exception as e:
             self.get_logger().error(f'Reset error: {e}')
@@ -592,7 +613,16 @@ class KinovaHandController(Node):
             return
 
         # ── Arm control ───────────────────────────────────────────────────────
-        if self.is_paused or self.is_resetting or self.target_position is None:
+        if self.is_resetting:
+            # _do_reset() drives the arm via ExecuteAction on its own thread, using
+            # the same Kortex RouterClient. The router is NOT thread-safe — issuing
+            # SendTwistCommand here concurrently corrupts RPC framing and makes
+            # ExecuteAction block forever (reset silently hangs). Stay off the
+            # router entirely; the twist watchdog (TWIST_WATCHDOG_MS) has already
+            # stopped the arm after the zero-twist sent in _reset_cb.
+            self._smoothed_vel[:] = 0.0
+            return
+        if self.is_paused or self.target_position is None:
             self._smoothed_vel[:] = 0.0
             self._send_zero_twist()
         else:
@@ -657,6 +687,13 @@ class KinovaHandController(Node):
 
     def _send_zero_twist(self):
         """Zero-velocity command with watchdog duration (safe stop)."""
+        if self.is_resetting:
+            # A home reset (ExecuteAction) owns the arm and the Kortex router. A
+            # twist command here would cancel the in-flight reach action and race
+            # the reset's RPCs — this is why losing hand tracking mid-reset used to
+            # abort it. The single intended pre-reset stop is sent in _reset_cb
+            # before is_resetting is set; the twist watchdog holds the arm still.
+            return
         try:
             cmd = Base_pb2.TwistCommand()
             cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED
