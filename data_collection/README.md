@@ -176,17 +176,18 @@ Episodes are saved to `demo_data/episode_N.hdf5`.
 
 Setup (once per session):
 
-1. **Plug in the DJI camera and turn it on**, then select **webcam mode** on the camera screen.
-2. **Turn on the robot.** Connect via browser at `http://192.168.1.10/configurationActions`
+1. Make sure the computer is on EE-WiFi.
+2. **Plug in the DJI camera and turn it on**, then select **webcam mode** on the camera screen.
+3. **Turn on the robot.** Connect via browser at `http://192.168.1.10/configurationActions`
    and move it to the teleop starting configuration.
-3. In a terminal, run `python3.12 launch_rosbridge.py`.
-4. **Turn on the HoloLens** and close all existing apps. Stand on the tape and launch the
+4. In a terminal, run `python3.12 launch_rosbridge.py`.
+5. **Turn on the HoloLens**, make sure it is on EE-WiFi, and close all existing apps. Stand on the tape and launch the
    **HapticTeleopROS2** app.
-5. **Turn on air and vacuum**, plug in the Piezense, and put the glove on your dominant hand.
-6. In a terminal, run `python3.12 launch_data_collection.py`.
-7. *(Optional test)* In another terminal, run `python3.12 preflight_check.py` to verify all
+6. **Turn on air and vacuum**, plug in the Piezense, and put the glove on your dominant hand.
+7. In a terminal, run `python3.12 launch_data_collection.py`.
+8. *(Optional test)* In another terminal, run `python3.12 preflight_check.py` to verify all
    topics/sensors are healthy.
-8. Move to the keyboard near the tape.
+9. Move to the keyboard near the tape.
 
 Per demo (repeat for each episode):
 
