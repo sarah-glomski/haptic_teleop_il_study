@@ -46,3 +46,4 @@ dataset:
   obs_horizon: ${task.low_dim_obs_horizon}
   action_horizon: ${task.action_horizon}
   preload: false
+  downsample: 3
