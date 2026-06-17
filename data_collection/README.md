@@ -181,7 +181,7 @@ Setup (once per session):
    and move it to the teleop starting configuration.
 3. In a terminal, run `python3.12 launch_rosbridge.py`.
 4. **Turn on the HoloLens** and close all existing apps. Stand on the tape and launch the
-   **AvaTeleopDevelopROS2** app.
+   **HapticTeleopROS2** app.
 5. **Turn on air and vacuum**, plug in the Piezense, and put the glove on your dominant hand.
 6. In a terminal, run `python3.12 launch_data_collection.py`.
 7. *(Optional test)* In another terminal, run `python3.12 preflight_check.py` to verify all
