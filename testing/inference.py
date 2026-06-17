@@ -310,7 +310,11 @@ class PolicyNode(Node):
         # for cam_key, msg in [("zed_front_rgb", zed_msg), ("dji_wrist_rgb", wrist_msg)]:
         for cam_key, msg in [("dji_wrist_rgb", wrist_msg)]:
             img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
-            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+            # dji_camera_node already publishes IMG_SIZE x IMG_SIZE (INTER_AREA),
+            # so no resize here — keeps inference latency identical to collection.
+            # Guard only resizes if a frame ever arrives at an unexpected size.
+            if img.shape[0] != IMG_SIZE or img.shape[1] != IMG_SIZE:
+                img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
             img = img.astype(np.float32) / 255.0
             img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
             buf = self.cam_buffers[cam_key]

@@ -24,8 +24,13 @@ Usage:
   # Specify device index manually (Linux: /dev/videoN, macOS: AVFoundation index):
   python3 dji_camera_validate.py --device 1
 
-  # Set capture resolution (default: 1920x1080):
+  # Set capture resolution (default: 1280x720; only 1280x720 / 1920x1080 work):
   python3 dji_camera_validate.py --width 1920 --height 1080
+
+  # Also show what the policy sees — a 224x224 (INTER_AREA) view alongside the
+  # full feed, mirroring dji_camera_node.py:
+  python3 dji_camera_validate.py --model-view
+  python3 dji_camera_validate.py --model-view --model-size 224
 
   # Also publish to a ROS2 topic (Linux only, requires sourced ROS2):
   source /opt/ros/jazzy/setup.bash
@@ -36,6 +41,8 @@ Usage:
 
 Press Q in the preview window to quit.
 """
+
+from __future__ import annotations
 
 import argparse
 import subprocess
@@ -279,7 +286,8 @@ def _open_camera(index: int):
 
 # ── Phase 2: live preview ─────────────────────────────────────────────────────
 
-def run_preview(device_index: int, width: int, height: int, use_ros: bool, ros_topic: str):
+def run_preview(device_index: int, width: int, height: int, use_ros: bool, ros_topic: str,
+                model_size: int = 0):
     ros_pub  = None
     ros_node = None
     bridge   = None
@@ -321,9 +329,16 @@ def run_preview(device_index: int, width: int, height: int, use_ros: bool, ros_t
             print('  If that opens the wrong camera, try --device 0')
         return
 
+    if IS_LINUX:
+        # Force MJPG. Without it V4L2 may fall back to uncompressed YUYV, which
+        # caps 1080p to a few fps over the camera's USB 2.0 link.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    # NOTE: do NOT set CAP_PROP_BUFFERSIZE=1 here. On the DJI Osmo Action 4 over
+    # V4L2 a buffer size of 1 halves the delivered rate to 15 fps; >=2 (or the
+    # driver default) gives the full 30 fps. See dji_camera_node.py (BUFFERSIZE=2).
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -335,6 +350,17 @@ def run_preview(device_index: int, width: int, height: int, use_ros: bool, ros_t
     t_start     = time.monotonic()
     window_name = f'DJI Osmo Action 4 — {label}'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    # Optional second window showing exactly what the policy sees: the frame
+    # downsampled to model_size x model_size with INTER_AREA (matching
+    # dji_camera_node.py), then upscaled with NEAREST so the true pixels show.
+    model_window = None
+    if model_size > 0:
+        model_window = f'Model input — {model_size}×{model_size} (INTER_AREA)'
+        cv2.namedWindow(model_window, cv2.WINDOW_NORMAL)
+        disp = max(model_size * 2, 448)
+        cv2.resizeWindow(model_window, disp, disp)
+        print(f'  {ok(f"Model-view window open — {model_size}×{model_size} as the policy sees it")}')
 
     try:
         while True:
@@ -358,6 +384,15 @@ def run_preview(device_index: int, width: int, height: int, use_ros: bool, ros_t
             cv2.putText(overlay, f'frame {frame_count}  elapsed {now - t_start:.1f}s',
                         (12, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.imshow(window_name, overlay)
+
+            if model_window is not None:
+                small = cv2.resize(frame, (model_size, model_size),
+                                   interpolation=cv2.INTER_AREA)
+                disp  = max(model_size * 2, 448)
+                shown = cv2.resize(small, (disp, disp), interpolation=cv2.INTER_NEAREST)
+                cv2.putText(shown, f'{model_size}x{model_size}', (8, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.imshow(model_window, shown)
 
             if use_ros and ros_pub is not None and bridge is not None:
                 import rclpy
@@ -404,14 +439,21 @@ def main():
     )
     parser.add_argument('--device', type=int, default=None,
                         help='Camera index to open. Auto-detected if omitted.')
-    parser.add_argument('--width',  type=int, default=1920,
-                        help='Requested capture width  (default: 1920)')
-    parser.add_argument('--height', type=int, default=1080,
-                        help='Requested capture height (default: 1080)')
+    parser.add_argument('--width',  type=int, default=1280,
+                        help='Requested capture width  (default: 1280). The DJI '
+                             'webcam only offers 1280x720 and 1920x1080.')
+    parser.add_argument('--height', type=int, default=720,
+                        help='Requested capture height (default: 720)')
     parser.add_argument('--ros', action='store_true',
                         help='Also publish frames to a ROS2 topic (Linux only)')
     parser.add_argument('--topic', default='/wrist_cam/image_raw',
                         help='ROS2 topic (default: /wrist_cam/image_raw)')
+    parser.add_argument('--model-view', action='store_true',
+                        help='Open a second window showing the frame downsampled to '
+                             'the model input size (INTER_AREA), i.e. what the policy '
+                             'sees. Mirrors dji_camera_node.py.')
+    parser.add_argument('--model-size', type=int, default=224,
+                        help='Model input size for --model-view (default: 224)')
     args = parser.parse_args()
 
     print()
@@ -424,7 +466,8 @@ def main():
         print(f'\n{fail("Aborting — no usable camera device found.")}\n')
         sys.exit(1)
 
-    run_preview(device_index, args.width, args.height, args.ros, args.topic)
+    run_preview(device_index, args.width, args.height, args.ros, args.topic,
+                model_size=args.model_size if args.model_view else 0)
     print()
 
 

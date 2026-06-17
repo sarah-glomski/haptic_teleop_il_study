@@ -32,6 +32,26 @@ hdf5_to_zarr         ──▶  output.zarr  (for diffusion policy training)
 | Wrist camera | DJI Osmo Action 4 (USB-C UVC mode) |
 | Host machine | Ubuntu 24.04, ROS2 Jazzy, RTX 4090 |
 
+### Wrist camera (DJI Osmo Action 4) setup
+
+The wrist camera streams over UVC via `dji_camera_node.py`. A few non-obvious points:
+
+- **Enable webcam mode on the camera:** Menu → Settings → Control Method → **UVC Camera**.
+  It reverts to its default USB mode when unplugged, so re-select it after replugging.
+- **Frame rate follows the camera's recording frame-rate menu.** The UVC feed inherits
+  whatever the camera is set to record at — set the camera to **30 fps** or the webcam
+  delivers a genuine 15 fps. This is *not* a USB/cable issue: the Osmo Action 4 is a
+  USB 2.0 device by design (`bcdUSB 2.01`), which is plenty for 720p/1080p MJPG.
+- **UVC offers only 1280×720 and 1920×1080.** `dji_camera_node.py` captures **1280×720**
+  (lowest bandwidth) and resizes once to the **224×224** model input with `INTER_AREA`,
+  publishing that directly. Both data collection and inference consume those exact pixels,
+  so training/inference are byte-identical with equal latency (no per-consumer resize).
+- **Do not set `cv2.CAP_PROP_BUFFERSIZE=1`** on this camera — on V4L2 it halves the
+  delivered rate to 15 fps. The node uses `BUFFERSIZE=2`.
+- **Validate the feed:** `python dji_camera_validate.py` (run in the `umi` conda env, which
+  has OpenCV). Add `--model-view` to see a live 224×224 window showing exactly what the
+  policy receives, alongside the full-resolution feed.
+
 ## Prerequisites
 
 ### ROS2 packages
@@ -152,6 +172,31 @@ Keyboard controls (pygame window):
 
 Episodes are saved to `demo_data/episode_N.hdf5`.
 
+### Full session runbook (start to finish)
+
+Setup (once per session):
+
+1. **Plug in the DJI camera and turn it on**, then select **webcam mode** on the camera screen.
+2. **Turn on the robot.** Connect via browser at `http://192.168.1.10/configurationActions`
+   and move it to the teleop starting configuration.
+3. In a terminal, run `python3.12 launch_rosbridge.py`.
+4. **Turn on the HoloLens** and close all existing apps. Stand on the tape and launch the
+   **AvaTeleopDevelopROS2** app.
+5. **Turn on air and vacuum**, plug in the Piezense, and put the glove on your dominant hand.
+6. In a terminal, run `python3.12 launch_data_collection.py`.
+7. *(Optional test)* In another terminal, run `python3.12 preflight_check.py` to verify all
+   topics/sensors are healthy.
+8. Move to the keyboard near the tape.
+
+Per demo (repeat for each episode):
+
+9. Place the hacky sack on the start tape. Press **`s`** on the keyboard to start the trial.
+10. Stand on the floor tape, hold out your arm, and say **"gripper"** then **"arm"** — *order matters*.
+11. Collect the demo. When finished, say **"arm"** then **"gripper"** — *order matters* — to freeze
+    data collection.
+12. Walk over and press **`d`** to end the trial, then **`r`** to reset the robot to home.
+13. Repeat steps 9–12 for each demo.
+
 ## HDF5 Schema
 
 ```
@@ -171,8 +216,8 @@ episode_N.hdf5
 │   ├── finger_tips     (T, 15)  float32
 │   └── hand_width      (T,)     float32
 └── images/
-    ├── zed_isometric  (T, 3, H, W)  uint8  LZF-compressed, CHW
-    └── dji_wrist   (T, 3, H, W)  uint8  LZF-compressed, CHW
+    ├── zed_isometric  (T, 3, H, W)      uint8  LZF-compressed, CHW
+    └── dji_wrist      (T, 3, 224, 224)  uint8  LZF-compressed, CHW  (resized in dji_camera_node)
 ```
 
 Metadata: `num_frames`, `collection_rate_hz=30`, `episode_index`
@@ -189,8 +234,8 @@ Zarr output (UMI-style flat concatenation):
 ```
 output.zarr/
 ├── data/
-│   ├── zed_isometric_rgb    (N, H, W, 3)  uint8   HWC
-│   ├── dji_wrist_rgb     (N, H, W, 3)  uint8   HWC
+│   ├── zed_isometric_rgb    (N, H, W, 3)      uint8   HWC
+│   ├── dji_wrist_rgb        (N, 224, 224, 3)  uint8   HWC
 │   ├── pose             (N, 10)       float32  [x,y,z, rot6d(6), gripper]
 │   ├── action           (N, 10)       float32
 │   ├── joint_states     (N, 7)        float32
