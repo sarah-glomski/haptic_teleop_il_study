@@ -150,17 +150,21 @@ class KinovaHandController(Node):
         self._setup_servoing()
 
         # ── Safety — log configured limits at startup ───────────────────────────
+        _rows = [
+            f' Workspace  X [{self.x_min:.3f}, {self.x_max:.3f}] m',
+            f'            Y [{self.y_min:.3f}, {self.y_max:.3f}] m',
+            f'            Z [{self.z_min:.3f}, {self.z_max:.3f}] m',
+            f' Soft zone  {self.soft_margin * 1000:.0f} mm from each wall',
+            f' Max linear {self.max_linear_speed * 1000:.0f} mm/s',
+            f' Max angular {self.max_angular_speed:.0f} deg/s',
+            f' Watchdog   {TWIST_WATCHDOG_MS} ms',
+        ]
+        _W = max(len(r) for r in _rows) + 2
         self.get_logger().info(
-            f'\n'
-            f'  ╔══ SAFETY LIMITS ══════════════════════════════╗\n'
-            f'  ║ Workspace  X [{self.x_min:.3f}, {self.x_max:.3f}] m          ║\n'
-            f'  ║            Y [{self.y_min:.3f}, {self.y_max:.3f}] m           ║\n'
-            f'  ║            Z [{self.z_min:.3f}, {self.z_max:.3f}] m            ║\n'
-            f'  ║ Soft zone  {self.soft_margin * 1000:.0f} mm from each wall        ║\n'
-            f'  ║ Max linear {self.max_linear_speed * 1000:.0f} mm/s               ║\n'
-            f'  ║ Max angular {self.max_angular_speed:.0f} deg/s               ║\n'
-            f'  ║ Watchdog   {TWIST_WATCHDOG_MS} ms                        ║\n'
-            f'  ╚══════════════════════════════════════════════╝'
+            '\n'
+            f'  ╔══ SAFETY LIMITS {"═" * (_W - 17)}╗\n' +
+            ''.join(f'  ║{r:<{_W}}║\n' for r in _rows) +
+            f'  ╚{"═" * _W}╝'
         )
 
         # ── Controller state ────────────────────────────────────────────────────

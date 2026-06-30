@@ -21,3 +21,10 @@ demo_data/
 .idea/
 *.swp
 *~
+
+# Large local-only files
+training/data/
+training/wandb/
+*.whl
+.claude/
+*.log
