@@ -21,8 +21,9 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
+from std_msgs.msg import Bool
 
 # Defaults matching launch_data_collection.py
 ZED_SERIAL = '17875187'
@@ -79,6 +80,20 @@ class CameraViewer(Node):
                 lambda msg, n=name: self._image_cb(msg, n),
                 qos_profile=sensor_qos,
             )
+
+        # The DJI node starts idle and only streams once it receives True on
+        # /dji_camera/enable (the data collector normally sends this). Match its
+        # RELIABLE + TRANSIENT_LOCAL QoS so the latched message reaches it.
+        enable_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self._enable_pub = self.create_publisher(Bool, '/dji_camera/enable', enable_qos)
+
+    def set_dji_enabled(self, enabled: bool):
+        self._enable_pub.publish(Bool(data=enabled))
 
     def _image_cb(self, msg: Image, name: str):
         try:
@@ -162,6 +177,8 @@ def main():
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     ros_thread.start()
 
+    node.set_dji_enabled(True)  # DJI node idles until enabled; the collector isn't running here
+
     print("Press 'q' to quit.")
 
     for name in CAMERA_STREAMS:
@@ -187,6 +204,8 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     finally:
+        node.set_dji_enabled(False)  # release the camera so the next run starts clean
+        time.sleep(0.2)              # let the latched disable flush before teardown
         node.destroy_node()
         rclpy.shutdown()
         cv2.destroyAllWindows()
