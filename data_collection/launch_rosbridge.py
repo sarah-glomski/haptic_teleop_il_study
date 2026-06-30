@@ -19,8 +19,22 @@ from launch import LaunchDescription, LaunchService
 from launch_ros.actions import Node
 
 
+def _local_ip():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # No packets are sent; this just picks the interface used for the route.
+        s.connect(('8.8.8.8', 80))
+        return s.getsockname()[0]
+    except OSError:
+        return '127.0.0.1'
+    finally:
+        s.close()
+
+
 def main():
     import os
+    print(f'[rosbridge] WebSocket URL: ws://{_local_ip()}:9090', flush=True)
     ld = LaunchDescription([
         Node(
             package='rosbridge_server',
