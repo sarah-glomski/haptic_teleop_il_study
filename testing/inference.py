@@ -114,10 +114,11 @@ CAMERA_TOPICS = {
 def pose_msg_to_10d(pose_msg: PoseStamped, gripper: float) -> np.ndarray:
     """Convert PoseStamped + gripper scalar to 10D [xyz, rot6d, grip].
 
-    Encoding must match hdf5_to_zarr.py (RotationTransformer with pytorch3d):
-      - pytorch3d quaternion_to_matrix expects [w,x,y,z] but received [qx,qy,qz,qw],
-        so it treats qx as w.  Replicate: scipy from_quat([qy, qz, qw, qx]).
-      - pytorch3d matrix_to_rotation_6d takes first two ROWS (not columns).
+    Encoding MUST match training/convert_data.py (what the zarr was built with):
+      - scipy from_quat([qx,qy,qz,qw]) directly — the physical quaternion, no reorder.
+      - rot6d = first two COLUMNS of the rotation matrix (Zhou et al. 2019).
+    (Note: data_collection/hdf5_to_zarr.py uses pytorch3d rows + a misread quat,
+     a DIFFERENT convention — do not mix the two converters.)
     """
     pos = np.array([pose_msg.pose.position.x,
                     pose_msg.pose.position.y,
@@ -126,30 +127,25 @@ def pose_msg_to_10d(pose_msg: PoseStamped, gripper: float) -> np.ndarray:
                   pose_msg.pose.orientation.y,
                   pose_msg.pose.orientation.z,
                   pose_msg.pose.orientation.w])  # [qx, qy, qz, qw]
-    # Replicate pytorch3d's misinterpretation: treat qx as w
-    q_as_training = np.array([q[1], q[2], q[3], q[0]])  # scipy [x,y,z,w] = [qy, qz, qw, qx]
-    rot_mat = R.from_quat(q_as_training).as_matrix()    # (3, 3)
-    rot6d = np.concatenate([rot_mat[0, :], rot_mat[1, :]])  # first two ROWS  (6,)
+    rot_mat = R.from_quat(q).as_matrix()                     # (3, 3), physical
+    rot6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]])   # first two COLUMNS  (6,)
     return np.concatenate([pos, rot6d, [gripper]]).astype(np.float32)  # (10,)
 
 
 def rot6d_to_euler_xyz(rot6d: np.ndarray) -> np.ndarray:
     """Decode training-encoded rot6d → Euler XYZ degrees.
 
-    Training encoding (pytorch3d rows convention):
-      rot6d = [row0, row1] of the *wrong* rotation matrix
-      (wrong = built from [qx,qy,qz,qw] misread as pytorch3d [w,x,y,z]).
-    To recover physical Euler: reconstruct wrong_mat, extract its scipy quaternion
-    [qy,qz,qw,qx], then roll right by 1 to get physical [qx,qy,qz,qw].
+    Inverse of pose_msg_to_10d / convert_data.py (COLUMNS convention):
+      rot6d = [col0, col1] of the physical rotation matrix.
+    Gram-Schmidt to re-orthonormalize (network output isn't exactly orthonormal),
+    rebuild the matrix from its columns, then read physical Euler XYZ via scipy.
     """
-    r0 = rot6d[:3] / (np.linalg.norm(rot6d[:3]) + 1e-8)
-    r1 = rot6d[3:6] - np.dot(rot6d[3:6], r0) * r0
-    r1 = r1 / (np.linalg.norm(r1) + 1e-8)
-    r2 = np.cross(r0, r1)
-    wrong_mat = np.row_stack([r0, r1, r2])                  # rows, not columns
-    wrong_quat_scipy = R.from_matrix(wrong_mat).as_quat()   # [qy, qz, qw, qx]
-    physical_quat = np.roll(wrong_quat_scipy, 1)            # [qx, qy, qz, qw]
-    return R.from_quat(physical_quat).as_euler("xyz", degrees=True)
+    c0 = rot6d[:3] / (np.linalg.norm(rot6d[:3]) + 1e-8)
+    c1 = rot6d[3:6] - np.dot(rot6d[3:6], c0) * c0
+    c1 = c1 / (np.linalg.norm(c1) + 1e-8)
+    c2 = np.cross(c0, c1)
+    mat = np.column_stack([c0, c1, c2])                     # columns (physical R)
+    return R.from_matrix(mat).as_euler("xyz", degrees=True)
 
 
 # ── Model loading ──────────────────────────────────────────────────────────────
@@ -579,7 +575,7 @@ class PolicyNode(Node):
 # ── Inference process ──────────────────────────────────────────────────────────
 
 def inference_loop(model_path, shared_obs, action_queue,
-                   action_horizon=8, device="cuda", start_time=0,
+                   n_action_steps=8, device="cuda", start_time=0,
                    dt=0.033, num_inference_steps=16,
                    latency_offset_s=0.0):
     """GPU process: load model and run inference, posting targets to the main process."""
@@ -666,12 +662,12 @@ def inference_loop(model_path, shared_obs, action_queue,
             _actions_logged = True
             print(f"predict_action output: {actions.shape[0]} steps × {actions.shape[1]} dims", flush=True)
 
-        # Schedule action_horizon steps with timestamps, skipping latency_steps
+        # Schedule n_action_steps steps with timestamps, skipping latency_steps
         # to account for system delay between observation capture and execution.
         t_start = time.monotonic()
         action_queue.put(("CLEAR_PENDING", t_start))
         start_idx = min(latency_steps, len(actions) - 1)
-        for i, act in enumerate(actions[start_idx: start_idx + action_horizon]):
+        for i, act in enumerate(actions[start_idx: start_idx + n_action_steps]):
             ts = t_start + i * dt
             action_queue.put((act, ts))
 
@@ -681,7 +677,7 @@ def inference_loop(model_path, shared_obs, action_queue,
         print(f"Inference: {infer_time*1000:.0f}ms | act[0] xyz={a0[:3]} theta_xyz={euler}", flush=True)
 
         total_time = time.time() - loop_start
-        print(f"  Wait: {wait_time*1000:.0f}ms | Total: {total_time*1000:.0f}ms | Actions: {action_horizon}", flush=True)
+        print(f"  Wait: {wait_time*1000:.0f}ms | Total: {total_time*1000:.0f}ms | Actions: {n_action_steps}", flush=True)
 
         time.sleep(dt)
 
@@ -770,7 +766,7 @@ def main():
     print(f"Model:           {args.model}")
     print(f"dt:              {args.dt}s  ({1/args.dt:.0f} Hz)")
     print(f"Obs horizon:     {OBS_HORIZON}")
-    print(f"Action horizon:  {args.action_horizon}")
+    print(f"Num Action steps:  {args.n_action_steps}")
     print(f"Diffusion steps: {args.diffusion_steps}")
     if args.latency_offset_s:
         print(f"Latency offset:  {args.latency_offset_s*1000:.0f} ms "
@@ -780,7 +776,7 @@ def main():
     inf_proc = Process(
         target=inference_loop,
         args=(args.model, shared_obs, action_queue,
-              args.action_horizon, device, start_time,
+              args.n_action_steps, device, start_time,
               args.dt, args.diffusion_steps, args.latency_offset_s),
         daemon=True,
     )
