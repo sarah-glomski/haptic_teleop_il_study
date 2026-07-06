@@ -153,8 +153,8 @@ def main(argv=sys.argv[1:]):
                         help="V4L2 device index for DJI wrist camera (default: 0)")
     parser.add_argument("--dt",              type=float, default=0.033,
                         help="Action step period in seconds (default: 0.033 = 30 Hz)")
-    parser.add_argument("--action-horizon",  type=int,   default=8,
-                        help="Actions to execute per inference cycle (default: 6)")
+    parser.add_argument("--n-action-steps",  type=int,   default=8,
+                        help="Actions to execute per inference cycle (default: 8)")
     parser.add_argument("--diffusion-steps", type=int,   default=16,
                         help="DDIM inference steps (default: 16)")
     parser.add_argument("--latency-offset-s", type=float, default=0.0,

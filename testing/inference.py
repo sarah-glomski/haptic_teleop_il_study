@@ -744,7 +744,7 @@ def main():
     parser = argparse.ArgumentParser(description="Diffusion Policy Inference — Kinova Gen3")
     parser.add_argument("--model",           type=str, required=True,  help="Path to .ckpt file")
     parser.add_argument("--dt",              type=float, default=0.1,   help="Action step period (s)")
-    parser.add_argument("--action-horizon",  type=int,   default=6,    help="Actions per inference cycle")
+    parser.add_argument("--n-action-steps",  type=int,   default=8,    help="Actions executed per inference cycle")
     parser.add_argument("--diffusion-steps", type=int,   default=16,   help="DDIM inference steps")
     parser.add_argument("--latency-offset-s", type=float, default=0.0,
                         help="System latency to compensate (seconds). Skips this many steps at the "
