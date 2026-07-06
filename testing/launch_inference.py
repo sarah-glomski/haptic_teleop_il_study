@@ -42,9 +42,11 @@ def find_latest_checkpoint(search_dir: str) -> str:
     ckpts = glob.glob(os.path.join(search_dir, "**", "*.ckpt"), recursive=True)
     if not ckpts:
         raise FileNotFoundError(f"No .ckpt files found under {search_dir}")
-    for ckpt in ckpts:
-        if os.path.basename(ckpt) == "latest.ckpt":
-            return ckpt
+    # Prefer the most-recently-modified latest.ckpt (newest training run);
+    # fall back to the newest .ckpt of any name.
+    latest = [c for c in ckpts if os.path.basename(c) == "latest.ckpt"]
+    if latest:
+        return max(latest, key=os.path.getmtime)
     return max(ckpts, key=os.path.getmtime)
 
 
@@ -57,7 +59,7 @@ def generate_launch_description(
     zed_serial: str = ZED_SERIAL,
     dji_device: int = 0,
     dt: float = 0.033,
-    action_horizon: int = 8,
+    n_action_steps: int = 8,
     diffusion_steps: int = 16,
     latency_offset_s: float = 0.0,
     no_pygame: bool = False,
@@ -67,7 +69,7 @@ def generate_launch_description(
         _PYTHON, _INFERENCE_SCRIPT,
         "--model", model_path,
         "--dt", str(dt),
-        "--action-horizon", str(action_horizon),
+        "--n-action-steps", str(n_action_steps),
         "--diffusion-steps", str(diffusion_steps),
         "--latency-offset-s", str(latency_offset_s),
     ]
@@ -182,7 +184,7 @@ def main(argv=sys.argv[1:]):
     print(f"  ZED serial:      {args.zed_serial or '(auto-detect)'}")
     print(f"  DJI device:      /dev/video{args.dji_device}")
     print(f"  dt:              {args.dt}s  ({1/args.dt:.0f} Hz)")
-    print(f"  Action horizon:  {args.action_horizon}")
+    print(f"  Num action steps:  {args.n_action_steps}")
     print(f"  Diffusion steps: {args.diffusion_steps}")
     if args.latency_offset_s:
         print(f"  Latency offset:  {args.latency_offset_s*1000:.0f} ms "
@@ -198,7 +200,7 @@ def main(argv=sys.argv[1:]):
         zed_serial=args.zed_serial,
         dji_device=args.dji_device,
         dt=args.dt,
-        action_horizon=args.action_horizon,
+        n_action_steps=args.n_action_steps,
         diffusion_steps=args.diffusion_steps,
         latency_offset_s=args.latency_offset_s,
         no_pygame=args.no_pygame,
