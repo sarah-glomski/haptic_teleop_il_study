@@ -184,7 +184,7 @@ Setup (once per session):
 5. **Turn on air and vacuum**, plug in the Piezense, and put the glove on your dominant hand.
 6. **Turn on the HoloLens**, make sure it is on **EE-WiFi**, and close all existing apps. Stand on the tape and launch the
    **HapticTeleopROS2** app.
-7. In a terminal, activate environment with `conda activate umi` and run `python3.12 launch_data_collection.py`. Wait about 25 seconds for the PieZense to configure itself and verify that **all systems show up as ready** on the GUI. 
+7. In a terminal, deactivate environments with `conda deactivate` and run `python3.12 launch_data_collection.py`. Wait about 25 seconds for the PieZense to configure itself and verify that **all systems show up as ready** on the GUI. 
 8. *(Optional test)* In another terminal, run `python3.12 preflight_check.py` to verify all
    topics/sensors are healthy.
 9. Move to the keyboard near the tape.
