@@ -1,33 +1,55 @@
 #!/usr/bin/env python3
 """
-Convert Kinova Gen3 HDF5 teleop episodes to flat UMI-style zarr for KinovaImageDataset.
+Convert Kinova Gen3 HDF5 teleop episodes to the UMI ReplayBuffer format:
+a zarr written into a .zarr.zip, with UMI's per-signal key schema.
 
-Adapted from Robomimic/training/convert_data.py for the HoloLens + Kinova Gen3
-setup (ZED front + DJI wrist cameras, piezense pressure).
+Reads the raw HDF5 episodes produced by data collection (unchanged and upstream)
+and writes the schema UmiDataset expects.
 
-Reads episode_*.hdf5 files produced by data_collection/hdf5_data_collector.py,
-converts quaternion poses to 10D [x,y,z,rot6d(6),gripper] using scipy,
-resizes images to 224x224, and writes a flat zarr store compatible with
-KinovaImageDataset.
+Target consumer: UmiDataset in
+  HapticTeleopIL/Imitation Learning/universal_manipulation_interface
+which opens the file with zarr.ZipStore and expects (single robot):
 
-Output zarr schema:
-  output.zarr/
-  ├── data/
-  │   ├── zed_isometric_rgb:  (N, 224, 224, 3)  uint8   HWC
-  │   ├── dji_wrist_rgb:      (N, 224, 224, 3)  uint8   HWC
-  │   ├── pose:               (N, 10)            float32 [xyz, rot6d, gripper_obs]
-  │   ├── action:             (N, 10)            float32 [xyz, rot6d, gripper_cmd]
-  │   └── piezense_pressure:  (N, 2)             float32 input channel pressures (Pa)
-  └── meta/
-      └── episode_ends:       (E,)               int64   cumulative end indices
+  data/
+    camera0_rgb              (N, 224, 224, 3) uint8   HWC (dataset converts to CHW /255 at read)
+    robot0_eef_pos           (N, 3)  float32   absolute TCP position (observed)
+    robot0_eef_rot_axis_angle(N, 3)  float32   absolute TCP rotation, AXIS-ANGLE (rotvec)
+    robot0_gripper_width     (N, 1)  float32   physical width in METERS (see GRIPPER_MAX_WIDTH_M)
+    robot0_demo_start_pose   (N, 6)  float32   episode start [pos, rotvec], repeated per frame
+    robot0_demo_end_pose     (N, 6)  float32   episode end   [pos, rotvec], repeated per frame
+    piezense0_pressures      (N, 2)  float32
+    action                   (N, 7)  float32   commanded [pos(3), rotvec(3), gripper_width(1)]
+  meta/
+    episode_ends             (E,)    int64
 
-Usage:
-    python convert_data.py --input ../data_collection/demo_data --output kinova_teleop.zarr
-    python convert_data.py --input /path/to/demos --output out.zarr --max-episodes 50
+Schema facts verified against umi_dataset.py / sampler.py:
+  - Rotations are STORED as axis-angle (scipy rotvec). rot6d is computed live at
+    read time via pose_to_mat -> mat_to_pose10d (first-two-ROWS convention).
+    We never store rot6d, so the rows-vs-columns question cannot bite here.
+  - robot0_demo_start_pose is REQUIRED: umi_dataset.__getitem__ reads it to build
+    the robot0_eef_rot_axis_angle_wrt_start observation (start pose + noise).
+  - action is stored 7D per robot ([...,:6] -> pose_to_mat, [...,6:7] -> gripper).
+  - sampler.py hard-reads replay_buffer['robot0_gripper_width'][:, 0] -> must be (N,1).
+  - Normalizers are range/identity per key, so units self-calibrate for training;
+    they only need to be CONSISTENT between this converter and inference.py.
+
+Gripper conversion (Kinova Gen3 + Robotiq 2F-85, 85 mm stroke):
+  HDF5 stores the normalized Kortex command/reading g in [0,1], 0=open 1=closed.
+  UMI's gripper_width is a physical opening width in meters, larger=more open.
+    width_m = GRIPPER_MAX_WIDTH_M * (1.0 - g)
+  inference.py MUST invert with the same constant: g = 1 - width/GRIPPER_MAX_WIDTH_M.
+
+Usage (from training/):
+    python convert_data.py --input ../data_collection/demo_data/Collection5 \
+        --output ../data_collection/demo_data/Collection5/kinova_teleop_umi.zarr.zip
+    python convert_data.py --input ... --output ... --max-episodes 3
+
+Honors <input>/exclude.txt (drops + end-crops). Originals are never modified.
 """
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import cv2
@@ -37,23 +59,25 @@ import zarr
 from natsort import natsorted
 from scipy.spatial.transform import Rotation
 
-IMG_SIZE = 224
+# Real UMI repo (charm-lab/HapticTeleopIL) for ReplayBuffer
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_UMI_REAL = os.path.join(_THIS_DIR, "..", "..", "HapticTeleopIL",
+                         "Imitation Learning", "universal_manipulation_interface")
+if _UMI_REAL not in sys.path:
+    sys.path.insert(0, _UMI_REAL)
 
-CAMERA_KEYS = {
-    "images/zed_isometric": "zed_isometric_rgb",   # matches the HDF5 key + task shape_meta
-    "images/dji_wrist":     "dji_wrist_rgb",
-}
+from diffusion_policy.common.replay_buffer import ReplayBuffer  # noqa: E402
+
+IMG_SIZE = 224
+# Robotiq 2F-85 stroke. Only consistency with inference.py matters (range
+# normalizer self-calibrates), but meters keeps UMI semantic conventions.
+GRIPPER_MAX_WIDTH_M = 0.085
+
+WRIST_CAM_H5_KEY = "images/dji_wrist"
 
 
 def parse_exclude(exclude_path: str):
-    """Read a curation exclude.txt written by inspect_transitions.py.
-
-    Format (originals are never modified — crops are applied here at read time):
-        episode_N              drop the whole episode
-        episode_N crop S E     keep frames [S:E) (end-crop)
-
-    Returns (full_drops:set[str], crops:dict[str,(start,end)]).
-    """
+    """Same exclude.txt format as convert_data.py: drops + `crop S E` lines."""
     full, crops = set(), {}
     if not os.path.exists(exclude_path):
         return full, crops
@@ -71,36 +95,81 @@ def parse_exclude(exclude_path: str):
     return full, crops
 
 
-def quat_xyzw_to_10d(pose_7: np.ndarray, gripper: np.ndarray) -> np.ndarray:
-    """Convert (T,7) [x,y,z,qx,qy,qz,qw] + (T,) gripper to (T,10) [xyz,rot6d,grip].
+def quat_pose_to_pos_rotvec(pose_7: np.ndarray):
+    """(T,7) [x,y,z,qx,qy,qz,qw] -> ((T,3) pos, (T,3) rotvec).
 
-    Rotation 6D = first two columns of the rotation matrix concatenated.
+    scipy from_quat takes xyzw directly — the physical quaternion, no reorder.
+    rotvec has no wxyz/xyzw ambiguity, matching umi/common/pose_util.py exactly.
     """
-    xyz = pose_7[:, :3]
-    quat_xyzw = pose_7[:, 3:]
-    rot_mats = Rotation.from_quat(quat_xyzw).as_matrix()  # (T, 3, 3)
-    rot6d = np.concatenate([rot_mats[:, :, 0], rot_mats[:, :, 1]], axis=1)  # (T, 6)
-    grip = gripper.reshape(-1, 1)
-    return np.concatenate([xyz, rot6d, grip], axis=1).astype(np.float32)  # (T, 10)
+    pos = pose_7[:, :3].astype(np.float32)
+    rotvec = Rotation.from_quat(pose_7[:, 3:]).as_rotvec().astype(np.float32)
+    return pos, rotvec
 
 
-def resize_images(imgs_chw: np.ndarray, size: int = IMG_SIZE) -> np.ndarray:
-    """Resize (T, 3, H, W) CHW uint8 images to (T, size, size, 3) HWC uint8."""
+def gripper_norm_to_width_m(g: np.ndarray) -> np.ndarray:
+    """Kortex normalized (0=open, 1=closed) -> physical width in meters, (T,1)."""
+    g = np.clip(g.astype(np.float32), 0.0, 1.0)
+    return (GRIPPER_MAX_WIDTH_M * (1.0 - g)).reshape(-1, 1)
+
+
+def resize_images_chw_to_hwc(imgs_chw: np.ndarray, size: int = IMG_SIZE) -> np.ndarray:
+    """(T,3,H,W) uint8 CHW -> (T,size,size,3) uint8 HWC."""
     T = imgs_chw.shape[0]
     out = np.empty((T, size, size, 3), dtype=np.uint8)
     for t in range(T):
-        frame = np.transpose(imgs_chw[t], (1, 2, 0))  # CHW -> HWC
-        out[t] = cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+        frame = np.transpose(imgs_chw[t], (1, 2, 0))
+        if frame.shape[:2] != (size, size):
+            frame = cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+        out[t] = frame
     return out
 
 
-def convert(input_dir: str, output_path: str, max_episodes: int = None):
+def load_episode(h5_path: Path, crop) -> dict:
+    """Read one HDF5 episode -> dict of UMI-schema arrays. crop=(s,e) or (0,None)."""
+    cs, ce = crop
+    with h5py.File(h5_path, "r") as f:
+        obs_pose = f["observation/pose"][cs:ce]
+        obs_grip = f["observation/gripper"][cs:ce]
+        act_pose = f["action/pose"][cs:ce]
+        act_grip = f["action/gripper"][cs:ce]
+        imgs = f[WRIST_CAM_H5_KEY][cs:ce]
+        if "piezense/pressure_input" in f:
+            piezense = f["piezense/pressure_input"][cs:ce].astype(np.float32)
+        else:
+            piezense = np.zeros((len(obs_pose), 2), dtype=np.float32)
+
+    obs_pos, obs_rotvec = quat_pose_to_pos_rotvec(obs_pose)
+    act_pos, act_rotvec = quat_pose_to_pos_rotvec(act_pose)
+    T = len(obs_pos)
+
+    # Episode start/end pose [pos, rotvec], repeated per frame (required by
+    # umi_dataset for the _wrt_start observation; end pose kept for parity with
+    # UMI's own pipeline output).
+    start_pose = np.concatenate([obs_pos[0], obs_rotvec[0]]).astype(np.float32)
+    end_pose = np.concatenate([obs_pos[-1], obs_rotvec[-1]]).astype(np.float32)
+
+    action = np.concatenate(
+        [act_pos, act_rotvec, gripper_norm_to_width_m(act_grip)], axis=1
+    ).astype(np.float32)  # (T, 7)
+
+    return {
+        "camera0_rgb": resize_images_chw_to_hwc(imgs),
+        "robot0_eef_pos": obs_pos,
+        "robot0_eef_rot_axis_angle": obs_rotvec,
+        "robot0_gripper_width": gripper_norm_to_width_m(obs_grip),
+        "robot0_demo_start_pose": np.tile(start_pose, (T, 1)),
+        "robot0_demo_end_pose": np.tile(end_pose, (T, 1)),
+        "piezense0_pressures": piezense,
+        "action": action,
+    }
+
+
+def convert(input_dir: str, output_path: str, max_episodes=None):
     h5_files = natsorted(Path(input_dir).glob("episode_*.hdf5"))
     if not h5_files:
         print(f"No episode_*.hdf5 files found in {input_dir}")
         return
 
-    # Curation: drop fully-excluded episodes and end-crop the rest per exclude.txt.
     full_drops, crops = parse_exclude(os.path.join(input_dir, "exclude.txt"))
     if full_drops:
         h5_files = [p for p in h5_files if p.stem not in full_drops]
@@ -109,105 +178,66 @@ def convert(input_dir: str, output_path: str, max_episodes: int = None):
     if crops:
         print(f"exclude.txt: end-cropping {len(crops)} episode(s): "
               f"{', '.join(f'{n}[{s}:{e}]' for n, (s, e) in sorted(crops.items()))}")
-
     if max_episodes is not None:
         h5_files = h5_files[:max_episodes]
 
-    print(f"Found {len(h5_files)} episode(s) in {input_dir}")
+    print(f"Converting {len(h5_files)} episode(s) from {input_dir}")
+    print(f"  gripper: width_m = {GRIPPER_MAX_WIDTH_M} * (1 - g_norm)  "
+          f"(inference.py must invert with the same constant)")
 
-    root     = zarr.open(output_path, mode="w")
-    data_grp = root.require_group("data")
-    meta_grp = root.require_group("meta")
+    buffer = ReplayBuffer.create_empty_numpy()
+    for i, h5_path in enumerate(h5_files):
+        crop = crops.get(h5_path.stem, (0, None))
+        ep = load_episode(h5_path, crop)
+        T = ep["robot0_eef_pos"].shape[0]
+        tag = f"[crop {crop[0]}:{crop[1]}] " if h5_path.stem in crops else ""
+        buffer.add_episode(ep)
+        print(f"  [{i + 1}/{len(h5_files)}] {h5_path.name} {tag}({T} frames)")
 
-    initialized = False
-    total_frames = 0
+    # Per-frame chunking for images; generous chunks for low-dim signals.
+    chunks = {
+        "camera0_rgb": (1, IMG_SIZE, IMG_SIZE, 3),
+        "robot0_eef_pos": (1000, 3),
+        "robot0_eef_rot_axis_angle": (1000, 3),
+        "robot0_gripper_width": (1000, 1),
+        "robot0_demo_start_pose": (1000, 6),
+        "robot0_demo_end_pose": (1000, 6),
+        "piezense0_pressures": (1000, 2),
+        "action": (1000, 7),
+    }
+    # Clamp chunk lengths to actual array length (zarr requires chunk <= shape is
+    # fine, but keep tidy for tiny test conversions)
+    n_total = buffer.n_steps
+    chunks = {k: (min(c[0], n_total),) + c[1:] for k, c in chunks.items()}
 
-    for ep_idx, h5_path in enumerate(h5_files):
-        print(f"  [{ep_idx + 1}/{len(h5_files)}] {h5_path.name} ", end="")
+    out = os.path.expanduser(output_path)
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    if os.path.exists(out):
+        os.remove(out)
+    print(f"Writing ZipStore -> {out}")
+    with zarr.ZipStore(out, mode="w") as zip_store:
+        buffer.save_to_store(store=zip_store, chunks=chunks)
 
-        # End-crop window [cs:ce) — keeps timing intact (start never moved).
-        cs, ce = crops.get(h5_path.stem, (0, None))
+    print(f"\nDone. {buffer.n_episodes} episode(s), {n_total} frames total.")
+    print(f"episode_ends: {buffer.episode_ends[:]}")
 
-        with h5py.File(h5_path, "r") as f:
-            obs_pose = f["observation/pose"][cs:ce]
-            obs_grip = f["observation/gripper"][cs:ce]
-            act_pose = f["action/pose"][cs:ce]
-            act_grip = f["action/gripper"][cs:ce]
-
-            pose_10d   = quat_xyzw_to_10d(obs_pose, obs_grip)
-            action_10d = quat_xyzw_to_10d(act_pose, act_grip)
-            T = pose_10d.shape[0]
-
-            cam_data = {}
-            for h5_key, zarr_key in CAMERA_KEYS.items():
-                if h5_key in f:
-                    cam_data[zarr_key] = resize_images(f[h5_key][cs:ce], IMG_SIZE)
-                else:
-                    print(f"\n    Warning: {h5_key} not found, skipping")
-
-            if "piezense/pressure_input" in f:
-                piezense = f["piezense/pressure_input"][cs:ce].astype(np.float32)
-            else:
-                print("\n    Warning: piezense/pressure_input not found, writing zeros")
-                piezense = np.zeros((T, 2), dtype=np.float32)
-
-        if h5_path.stem in crops:
-            print(f"[crop {cs}:{ce}] ", end="")
-
-        ep_data = {
-            "pose":              pose_10d,
-            "action":            action_10d,
-            "piezense_pressure": piezense,
-            **cam_data,
-        }
-
-        if not initialized:
-            for key, val in ep_data.items():
-                shape  = (0,) + val.shape[1:]
-                chunks = (1,) + val.shape[1:] if val.ndim >= 3 else (min(T, 1000),) + val.shape[1:]
-                data_grp.zeros(key, shape=shape, chunks=chunks, dtype=val.dtype)
-            meta_grp.zeros("episode_ends", shape=(0,), dtype=np.int64, compressor=None)
-            initialized = True
-
-        # Append this episode to each flat array
-        curr = total_frames
-        new  = curr + T
-        for key, val in ep_data.items():
-            arr = data_grp[key]
-            arr.resize((new,) + val.shape[1:])
-            arr[curr:new] = val
-
-        ends = meta_grp["episode_ends"]
-        ends.resize(ends.shape[0] + 1)
-        ends[-1] = new
-        total_frames = new
-
-        print(f"({T} frames, cumulative={new})")
-
-    print(f"\nDone. Zarr written to {output_path}")
-    print(f"Total frames : {total_frames}")
-    print(f"episode_ends : {meta_grp['episode_ends'][:]}")
-    for key in sorted(data_grp.array_keys()):
-        arr = data_grp[key]
-        print(f"  data/{key:25s}  {arr.shape}  {arr.dtype}")
+    # Read-back sanity check
+    with zarr.ZipStore(out, mode="r") as zip_store:
+        root = zarr.group(zip_store)
+        for key in sorted(root["data"].array_keys()):
+            arr = root["data"][key]
+            print(f"  data/{key:28s} {arr.shape}  {arr.dtype}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert Kinova Gen3 HDF5 episodes to flat UMI-style zarr"
+        description="Convert Kinova HDF5 episodes to the real-UMI ReplayBuffer .zarr.zip"
     )
-    parser.add_argument(
-        "--input", type=str,
-        default=os.path.join(os.path.dirname(__file__), "..", "data_collection", "demo_data"),
-        help="Directory containing episode_*.hdf5 files",
-    )
-    parser.add_argument(
-        "--output", type=str, default="kinova_teleop.zarr",
-        help="Output zarr path",
-    )
-    parser.add_argument(
-        "--max-episodes", type=int, default=None,
-        help="Limit number of episodes to convert",
-    )
+    parser.add_argument("--input", type=str, required=True,
+                        help="Directory containing episode_*.hdf5 files")
+    parser.add_argument("--output", type=str, required=True,
+                        help="Output .zarr.zip path")
+    parser.add_argument("--max-episodes", type=int, default=None,
+                        help="Limit number of episodes (for testing)")
     args = parser.parse_args()
     convert(args.input, args.output, args.max_episodes)

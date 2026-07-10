@@ -277,19 +277,18 @@ Chunked at `(1, 224, 224, 3)` — one frame per chunk for efficient random acces
 
 Training runs in the **`umi` miniforge conda env (Python 3.9)** — *not* `base`
 (`base`/`python3.12` holds the data-prep tools: h5py/cv2/zarr). `train.py`
-path-imports `diffusion_policy`/`robomimic` from
-`../../Robomimic/dt_ag-main/universal_manipulation_interface/`, so that repo must
-stay at that relative location.
+path-imports `diffusion_policy` from
+`../../HapticTeleopIL/Imitation Learning/universal_manipulation_interface/`
+(the real charm-lab UMI repo), so that repo must stay at that relative location.
 
 ```bash
 conda activate umi
 cd training/
 
 python train.py --config-name=train_diffusion_unet_timm_kinova \
-    task.dataset_path=../data_collection/demo_data/Collection4/kinova_teleop.zarr
+    task.dataset_path=../data_collection/demo_data/Collection5.5/kinova_teleop_umi.zarr.zip
 
-# (alternatively set the dataset via env var instead of the Hydra override)
-export KINOVA_ZARR_PATH=../data_collection/demo_data/Collection4/kinova_teleop.zarr
+# (the .zarr.zip is produced by convert_data.py, run in base/python3.12)
 
 # Options
 python train.py --config-name=train_diffusion_unet_timm_kinova training.debug=True
@@ -325,7 +324,7 @@ python -c "import torch; print(torch.__version__); print('sm_120' in torch.cuda.
 
 ### 5.2 Policy Architecture
 
-**`DiffusionUnetTimmPolicy`** from the UMI / dt_ag-main diffusion_policy codebase.
+**`DiffusionUnetTimmPolicy`** from the UMI diffusion_policy codebase (charm-lab/HapticTeleopIL).
 
 ```
 Observations ──► TimmObsEncoder ──► conditioning vector
@@ -689,7 +688,6 @@ haptic_teleop_il_study/
 │   ├── kinova_hand_controller.py    — HoloLens → Kortex velocity control
 │   ├── hololens_hand_node.py        — hand joint → hand/pose, hand/gripper_cmd
 │   ├── hololens_tf_publisher_ros2.py— HoloLens joints → TF2
-│   ├── hdf5_to_zarr.py              — DEPRECATED (incompatible rot6d); use training/convert_data.py
 │   ├── dji_camera_node.py           — DJI Osmo → ROS2 Image (1280×720 capture → 224×224 publish)
 │   ├── dji_camera_validate.py       — verify DJI device/feed (--model-view shows the 224×224 policy input)
 │   ├── launch_teleop.py             — teleoperation only (no recording)
@@ -703,8 +701,7 @@ haptic_teleop_il_study/
 │   └── README.md                    — data collection subsystem docs
 │
 ├── training/
-│   ├── convert_data.py              — HDF5 → flat UMI-style zarr (for training)
-│   ├── kinova_dataset.py            — PyTorch Dataset class (KinovaImageDataset)
+│   ├── convert_data.py              — HDF5 → UMI ReplayBuffer .zarr.zip (for training)
 │   ├── train.py                     — Hydra entry point
 │   └── config/
 │       ├── train_diffusion_unet_timm_kinova.yaml  — main training config
@@ -717,15 +714,12 @@ haptic_teleop_il_study/
 └── README.md                        — this document
 ```
 
-**Note on zarr converters:** `training/convert_data.py` is the single canonical
-converter. `data_collection/hdf5_to_zarr.py` is **DEPRECATED** — despite writing
-the same flat layout, it encodes rotations with a *different, incompatible*
-convention (pytorch3d rows + a misread quaternion) than `convert_data.py` (scipy
-columns + the correct quaternion). `testing/inference.py` is aligned to
-`convert_data.py`, so training with `hdf5_to_zarr.py` silently causes the ~90°
-wrist-rotation bug. `convert_data.py` also reads the correct ZED key
-(`images/zed_isometric`) and supports `exclude.txt` drops **and** end-crops.
-`hdf5_to_zarr.py` now refuses to run without `--force`.
+**Note on the converter:** `training/convert_data.py` is the single converter.
+It writes the UMI ReplayBuffer `.zarr.zip` (per-signal `robot0_*`/`camera0_rgb`
+schema, axis-angle rotations) that `UmiDataset` consumes, reads the wrist camera
+key (`images/dji_wrist`), and honors `exclude.txt` drops **and** end-crops.
+`testing/inference.py` uses the matching encode/decode (UMI `pose_util`), so
+training and inference stay consistent.
 
 ---
 
@@ -751,8 +745,8 @@ omegaconf
 diffusers         # DDIMScheduler
 torch torchvision
 
-# UMI / diffusion_policy codebase (shared with Robomimic):
-# Robomimic/dt_ag-main/universal_manipulation_interface/
+# UMI / diffusion_policy codebase (charm-lab/HapticTeleopIL):
+# HapticTeleopIL/Imitation Learning/universal_manipulation_interface/
 #   — diffusion_policy.*  (policy, workspace, dataset, model)
-#   — dt_ag.rotation_transformer  (used by Robomimic scripts; not used here)
+#   — umi.common.pose_util, umi.real_world.real_inference_util  (used by inference.py)
 ```

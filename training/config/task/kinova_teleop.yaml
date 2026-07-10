@@ -1,49 +1,105 @@
-low_dim_obs_horizon: 2
+# Task config. Copied from the real UMI repo's
+# diffusion_policy/config/task/kinova_teleop.yaml (charm-lab/HapticTeleopIL),
+# with pose_repr set to abs (not relative).
+#
+# Data comes from training/convert_data.py (HDF5 -> ReplayBuffer .zarr.zip).
+# Gripper: stored as physical width in meters, width = 0.085 * (1 - kortex_norm)
+# (Robotiq 2F-85; constant lives in convert_data.py + inference.py —
+# validated round-trip against raw HDF5, err < 1e-8).
+
+name: kinova_teleop
+
+camera_obs_latency: 0 #0.125
+robot_obs_latency: 0.0001
+gripper_obs_latency: 0.02
+piezense_obs_latency: 0.0001
+dataset_frequeny: 0 #0, 59.94
+obs_down_sample_steps: 3 # 3, 1
+
+low_dim_obs_horizon: 8
 img_obs_horizon: 2
 action_horizon: 16
+ignore_proprioception: False
 
 shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
   obs:
-    # zed_isometric_rgb:
-    #   shape: [3, 224, 224]
-    #   type: rgb
-    #   horizon: ${task.img_obs_horizon}
-    #   down_sample_steps: 1
-    dji_wrist_rgb:
+    camera0_rgb:
       shape: [3, 224, 224]
+      horizon: ${task.img_obs_horizon} # int
+      latency_steps: 0 # float
+      down_sample_steps: ${task.obs_down_sample_steps} # int
       type: rgb
-      horizon: ${task.img_obs_horizon}
-      down_sample_steps: 1
-    pose:
-      shape: [10]
+      ignore_by_policy: False
+    robot0_eef_pos:
+      shape: [3]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
       type: low_dim
-      horizon: ${task.low_dim_obs_horizon}
-      down_sample_steps: 1
-    piezense_pressure:
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_eef_rot_axis_angle:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      rotation_rep: rotation_6d
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_gripper_width:
+      shape: [1]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.gripper_obs_latency}) * ${task.dataset_frequeny}'} # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_eef_rot_axis_angle_wrt_start:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    piezense0_pressures:
       shape: [2]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.piezense_obs_latency}) * ${task.dataset_frequeny}'} # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
       type: low_dim
-      horizon: ${task.low_dim_obs_horizon}
-      down_sample_steps: 1
+      ignore_by_policy: ${task.ignore_proprioception}
   action:
     shape: [10]
     horizon: ${task.action_horizon}
-    down_sample_steps: 1
+    latency_steps: 0 # float
+    down_sample_steps: ${task.obs_down_sample_steps} # int
+    rotation_rep: rotation_6d
 
-name: kinova_teleop
-task_name: kinova_teleop
-dataset_path: ${oc.env:KINOVA_ZARR_PATH,kinova_teleop.zarr}
+task_name: &task_name kinova_teleop
+
+# Co-located with the source HDF5 episodes. Relative to training/ (where train.py
+# is launched from); override per run with task.dataset_path=...
+dataset_path: ../data_collection/demo_data/Collection5/kinova_teleop_umi.zarr.zip
+
+pose_repr: &pose_repr
+  obs_pose_repr: abs   # was: relative — using abs for the first-pass migration
+  action_pose_repr: abs # was: relative — isolates "does the UMI pipeline itself
+                        # help" from "does relative pose help" as two separate
+                        # later experiments (see lab notes net assessment)
 
 env_runner:
   _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
 
 dataset:
-  _target_: kinova_dataset.KinovaImageDataset
+  _target_: diffusion_policy.dataset.umi_dataset.UmiDataset
   shape_meta: *shape_meta
-  zarr_path: ${task.dataset_path}
+  dataset_path: ${task.dataset_path}
+  cache_dir: null
+  pose_repr: *pose_repr
+  action_padding: False
+  temporally_independent_normalization: False
+  repeat_frame_prob: 0.0
+  max_duration: null
   seed: 42
   val_ratio: 0.05
-  horizon: 16
-  obs_horizon: ${task.low_dim_obs_horizon}
-  action_horizon: ${task.action_horizon}
-  preload: false
-  downsample: 3

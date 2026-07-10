@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
-Real-time diffusion policy inference for Kinova Gen3 with ZED front + DJI wrist cameras.
+Real-time diffusion policy inference (charm-lab UMI pipeline, real UMI repo).
 
-Adapted from Robomimic/testing/inference.py for the HoloLens + Kinova Gen3 setup.
+Runs checkpoints trained by train.py on data from convert_data.py. Two-process
+architecture (ROS2 obs collection + GPU inference) with Kinova P-loop control.
 
-Two-process architecture:
-  Main process  — ROS2 PolicyNode: collects observations, tracks actions via Kortex P-loop
-  GPU process   — Loads model, runs predict_action(), writes target poses to shared memory
+Observation/action schema (single robot):
+  robot0_eef_pos(3) + robot0_eef_rot_axis_angle (rot6d ROWS) +
+  robot0_gripper_width (meters) + robot0_eef_rot_axis_angle_wrt_start (rot6d),
+  camera key 'camera0_rgb'. Encode/decode uses UMI's own pose_util
+  (pose_to_mat, mat_to_pose10d, pose10d_to_mat). Obs frames are sampled dt
+  apart (matching training down_sample_steps spacing).
 
-The Kinova is controlled via a 30 Hz P-loop velocity controller (SendTwistCommand in
-SINGLE_LEVEL_SERVOING mode), matching the kinova_hand_controller.py approach.
+pose_repr is 'abs' end-to-end (matching config/task/kinova_teleop.yaml), so
+predicted poses are absolute — no relative-frame composition at decode time.
+
+Gripper: model I/O is physical width in METERS (Robotiq 2F-85):
+    width = GRIPPER_MAX_WIDTH_M * (1 - kortex_norm);  kortex_norm = 1 - width/GRIPPER_MAX_WIDTH_M
+  The constant MUST match convert_data.py.
 
 Usage:
     python inference.py --model /path/to/checkpoint.ckpt
-    python inference.py --model /path/to/checkpoint.ckpt --dt 0.033 --action-horizon 6
+    python inference.py --model ... --dt 0.1 --n-action-steps 8
 """
 
 import math
@@ -32,22 +40,24 @@ import torch
 import dill
 import hydra
 
-# Path setup: UMI / diffusion_policy codebase
+# Path setup: real UMI repo (charm-lab/HapticTeleopIL)
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_UMI_ROOT = os.path.join(_THIS_DIR, "..", "..", "Robomimic", "dt_ag-main")
-_UMI_DP   = os.path.join(_UMI_ROOT, "universal_manipulation_interface")
-_TRAINING_DIR = os.path.join(_THIS_DIR, "..", "training")
+_UMI_ROOT = os.path.join(_THIS_DIR, "..", "..", "HapticTeleopIL",
+                         "Imitation Learning", "universal_manipulation_interface")
 
-for p in [_UMI_DP, _UMI_ROOT, _TRAINING_DIR]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+if _UMI_ROOT not in sys.path:
+    sys.path.insert(0, _UMI_ROOT)
 
-os.chdir(_UMI_DP)
+os.chdir(_UMI_ROOT)
 
 from omegaconf import OmegaConf
 OmegaConf.register_new_resolver("eval", eval, use_cache=True)
 
-from diffusion_policy.workspace.base_workspace import BaseWorkspace
+from diffusion_policy.workspace.base_workspace import BaseWorkspace  # noqa: F401
+# UMI's own pose math (rows-convention rot6d) — the same functions UmiDataset
+# used at training time, so encode/decode conventions cannot diverge.
+from umi.common.pose_util import pose_to_mat, mat_to_pose10d, pose10d_to_mat
+from diffusion_policy.common.pose_repr_util import convert_pose_mat_rep
 
 import rclpy
 from rclpy.node import Node
@@ -71,8 +81,7 @@ from kortex_api.autogen.messages import Session_pb2, Base_pb2
 
 POSE_TOPIC      = "robot_obs/pose"
 GRIPPER_TOPIC   = "robot_obs/gripper"
-ZED_FRONT_TOPIC = "/zed_front/zed_node/left/image_rect_color"
-DJI_WRIST_TOPIC  = "/dji_wrist/dji_wrist/color/image_raw"
+DJI_WRIST_TOPIC = "/dji_wrist/dji_wrist/color/image_raw"
 PIEZENSE_TOPIC  = "piezense/data"
 
 PIEZENSE_SYSTEM_ID      = 0
@@ -92,33 +101,39 @@ HOME_TX, HOME_TY, HOME_TZ = -180.0, 0.0, 90.0   # Euler XYZ degrees
 MAX_LINEAR_SPEED  = 0.10   # m/s
 MAX_ANGULAR_SPEED = 15.0   # deg/s
 P_GAIN            = 2.0
-VEL_ALPHA         = 0.4    # smoothing factor (0 = no smoothing)
-TWIST_WATCHDOG_MS = 200    # ms — Kortex auto-stops if we miss this many ms
+VEL_ALPHA         = 0.4
+TWIST_WATCHDOG_MS = 200
 
 IMG_SIZE     = 224
-OBS_HORIZON  = 2
+# Per-key obs horizons are read from the checkpoint's shape_meta at startup
+# (img and low_dim horizons may differ, e.g. camera 2 / low_dim 8) — see
+# load_obs_meta(). OBS_HORIZON_FALLBACK is only used if a key lacks one.
+OBS_HORIZON_FALLBACK = 2
 
-# CAMERA_KEYS = ["zed_front_rgb", "dji_wrist_rgb"]
-CAMERA_KEYS = ["dji_wrist_rgb"]
-# CAMERA_TOPICS = {
-#     "zed_front_rgb": ZED_FRONT_TOPIC,
-#     "dji_wrist_rgb":  DJI_WRIST_TOPIC,
-# }
-CAMERA_TOPICS = {
-    "dji_wrist_rgb":  DJI_WRIST_TOPIC,
-}
+# MUST match convert_data.py (Robotiq 2F-85 stroke).
+GRIPPER_MAX_WIDTH_M = 0.085
+
+CAMERA_KEYS = ["camera0_rgb"]
+CAMERA_TOPICS = {"camera0_rgb": DJI_WRIST_TOPIC}
 
 
-# ── Rotation helpers ───────────────────────────────────────────────────────────
+# ── UMI-schema encode/decode helpers ───────────────────────────────────────────
 
-def pose_msg_to_10d(pose_msg: PoseStamped, gripper: float) -> np.ndarray:
-    """Convert PoseStamped + gripper scalar to 10D [xyz, rot6d, grip].
+def gripper_norm_to_width_m(g: float) -> float:
+    return GRIPPER_MAX_WIDTH_M * (1.0 - float(np.clip(g, 0.0, 1.0)))
 
-    Encoding MUST match training/convert_data.py (what the zarr was built with):
-      - scipy from_quat([qx,qy,qz,qw]) directly — the physical quaternion, no reorder.
-      - rot6d = first two COLUMNS of the rotation matrix (Zhou et al. 2019).
-    (Note: data_collection/hdf5_to_zarr.py uses pytorch3d rows + a misread quat,
-     a DIFFERENT convention — do not mix the two converters.)
+
+def width_m_to_gripper_norm(w: float) -> float:
+    return float(np.clip(1.0 - w / GRIPPER_MAX_WIDTH_M, 0.0, 1.0))
+
+
+def pose_msg_to_raw(pose_msg: PoseStamped, gripper_norm: float) -> np.ndarray:
+    """PoseStamped + kortex gripper -> raw 7D [pos(3), rotvec(3), width_m(1)].
+
+    Matches convert_data.py exactly: scipy from_quat([qx,qy,qz,qw]) -> rotvec
+    (no wxyz/xyzw ambiguity possible), gripper as physical width in meters.
+    rot6d is NEVER computed here — it's derived later via UMI's own pose_to_mat /
+    mat_to_pose10d (rows convention), identical to what UmiDataset did in training.
     """
     pos = np.array([pose_msg.pose.position.x,
                     pose_msg.pose.position.y,
@@ -126,26 +141,41 @@ def pose_msg_to_10d(pose_msg: PoseStamped, gripper: float) -> np.ndarray:
     q = np.array([pose_msg.pose.orientation.x,
                   pose_msg.pose.orientation.y,
                   pose_msg.pose.orientation.z,
-                  pose_msg.pose.orientation.w])  # [qx, qy, qz, qw]
-    rot_mat = R.from_quat(q).as_matrix()                     # (3, 3), physical
-    rot6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]])   # first two COLUMNS  (6,)
-    return np.concatenate([pos, rot6d, [gripper]]).astype(np.float32)  # (10,)
+                  pose_msg.pose.orientation.w])
+    rotvec = R.from_quat(q).as_rotvec()
+    return np.concatenate([pos, rotvec,
+                           [gripper_norm_to_width_m(gripper_norm)]]).astype(np.float32)
 
 
-def rot6d_to_euler_xyz(rot6d: np.ndarray) -> np.ndarray:
-    """Decode training-encoded rot6d → Euler XYZ degrees.
+def action10d_to_pos_euler_grip(action_10d: np.ndarray):
+    """UMI 10D action [pos(3), rot6d ROWS (6), width_m(1)] -> (pos, euler_xyz_deg, grip_norm).
 
-    Inverse of pose_msg_to_10d / convert_data.py (COLUMNS convention):
-      rot6d = [col0, col1] of the physical rotation matrix.
-    Gram-Schmidt to re-orthonormalize (network output isn't exactly orthonormal),
-    rebuild the matrix from its columns, then read physical Euler XYZ via scipy.
+    pose10d_to_mat is UMI's own decoder (Gram-Schmidt on the rows-convention
+    rot6d) — the exact inverse of the training-time mat_to_pose10d.
+    pose_repr is 'abs', so the predicted pose is already absolute (no base-pose
+    composition needed).
     """
-    c0 = rot6d[:3] / (np.linalg.norm(rot6d[:3]) + 1e-8)
-    c1 = rot6d[3:6] - np.dot(rot6d[3:6], c0) * c0
-    c1 = c1 / (np.linalg.norm(c1) + 1e-8)
-    c2 = np.cross(c0, c1)
-    mat = np.column_stack([c0, c1, c2])                     # columns (physical R)
-    return R.from_matrix(mat).as_euler("xyz", degrees=True)
+    mat = pose10d_to_mat(action_10d[:9].astype(np.float64))
+    pos = mat[:3, 3].copy()
+    euler_deg = R.from_matrix(mat[:3, :3]).as_euler("xyz", degrees=True)
+    grip_norm = width_m_to_gripper_norm(float(action_10d[9]))
+    return pos, euler_deg, grip_norm
+
+
+def pick_frames_by_time(buffer, n, spacing_s):
+    """Pick n entries from [(value, t), ...] ending at the latest, spaced spacing_s
+    apart (nearest-neighbor in time). Replicates training-time down_sample_steps
+    spacing instead of taking consecutive ~30 Hz frames.
+    """
+    if not buffer:
+        return None
+    t_latest = buffer[-1][1]
+    picked = []
+    for i in range(n):
+        t_target = t_latest - (n - 1 - i) * spacing_s
+        best = min(buffer, key=lambda e: abs(e[1] - t_target))
+        picked.append(best)
+    return picked
 
 
 # ── Model loading ──────────────────────────────────────────────────────────────
@@ -163,60 +193,86 @@ def load_policy(model_path: str, num_inference_steps: int = 16):
     policy.eval().to(device)
     print(f"Policy loaded on {device} (EMA={cfg.training.use_ema}, "
           f"diffusion_steps={num_inference_steps})")
+    # Sanity: checkpoint must use the UMI per-signal schema (robot0_* obs keys)
+    obs_keys = list(cfg.policy.shape_meta["obs"].keys())
+    if not any(k.startswith("robot0_") for k in obs_keys):
+        raise RuntimeError(
+            f"Checkpoint obs keys {obs_keys} are not UMI-schema (expected robot0_* keys).")
     return policy
 
 
-def load_obs_keys(model_path: str) -> list[str]:
+def load_obs_keys(model_path: str) -> list:
     path = pathlib.Path(model_path)
     payload = torch.load(path.open("rb"), pickle_module=dill, map_location="cpu")
     return list(payload["cfg"].policy.shape_meta["obs"].keys())
 
 
+def load_obs_meta(model_path: str):
+    """Read (obs_keys, per-key horizons) from the checkpoint's shape_meta.
+
+    Inference must pack each obs key with the SAME horizon it was trained with
+    (img and low_dim horizons can differ, e.g. camera0_rgb: 2, robot0_*: 8).
+    """
+    path = pathlib.Path(model_path)
+    payload = torch.load(path.open("rb"), pickle_module=dill, map_location="cpu")
+    obs_meta = payload["cfg"].policy.shape_meta["obs"]
+    keys = list(obs_meta.keys())
+    horizons = {k: int(obs_meta[k].get("horizon", OBS_HORIZON_FALLBACK)) for k in keys}
+    return keys, horizons
+
+
 # ── PolicyNode ─────────────────────────────────────────────────────────────────
 
 class PolicyNode(Node):
-    """ROS2 node: collects observations, tracks policy targets via Kinova P-loop."""
+    """ROS2 node: collects observations (UMI schema), tracks policy targets via P-loop."""
 
-    def __init__(self, shared_obs: dict, start_time: float, model_path: str):
+    def __init__(self, shared_obs: dict, start_time: float, model_path: str, dt: float):
         super().__init__("kinova_policy_node")
         np.set_printoptions(suppress=True, precision=4)
 
         self.shared_obs = shared_obs
         self.start_time = start_time
-        self.obs_keys = load_obs_keys(model_path)
-        self.get_logger().info(f"Policy obs keys: {self.obs_keys}")
+        self.dt = dt
+        self.obs_keys, self.key_horizons = load_obs_meta(model_path)
+        self.max_horizon = max(self.key_horizons.values())
+        # Raw ~30 Hz buffer must span (max_horizon-1)*dt of history plus margin.
+        self.raw_buffer_len = max(40, int((self.max_horizon + 2) * self.dt * 30) + 10)
+        self.get_logger().info(
+            f"Policy obs keys: {self.obs_keys} | horizons: {self.key_horizons} "
+            f"| raw buffer: {self.raw_buffer_len}")
 
-        # ── Kinova connection ────────────────────────────────────────────────
         self.get_logger().info(f"Connecting to Kinova Gen3 at {KINOVA_IP}...")
         self._connect_kinova()
         self._setup_servoing()
 
         # ── Controller state ─────────────────────────────────────────────────
-        self.current_target_xyz = None      # np.ndarray (3,) metres
-        self.current_target_euler = None    # np.ndarray (3,) degrees XYZ
+        self.current_target_xyz = None
+        self.current_target_euler = None
         self.current_gripper_cmd  = 0.0
         self._smoothed_vel = np.zeros(3)
         self.paused = True
         self.is_resetting = False
 
-        # ── QoS ──────────────────────────────────────────────────────────────
+        # Episode start pose (4x4 mat) for robot0_eef_rot_axis_angle_wrt_start.
+        # Captured from the first observation after each home reset — the same
+        # anchor as training's robot0_demo_start_pose (episode's first frame,
+        # robot at home). Cleared on every reset.
+        self.episode_start_pose_mat = None
+
         sensor_qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
         )
 
-        # ── Synchronized observation subscribers ─────────────────────────────
         self._bridge = CvBridge()
         self.gripper_state = 0.0
 
-        self.pose_sub     = message_filters.Subscriber(self, PoseStamped, POSE_TOPIC,      qos_profile=sensor_qos)
-        self.gripper_sub  = message_filters.Subscriber(self, Float32,     GRIPPER_TOPIC,   qos_profile=sensor_qos)
-        # self.zed_sub      = message_filters.Subscriber(self, Image,       ZED_FRONT_TOPIC, qos_profile=sensor_qos)
-        self.wrist_sub    = message_filters.Subscriber(self, Image,       DJI_WRIST_TOPIC,  qos_profile=sensor_qos)
+        self.pose_sub    = message_filters.Subscriber(self, PoseStamped, POSE_TOPIC,    qos_profile=sensor_qos)
+        self.gripper_sub = message_filters.Subscriber(self, Float32,     GRIPPER_TOPIC, qos_profile=sensor_qos)
+        self.wrist_sub   = message_filters.Subscriber(self, Image,       DJI_WRIST_TOPIC, qos_profile=sensor_qos)
 
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            # [self.pose_sub, self.gripper_sub, self.zed_sub, self.wrist_sub],
             [self.pose_sub, self.gripper_sub, self.wrist_sub],
             queue_size=100,
             slop=0.05,
@@ -224,7 +280,6 @@ class PolicyNode(Node):
         )
         self.sync.registerCallback(self.synced_obs_callback)
 
-        # ── Enable DJI camera ────────────────────────────────────────────────
         _dji_enable_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
@@ -234,23 +289,21 @@ class PolicyNode(Node):
         self._dji_enable_pub = self.create_publisher(Bool, '/dji_camera/enable', _dji_enable_qos)
         self.create_timer(0.5, self._enable_dji_camera)
 
-        # ── Observation buffers ──────────────────────────────────────────────
-        self.pose_buffer = []
-        self.cam_buffers = {k: [] for k in CAMERA_KEYS}
+        # ── Observation buffers (raw ~30 Hz; dt-spaced frames picked at pack time)
+        self.pose_buffer = []                                  # (raw7, t)
+        self.cam_buffers = {k: [] for k in CAMERA_KEYS}        # (img CHW float, t)
 
-        # ── Piezense side-channel (latest-value, not synchronized) ───────────
-        self._latest_piezense = np.array([111337.0, 110375.0], dtype=np.float32)  # training mean fallback
+        self._latest_piezense = np.array([111337.0, 110375.0], dtype=np.float32)
         self.piezense_buffer  = []
         self.create_subscription(
             PiezenseSystemArray, PIEZENSE_TOPIC, self._piezense_cb, 10
         )
 
-        # ── Timers ───────────────────────────────────────────────────────────
-        self.create_timer(1.0 / 30.0, self.update_observation)   # pack shared_obs
-        self.create_timer(1.0 / 30.0, self.control_callback)     # send velocity commands
+        self.create_timer(1.0 / 30.0, self.update_observation)
+        self.create_timer(1.0 / 30.0, self.control_callback)
 
         self.reset_to_home()
-        self.get_logger().info("PolicyNode ready. Press S to start, D to pause, R to reset.")
+        self.get_logger().info("PolicyNode (UMI) ready. Press S to start, D to pause, R to reset.")
 
     # ── Kinova setup ──────────────────────────────────────────────────────────
 
@@ -292,30 +345,32 @@ class PolicyNode(Node):
 
     # ── Observation callbacks ─────────────────────────────────────────────────
 
-    def synced_obs_callback(self, pose_msg, gripper_msg, wrist_msg):  # zed_msg removed
+    def synced_obs_callback(self, pose_msg, gripper_msg, wrist_msg):
         now = time.monotonic() - self.start_time
         self.gripper_state = gripper_msg.data
 
-        # Pose -> 10D
-        pose_10d = pose_msg_to_10d(pose_msg, self.gripper_state)
-        self.pose_buffer.append((pose_10d, now))
-        if len(self.pose_buffer) > OBS_HORIZON:
+        raw7 = pose_msg_to_raw(pose_msg, self.gripper_state)
+        self.pose_buffer.append((raw7, now))
+        if len(self.pose_buffer) > self.raw_buffer_len:
             self.pose_buffer.pop(0)
 
-        # Camera images
-        # for cam_key, msg in [("zed_front_rgb", zed_msg), ("dji_wrist_rgb", wrist_msg)]:
-        for cam_key, msg in [("dji_wrist_rgb", wrist_msg)]:
+        # Capture episode start pose on the first observation after a reset
+        # completes (mirrors training's demo_start_pose = episode's first frame).
+        if self.episode_start_pose_mat is None and not self.is_resetting:
+            self.episode_start_pose_mat = pose_to_mat(raw7[:6].astype(np.float64))
+            self.get_logger().info(
+                f"Episode start pose captured: xyz={np.round(raw7[:3], 4)}")
+
+        for cam_key in CAMERA_KEYS:
+            msg = wrist_msg
             img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
-            # dji_camera_node already publishes IMG_SIZE x IMG_SIZE (INTER_AREA),
-            # so no resize here — keeps inference latency identical to collection.
-            # Guard only resizes if a frame ever arrives at an unexpected size.
             if img.shape[0] != IMG_SIZE or img.shape[1] != IMG_SIZE:
                 img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
             img = img.astype(np.float32) / 255.0
             img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
             buf = self.cam_buffers[cam_key]
             buf.append((img, now))
-            if len(buf) > OBS_HORIZON:
+            if len(buf) > self.raw_buffer_len:
                 buf.pop(0)
 
     def _enable_dji_camera(self):
@@ -335,66 +390,97 @@ class PolicyNode(Node):
                 break
         now = time.monotonic() - self.start_time
         self.piezense_buffer.append((self._latest_piezense.copy(), now))
-        if len(self.piezense_buffer) > OBS_HORIZON:
+        if len(self.piezense_buffer) > self.raw_buffer_len:
             self.piezense_buffer.pop(0)
 
     def update_observation(self):
-        """Pack observation buffers into shared_obs for the GPU process."""
-        if len(self.pose_buffer) < OBS_HORIZON:
+        """Pack UMI-schema observation dict into shared_obs for the GPU process.
+
+        Obs frames are picked self.dt apart (training down_sample_steps spacing),
+        NOT consecutive ~30 Hz frames. Each key uses ITS OWN horizon from the
+        checkpoint's shape_meta (img and low_dim horizons may differ). If the
+        buffer doesn't yet span the full horizon, nearest-neighbor picking
+        repeats the earliest frame — the same start-of-episode padding the
+        training sampler used.
+        """
+        if not self.pose_buffer:
             return
         for k in CAMERA_KEYS:
-            if len(self.cam_buffers[k]) < OBS_HORIZON:
+            if not self.cam_buffers[k]:
                 return
+        if self.episode_start_pose_mat is None:
+            return
 
-        pose_slice = self.pose_buffer[-OBS_HORIZON:]
+        H = self.key_horizons  # per-key horizons from the checkpoint
 
-        # One-time diagnostic: log the obs rot6d vs expected training value
+        # Pose-derived keys share one raw stack at the max low-dim horizon;
+        # each key then takes its last H[key] rows (frames end at "now").
+        h_pose = max(H.get("robot0_eef_pos", OBS_HORIZON_FALLBACK),
+                     H.get("robot0_eef_rot_axis_angle", OBS_HORIZON_FALLBACK),
+                     H.get("robot0_eef_rot_axis_angle_wrt_start", OBS_HORIZON_FALLBACK),
+                     H.get("robot0_gripper_width", OBS_HORIZON_FALLBACK))
+        pose_slice = pick_frames_by_time(self.pose_buffer, h_pose, self.dt)
+        raw = np.stack([p[0] for p in pose_slice])              # (h_pose, 7)
+        pose_mat = pose_to_mat(raw[:, :6].astype(np.float64))   # (h_pose, 4, 4)
+
+        # abs mode: absolute pose -> [pos(3), rot6d ROWS(6)] via UMI's encoder
+        p10 = mat_to_pose10d(pose_mat)                          # (h_pose, 9)
+        # rotation relative to episode start (UMI's convert_pose_mat_rep, the
+        # exact function UmiDataset used in training)
+        rel_mat = convert_pose_mat_rep(
+            pose_mat, base_pose_mat=self.episode_start_pose_mat,
+            pose_rep='relative', backward=False)
+        rot_wrt_start = mat_to_pose10d(rel_mat)[:, 3:]          # (h_pose, 6)
+
         if not getattr(self, '_obs_logged', False):
             self._obs_logged = True
-            p10d = pose_slice[-1][0]
-            obs_euler = rot6d_to_euler_xyz(p10d[3:9])
+            mat_last = pose_mat[-1]
+            euler = R.from_matrix(mat_last[:3, :3]).as_euler("xyz", degrees=True)
             self.get_logger().info(
-                f"OBS diagnostic — pose rot6d={np.round(p10d[3:9], 4)}  "
-                f"→ decoded theta_xyz={np.round(obs_euler, 2)}  "
-                f"(expected ≈ [-179.3, -0.4, 89.3])"
-            )
+                f"OBS diagnostic (UMI) — pos={np.round(raw[-1, :3], 4)}  "
+                f"theta_xyz={np.round(euler, 2)} (expected ≈ [{HOME_TX}, {HOME_TY}, {HOME_TZ}])  "
+                f"width={raw[-1, 6]:.4f} m  obs spacing={self.dt}s  horizons={H}")
+
+        def tail(arr, key):
+            """Last H[key] rows of a stack whose frames end at 'now'."""
+            return arr[-H.get(key, OBS_HORIZON_FALLBACK):]
 
         obs_dict = {
-            "pose": torch.from_numpy(
-                np.stack([p[0] for p in pose_slice])
-            ).unsqueeze(0),  # (1, 2, 10)
+            "robot0_eef_pos": torch.from_numpy(
+                tail(p10[:, :3], "robot0_eef_pos").astype(np.float32)).unsqueeze(0),
+            "robot0_eef_rot_axis_angle": torch.from_numpy(
+                tail(p10[:, 3:], "robot0_eef_rot_axis_angle").astype(np.float32)).unsqueeze(0),
+            "robot0_eef_rot_axis_angle_wrt_start": torch.from_numpy(
+                tail(rot_wrt_start, "robot0_eef_rot_axis_angle_wrt_start").astype(np.float32)).unsqueeze(0),
+            "robot0_gripper_width": torch.from_numpy(
+                tail(raw[:, 6:7], "robot0_gripper_width").astype(np.float32)).unsqueeze(0),
             "pose_timestamps": np.array([p[1] for p in pose_slice]),
         }
 
         for cam_key in CAMERA_KEYS:
-            cam_slice = self.cam_buffers[cam_key][-OBS_HORIZON:]
+            h_img = H.get(cam_key, OBS_HORIZON_FALLBACK)
+            cam_slice = pick_frames_by_time(self.cam_buffers[cam_key], h_img, self.dt)
             obs_dict[cam_key] = torch.from_numpy(
                 np.stack([c[0] for c in cam_slice])
-            ).unsqueeze(0)  # (1, 2, 3, 224, 224)
+            ).unsqueeze(0)                                      # (1, h_img, 3, 224, 224)
             obs_dict[f"{cam_key}_timestamps"] = np.array([c[1] for c in cam_slice])
 
-        # Piezense: pad with last known value if buffer not yet full
-        if len(self.piezense_buffer) >= OBS_HORIZON:
-            pz_slice = self.piezense_buffer[-OBS_HORIZON:]
-        elif self.piezense_buffer:
-            pz_slice = [self.piezense_buffer[0]] * (OBS_HORIZON - len(self.piezense_buffer)) \
-                       + self.piezense_buffer
+        h_pz = H.get("piezense0_pressures", OBS_HORIZON_FALLBACK)
+        if self.piezense_buffer:
+            pz_slice = pick_frames_by_time(self.piezense_buffer, h_pz, self.dt)
         else:
-            pz_slice = [(np.zeros(PIEZENSE_INPUT_CHANNELS, dtype=np.float32), 0.0)] * OBS_HORIZON
+            pz_slice = [(np.zeros(PIEZENSE_INPUT_CHANNELS, dtype=np.float32), 0.0)] * h_pz
 
-        obs_dict["piezense_pressure"] = torch.from_numpy(
+        obs_dict["piezense0_pressures"] = torch.from_numpy(
             np.stack([p[0] for p in pz_slice])
-        ).unsqueeze(0)  # (1, 2, 2)
+        ).unsqueeze(0)                                          # (1, h_pz, 2)
 
         self.shared_obs["obs"] = obs_dict
 
-    # ── Velocity control ──────────────────────────────────────────────────────
+    # ── Velocity control (identical to inference.py) ──────────────────────────
 
     def control_callback(self):
-        """30 Hz: consume next target from shared_obs and drive the arm toward it."""
         if self.is_resetting:
-            # _do_home_reset owns all twist state during reset — sending zero here
-            # would continuously renew the watchdog and prevent ExecuteAction.
             self._smoothed_vel[:] = 0.0
             return
         if self.paused:
@@ -402,7 +488,6 @@ class PolicyNode(Node):
             self._send_zero_twist()
             return
 
-        # Snapshot targets once to avoid race with action_executor / reset threads
         target_xyz   = self.current_target_xyz
         target_euler = self.current_target_euler
         if target_xyz is None:
@@ -418,25 +503,18 @@ class PolicyNode(Node):
             ])
             current_tz = feedback.base.tool_pose_theta_z
 
-            # Linear P-loop
             pos_err = target_xyz - current_xyz
             raw_vel = P_GAIN * pos_err
             speed = np.linalg.norm(raw_vel)
             if speed > MAX_LINEAR_SPEED:
                 raw_vel *= MAX_LINEAR_SPEED / speed
 
-            # Velocity smoothing
             self._smoothed_vel = VEL_ALPHA * raw_vel + (1.0 - VEL_ALPHA) * self._smoothed_vel
             send_vel = self._smoothed_vel.copy()
             smooth_speed = np.linalg.norm(send_vel)
             if smooth_speed > MAX_LINEAR_SPEED:
                 send_vel *= MAX_LINEAR_SPEED / smooth_speed
 
-            # Angular P-loop in world/base frame.
-            # CARTESIAN_REFERENCE_FRAME_BASE puts angular_z in the world Z axis,
-            # so the P-loop sign is correct regardless of tool orientation.
-            # (CARTESIAN_REFERENCE_FRAME_MIXED uses tool-frame angular, which at
-            # theta_x≈-180° maps world +Z → tool -Z, inverting the sign.)
             ang_vel_z = 0.0
             if target_euler is not None:
                 tz_err = (target_euler[2] - current_tz + 180.0) % 360.0 - 180.0
@@ -458,14 +536,11 @@ class PolicyNode(Node):
             self._send_zero_twist()
 
     def _execute_action(self, action_10d: np.ndarray):
-        """Accept a 10D policy action and update the tracked target."""
-        pos = action_10d[:3].copy()
+        """Accept a UMI 10D policy action [pos, rot6d ROWS, width_m] and update targets."""
+        pos, euler_deg, grip = action10d_to_pos_euler_grip(action_10d)
         pos[0] = np.clip(pos[0], WS_X[0], WS_X[1])
         pos[1] = np.clip(pos[1], WS_Y[0], WS_Y[1])
         pos[2] = np.clip(pos[2], WS_Z[0], WS_Z[1])
-
-        euler_deg = rot6d_to_euler_xyz(action_10d[3:9])
-        grip = float(np.clip(action_10d[9], 0.0, 1.0))
 
         self.current_target_xyz   = pos
         self.current_target_euler = euler_deg
@@ -475,10 +550,9 @@ class PolicyNode(Node):
             self._action_logged = True
             self.get_logger().info(
                 f"First action target: xyz={np.round(pos, 4)}  "
-                f"theta_xyz={np.round(euler_deg, 2)}  grip={grip:.3f}"
-            )
+                f"theta_xyz={np.round(euler_deg, 2)}  "
+                f"width={action_10d[9]:.4f} m -> grip={grip:.3f}")
 
-        # Gripper command
         try:
             gc = Base_pb2.GripperCommand()
             gc.mode = Base_pb2.GRIPPER_POSITION
@@ -511,14 +585,13 @@ class PolicyNode(Node):
         self.shared_obs["paused"] = True
         self.current_target_xyz = None
         self._smoothed_vel[:] = 0.0
+        self.episode_start_pose_mat = None   # re-anchor _wrt_start on next obs
         self.is_resetting = True
         threading.Thread(target=self._do_home_reset, daemon=True).start()
 
     def _do_home_reset(self):
         try:
             self._send_zero_twist()
-            # 1 s gives the watchdog time to expire AND lets any in-flight
-            # ACTION_END/ABORT notifications drain before we register the new listener.
             time.sleep(1.0)
 
             action = Base_pb2.Action()
@@ -545,7 +618,6 @@ class PolicyNode(Node):
                 self.get_logger().warn("Home reset timed out")
                 self._base.StopAction()
 
-            # Open gripper
             gc = Base_pb2.GripperCommand()
             gc.mode = Base_pb2.GRIPPER_POSITION
             f = gc.gripper.finger.add()
@@ -576,11 +648,11 @@ class PolicyNode(Node):
 
 def inference_loop(model_path, shared_obs, action_queue,
                    n_action_steps=8, device="cuda", start_time=0,
-                   dt=0.033, num_inference_steps=16,
+                   dt=0.1, num_inference_steps=16,
                    latency_offset_s=0.0):
     """GPU process: load model and run inference, posting targets to the main process."""
     import sys as _sys
-    _sys.stdout.reconfigure(line_buffering=True)  # force line-flush in spawned subprocess
+    _sys.stdout.reconfigure(line_buffering=True)
 
     latency_steps = max(0, round(latency_offset_s / dt))
     if latency_steps:
@@ -590,12 +662,10 @@ def inference_loop(model_path, shared_obs, action_queue,
     model_obs_keys = load_obs_keys(model_path)
     print(f"Model expects obs keys: {model_obs_keys}", flush=True)
 
-    # Wait for first observation
     while shared_obs.get("obs") is None:
         time.sleep(0.05)
         print("Waiting for first observation...", flush=True)
 
-    # Track timestamp freshness
     prev_timestamps = {}
     obs_now = shared_obs["obs"]
     if "pose_timestamps" in obs_now:
@@ -605,7 +675,7 @@ def inference_loop(model_path, shared_obs, action_queue,
         if ts_key in obs_now:
             prev_timestamps[cam_key] = obs_now[ts_key][-1]
 
-    print("Inference loop started.", flush=True)
+    print("Inference loop started (UMI pipeline).", flush=True)
     _actions_logged = False
 
     while True:
@@ -615,18 +685,19 @@ def inference_loop(model_path, shared_obs, action_queue,
 
         loop_start = time.time()
 
-        # Wait until all sensors have fresh data
+        # Wait until the LATEST obs frame is fresh (obs frames are dt apart by
+        # construction, so we compare the newest timestamp, not the window min).
         wait_start = time.time()
         while True:
             obs_now = shared_obs["obs"]
             all_new = True
             if "pose_timestamps" in obs_now:
-                if np.min(obs_now["pose_timestamps"]) <= prev_timestamps.get("pose", -1):
+                if obs_now["pose_timestamps"][-1] <= prev_timestamps.get("pose", -1):
                     all_new = False
             for cam_key in CAMERA_KEYS:
                 ts_key = f"{cam_key}_timestamps"
                 if ts_key in obs_now:
-                    if np.min(obs_now[ts_key]) <= prev_timestamps.get(cam_key, -1):
+                    if obs_now[ts_key][-1] <= prev_timestamps.get(cam_key, -1):
                         all_new = False
             if all_new:
                 break
@@ -637,7 +708,6 @@ def inference_loop(model_path, shared_obs, action_queue,
 
         wait_time = time.time() - wait_start
 
-        # Update timestamps
         if "pose_timestamps" in obs_now:
             prev_timestamps["pose"] = obs_now["pose_timestamps"][-1]
         for cam_key in CAMERA_KEYS:
@@ -645,14 +715,12 @@ def inference_loop(model_path, shared_obs, action_queue,
             if ts_key in obs_now:
                 prev_timestamps[cam_key] = obs_now[ts_key][-1]
 
-        # Build model obs dict (filter to expected keys, move to GPU)
         model_obs = {}
         for k in model_obs_keys:
             if k in obs_now:
                 v = obs_now[k]
                 model_obs[k] = v.to(device) if isinstance(v, torch.Tensor) else v
 
-        # Run inference
         t_infer = time.time()
         with torch.no_grad():
             actions = policy.predict_action(model_obs)["action"][0].detach().cpu().numpy()
@@ -662,8 +730,6 @@ def inference_loop(model_path, shared_obs, action_queue,
             _actions_logged = True
             print(f"predict_action output: {actions.shape[0]} steps × {actions.shape[1]} dims", flush=True)
 
-        # Schedule n_action_steps steps with timestamps, skipping latency_steps
-        # to account for system delay between observation capture and execution.
         t_start = time.monotonic()
         action_queue.put(("CLEAR_PENDING", t_start))
         start_idx = min(latency_steps, len(actions) - 1)
@@ -671,10 +737,10 @@ def inference_loop(model_path, shared_obs, action_queue,
             ts = t_start + i * dt
             action_queue.put((act, ts))
 
-        # Debug: log first predicted action in physical Euler angles
         a0 = actions[start_idx]
-        euler = rot6d_to_euler_xyz(a0[3:9])
-        print(f"Inference: {infer_time*1000:.0f}ms | act[0] xyz={a0[:3]} theta_xyz={euler}", flush=True)
+        pos, euler, grip = action10d_to_pos_euler_grip(a0)
+        print(f"Inference: {infer_time*1000:.0f}ms | act[0] xyz={np.round(pos,4)} "
+              f"theta_xyz={np.round(euler,2)} width={a0[9]:.4f}m grip={grip:.3f}", flush=True)
 
         total_time = time.time() - loop_start
         print(f"  Wait: {wait_time*1000:.0f}ms | Total: {total_time*1000:.0f}ms | Actions: {n_action_steps}", flush=True)
@@ -685,11 +751,10 @@ def inference_loop(model_path, shared_obs, action_queue,
 # ── Pygame control window ──────────────────────────────────────────────────────
 
 def monitor_keys(policy_node: PolicyNode, shared_obs: dict):
-    """Background thread: pygame window for pause / resume / reset."""
     try:
         pygame.init()
         screen = pygame.display.set_mode((340, 210))
-        pygame.display.set_caption("Kinova Policy Control")
+        pygame.display.set_caption("Kinova Policy Control (UMI)")
         clock = pygame.time.Clock()
         font       = pygame.font.SysFont("monospace", 18)
         font_small = pygame.font.SysFont("monospace", 14)
@@ -741,14 +806,14 @@ def monitor_keys(policy_node: PolicyNode, shared_obs: dict):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Diffusion Policy Inference — Kinova Gen3")
-    parser.add_argument("--model",           type=str, required=True,  help="Path to .ckpt file")
-    parser.add_argument("--dt",              type=float, default=0.1,   help="Action step period (s)")
+    parser = argparse.ArgumentParser(description="Diffusion Policy Inference (UMI pipeline) — Kinova Gen3")
+    parser.add_argument("--model",           type=str, required=True,  help="Path to UMI-pipeline .ckpt")
+    parser.add_argument("--dt",              type=float, default=0.1,  help="Action step period (s); must match "
+                                                                            "training obs_down_sample_steps/30Hz (3/30 = 0.1)")
     parser.add_argument("--n-action-steps",  type=int,   default=8,    help="Actions executed per inference cycle")
     parser.add_argument("--diffusion-steps", type=int,   default=16,   help="DDIM inference steps")
     parser.add_argument("--latency-offset-s", type=float, default=0.0,
-                        help="System latency to compensate (seconds). Skips this many steps at the "
-                             "start of each predicted action sequence. Measure with latency_calculation.py.")
+                        help="System latency to compensate (seconds)")
     parser.add_argument("--no-pygame",       action="store_true",      help="Disable pygame window")
     args = parser.parse_args()
 
@@ -765,14 +830,11 @@ def main():
 
     print(f"Model:           {args.model}")
     print(f"dt:              {args.dt}s  ({1/args.dt:.0f} Hz)")
-    print(f"Obs horizon:     {OBS_HORIZON}")
-    print(f"Num Action steps:  {args.n_action_steps}")
+    print(f"Obs horizons:    read from checkpoint shape_meta (frames {args.dt}s apart)")
+    print(f"Num Action steps:{args.n_action_steps}")
     print(f"Diffusion steps: {args.diffusion_steps}")
-    if args.latency_offset_s:
-        print(f"Latency offset:  {args.latency_offset_s*1000:.0f} ms "
-              f"({round(args.latency_offset_s / args.dt)} steps)")
+    print(f"Gripper:         width_m = {GRIPPER_MAX_WIDTH_M} * (1 - kortex_norm)")
 
-    # GPU inference process
     inf_proc = Process(
         target=inference_loop,
         args=(args.model, shared_obs, action_queue,
@@ -782,9 +844,8 @@ def main():
     )
     inf_proc.start()
 
-    node = PolicyNode(shared_obs, start_time, args.model)
+    node = PolicyNode(shared_obs, start_time, args.model, args.dt)
 
-    # Action execution thread: drains action_queue and calls _execute_action at scheduled times
     def action_executor():
         pending = []
         while True:

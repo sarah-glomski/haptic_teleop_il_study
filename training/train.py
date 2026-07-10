@@ -1,14 +1,16 @@
 """
-Training entry point for diffusion policy on Kinova Gen3 teleop data.
+Training entry point (charm-lab UMI pipeline, real universal_manipulation_interface).
 
-Adapted from Robomimic/training/train.py for the HoloLens + Kinova Gen3 setup.
-Adds the UMI codebase (dt_ag-main) and this training directory to sys.path,
-registers Hydra resolvers, then delegates to TrainDiffusionUnetImageWorkspace.
+Points sys.path at the real UMI repo (HapticTeleopIL/.../universal_manipulation_interface)
+and config_path at training/config/, so `--config-name=train_diffusion_unet_timm_kinova`
+resolves its `defaults: - task: kinova_teleop` against config/task/kinova_teleop.yaml
+(UmiDataset, per-signal robot0_*/camera0_* schema).
 
-Usage:
-    python train.py --config-name=train_diffusion_unet_timm_kinova
-    python train.py --config-name=train_diffusion_unet_timm_kinova training.debug=True
-    python train.py --config-name=train_diffusion_unet_timm_kinova logging.mode=disabled
+Run in the `umi` conda env, from training/:
+    python train.py --config-name=train_diffusion_unet_timm_kinova \
+        task.dataset_path=../data_collection/demo_data/Collection5.5/kinova_teleop_umi.zarr.zip
+
+The dataset .zarr.zip is produced by convert_data.py (UMI ReplayBuffer schema).
 """
 
 import os
@@ -16,17 +18,12 @@ import sys
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# UMI / diffusion_policy codebase (shared with Robomimic)
-_UMI_ROOT = os.path.join(_THIS_DIR, "..", "..", "Robomimic", "dt_ag-main")
-_UMI_DP   = os.path.join(_UMI_ROOT, "universal_manipulation_interface")
+# Real UMI repo (charm-lab/HapticTeleopIL clone)
+_UMI_ROOT = os.path.join(_THIS_DIR, "..", "..", "HapticTeleopIL",
+                         "Imitation Learning", "universal_manipulation_interface")
 
-for p in [_UMI_DP, _UMI_ROOT]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-# Make kinova_dataset importable by Hydra
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
+if _UMI_ROOT not in sys.path:
+    sys.path.insert(0, _UMI_ROOT)
 
 import hydra
 from omegaconf import OmegaConf

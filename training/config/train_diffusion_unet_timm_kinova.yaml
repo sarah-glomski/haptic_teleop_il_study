@@ -1,3 +1,17 @@
+# Training config. Copied from the real UMI repo's
+# diffusion_policy/config/train_diffusion_unet_timm_kinova_teleop_workspace.yaml
+# (charm-lab/HapticTeleopIL).
+#
+# Launch (umi conda env, from training/):
+#   python train.py --config-name=train_diffusion_unet_timm_kinova \
+#       task.dataset_path=../data_collection/demo_data/Collection5.5/kinova_teleop_umi.zarr.zip
+#
+# train.py points sys.path at the real UMI repo and config_path at config/, so
+# `defaults: - task: kinova_teleop` below resolves to config/task/kinova_teleop.yaml.
+#
+# Batch: 8 x gradient_accumulate_every 8 = effective 64 (lr 3e-4 / warmup 2000
+# are paired with it).
+
 defaults:
   - _self_
   - task: kinova_teleop
@@ -7,7 +21,7 @@ _target_: diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainD
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: "default"
+exp_name: "umi_v1"
 
 n_action_steps: 8
 
@@ -51,7 +65,7 @@ policy:
 
     use_group_norm: True
     share_rgb_model: False
-    imagenet_norm: True
+    imagenet_norm: True   # NOTE: confirmed dead/unused param in this encoder version — no effect either way
 
   num_inference_steps: 16
   obs_as_global_cond: True
@@ -71,15 +85,17 @@ ema:
   min_value: 0.0
   max_value: 0.9999
 
+# effective batch = batch_size (8) * training.gradient_accumulate_every (8) = 64
+# (RTX 5070 12GB cannot fit a literal batch of 64)
 dataloader:
-  batch_size: 1
+  batch_size: 8
   num_workers: 4
   shuffle: True
   pin_memory: True
   persistent_workers: True
 
 val_dataloader:
-  batch_size: 1
+  batch_size: 8
   num_workers: 4
   shuffle: False
   pin_memory: True
@@ -98,21 +114,27 @@ training:
   debug: False
   resume: False
   lr_scheduler: cosine
-  lr_warmup_steps: 500
-  num_epochs: 120
-  gradient_accumulate_every: 1
+  lr_warmup_steps: 2000
+  num_epochs: 121   # 121 (not 120) so the last epoch (120) is a multiple of
+                    # checkpoint_every (30) -> a checkpoint lands on the final epoch.
+                    # 0-indexed loop runs 0..120; with 120 the last ckpt was epoch 90.
+  gradient_accumulate_every: 8   # x batch_size 8 = effective batch 64
   use_ema: True
   freeze_encoder: False
-  rollout_every: 999999
-  checkpoint_every: 10
-  val_every: 5
+  rollout_every: 999999   # was: 10 — env_runner is RealPushTImageRunner, a complete
+                          # stub (no hardware), so this made no functional difference,
+                          # but 999999 matches our safety convention (see lab notes §10)
+                          # in case a real Kinova runner is ever wired in later
+  checkpoint_every: 30
+  val_every: 1
   sample_every: 5
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
 
 logging:
-  project: 'Haptic Teleop IL Study'
+  project: 'Haptic Teleop IL Study - UMI migration'  # wandb project (kept stable so
+                                                        # runs don't fragment across projects)
   resume: False
   mode: online
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}

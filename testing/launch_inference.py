@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """
-Launch file for diffusion policy inference on Kinova Gen3.
+Launch file for diffusion policy inference (charm-lab UMI pipeline).
 
-Adapted from Robomimic/testing/launch_inference.py for the HoloLens + Kinova Gen3
-setup (ZED front camera + DJI wrist camera, Kortex velocity control).
-
-Starts all required nodes:
-  1. ZED M camera            — /zed_front/zed_node/left/image_rect_color
-  2. DJI wrist camera        — /dji_wrist/dji_wrist/color/image_raw
-  3. kinova_state_publisher  — robot_obs/pose, robot_obs/gripper
-  4. piezense_driver         — piezense/data
-  5. inference.py            — loads policy, runs predict_action(), controls robot
+Starts kinova_state_publisher, dji_camera_node, and inference.py, which expects
+checkpoints trained by train.py (UMI obs/action schema — robot0_*/camera0_* keys).
 
 Usage:
     python launch_inference.py --model /path/to/checkpoint.ckpt
-    python launch_inference.py --model data/outputs/.../last.ckpt --action-horizon 4
-    python launch_inference.py --model last.ckpt --latest   # find latest checkpoint automatically
+    python launch_inference.py --latest   # newest training run's latest.ckpt
 """
 
 import argparse
@@ -25,7 +17,6 @@ import sys
 
 from launch import LaunchDescription, LaunchService
 from launch.actions import ExecuteProcess
-from launch_ros.actions import Node
 
 
 _PYTHON = sys.executable
@@ -38,27 +29,26 @@ _INFERENCE_SCRIPT = os.path.join(_THIS_DIR, "inference.py")
 
 
 def find_latest_checkpoint(search_dir: str) -> str:
-    """Find latest.ckpt if it exists, otherwise the most recently modified .ckpt."""
+    """Most recently modified latest.ckpt across all training runs.
+
+    inference.py hard-rejects non-UMI-schema checkpoints at load time.
+    """
     ckpts = glob.glob(os.path.join(search_dir, "**", "*.ckpt"), recursive=True)
     if not ckpts:
-        raise FileNotFoundError(f"No .ckpt files found under {search_dir}")
-    # Prefer the most-recently-modified latest.ckpt (newest training run);
-    # fall back to the newest .ckpt of any name.
+        raise FileNotFoundError(
+            f"No checkpoints found under {search_dir} "
+            f"(train one with train.py first, or pass --model explicitly)")
     latest = [c for c in ckpts if os.path.basename(c) == "latest.ckpt"]
     if latest:
         return max(latest, key=os.path.getmtime)
     return max(ckpts, key=os.path.getmtime)
 
 
-ZED_SERIAL = "17875187"
-
-
 def generate_launch_description(
     model_path: str,
     robot_ip: str = "192.168.1.10",
-    zed_serial: str = ZED_SERIAL,
     dji_device: int = 0,
-    dt: float = 0.033,
+    dt: float = 0.1,
     n_action_steps: int = 8,
     diffusion_steps: int = 16,
     latency_offset_s: float = 0.0,
@@ -78,28 +68,7 @@ def generate_launch_description(
 
     return LaunchDescription([
 
-        # ── 1. ZED M camera — front view ──────────────────────────────────────
-        # Node(
-        #     package="zed_wrapper",
-        #     executable="zed_wrapper",
-        #     name="zed_node",
-        #     namespace="zed_front",
-        #     output="screen",
-        #     parameters=[{
-        #         "camera_model":    "zedm",
-        #         "camera_name":     "zed_front",
-        #         "serial_number":   int(zed_serial) if zed_serial else 0,
-        #         "grab_resolution": "HD720",
-        #         "grab_frame_rate": 30,
-        #         "pub_frame_rate":  30.0,
-        #         "general.grab_frame_rate": 30,
-        #         "depth.depth_mode": 1,
-        #         "video.extrinsic_in_camera_frame": False,
-        #     }],
-        # ),
-
-        # ── 2. DJI Osmo Action 4 — wrist camera ───────────────────────────────
-        # Remapped to /dji_wrist/dji_wrist/color/image_raw to match inference.py
+        # ── DJI Osmo Action 4 — wrist camera ───────────────────────────────
         ExecuteProcess(
             cmd=[
                 '/usr/bin/python3.12', _DJI_CAMERA_NODE,
@@ -111,7 +80,7 @@ def generate_launch_description(
             output="screen",
         ),
 
-        # ── 3. Kinova Gen3 state publisher ────────────────────────────────────
+        # ── Kinova Gen3 state publisher ────────────────────────────────────
         ExecuteProcess(
             cmd=[
                 _PYTHON, _KINOVA_STATE_PUB,
@@ -121,14 +90,7 @@ def generate_launch_description(
             output="screen",
         ),
 
-        # # ── 4. Piezense pressure sensor driver ────────────────────────────────
-        # ExecuteProcess(
-        #     cmd=["ros2", "launch", "piezense_ros", "ar_teleop_piezense_launch.py"],
-        #     name="piezense_driver",
-        #     output="screen",
-        # ),
-
-        # ── 5. Diffusion policy inference (controls robot via Kortex API) ──────
+        # ── Diffusion policy inference (UMI pipeline) ──────────────────────
         ExecuteProcess(
             cmd=inference_cmd,
             name="policy_inference",
@@ -139,37 +101,32 @@ def generate_launch_description(
 
 def main(argv=sys.argv[1:]):
     parser = argparse.ArgumentParser(
-        description="Launch diffusion policy inference for Kinova Gen3"
+        description="Launch diffusion policy inference (UMI pipeline) for Kinova Gen3"
     )
     parser.add_argument("--model",           type=str,   default=None,
-                        help="Path to .ckpt checkpoint file")
+                        help="Path to UMI-pipeline .ckpt checkpoint file")
     parser.add_argument("--latest",          action="store_true",
-                        help="Find and use the latest checkpoint in training/data/outputs/")
-    parser.add_argument("--robot-ip",        type=str,   default="192.168.1.10",
-                        help="Kinova Gen3 IP address (default: 192.168.1.10)")
-    parser.add_argument("--zed-serial",      type=str,   default=ZED_SERIAL,
-                        help=f"ZED M serial number (default: {ZED_SERIAL})")
+                        help="Use the newest run's checkpoint in training/data/outputs/")
+    parser.add_argument("--robot-ip",        type=str,   default="192.168.1.10")
     parser.add_argument("--dji-device",      type=int,   default=0,
                         help="V4L2 device index for DJI wrist camera (default: 0)")
-    parser.add_argument("--dt",              type=float, default=0.033,
-                        help="Action step period in seconds (default: 0.033 = 30 Hz)")
+    parser.add_argument("--dt",              type=float, default=0.1,
+                        help="Action step period in seconds (default: 0.1 = 10 Hz, "
+                             "matching training obs_down_sample_steps 3 @ 30 Hz)")
     parser.add_argument("--n-action-steps",  type=int,   default=8,
                         help="Actions to execute per inference cycle (default: 8)")
     parser.add_argument("--diffusion-steps", type=int,   default=16,
                         help="DDIM inference steps (default: 16)")
     parser.add_argument("--latency-offset-s", type=float, default=0.0,
-                        help="System latency to compensate in seconds (default: 0). "
-                             "Skips this many steps at the start of each predicted action sequence. "
-                             "Measure with latency_calculation.py.")
+                        help="System latency to compensate in seconds (default: 0)")
     parser.add_argument("--no-pygame",       action="store_true",
                         help="Disable pygame keyboard control window")
     args, launch_argv = parser.parse_known_args(argv)
 
-    # Resolve checkpoint path
     if args.latest:
         outputs_dir = os.path.join(_THIS_DIR, "..", "training", "data", "outputs")
         args.model = find_latest_checkpoint(outputs_dir)
-        print(f"Using latest checkpoint: {args.model}")
+        print(f"Using latest UMI checkpoint: {args.model}")
     elif args.model is None:
         parser.error("Provide --model /path/to/checkpoint.ckpt or use --latest")
 
@@ -177,14 +134,13 @@ def main(argv=sys.argv[1:]):
         parser.error(f"Checkpoint not found: {args.model}")
 
     print("=" * 60)
-    print("Diffusion Policy Inference — Kinova Gen3")
+    print("Diffusion Policy Inference (UMI pipeline) — Kinova Gen3")
     print("=" * 60)
     print(f"  Model:           {args.model}")
     print(f"  Robot IP:        {args.robot_ip}")
-    print(f"  ZED serial:      {args.zed_serial or '(auto-detect)'}")
     print(f"  DJI device:      /dev/video{args.dji_device}")
     print(f"  dt:              {args.dt}s  ({1/args.dt:.0f} Hz)")
-    print(f"  Num action steps:  {args.n_action_steps}")
+    print(f"  Num action steps:{args.n_action_steps}")
     print(f"  Diffusion steps: {args.diffusion_steps}")
     if args.latency_offset_s:
         print(f"  Latency offset:  {args.latency_offset_s*1000:.0f} ms "
@@ -194,19 +150,17 @@ def main(argv=sys.argv[1:]):
     print("  S - Start / Resume | D - Done / Pause | R - Reset home | Q - Quit")
     print("=" * 60)
 
-    ld = generate_launch_description(
+    ls = LaunchService(argv=launch_argv)
+    ls.include_launch_description(generate_launch_description(
         model_path=args.model,
         robot_ip=args.robot_ip,
-        zed_serial=args.zed_serial,
         dji_device=args.dji_device,
         dt=args.dt,
         n_action_steps=args.n_action_steps,
         diffusion_steps=args.diffusion_steps,
         latency_offset_s=args.latency_offset_s,
         no_pygame=args.no_pygame,
-    )
-    ls = LaunchService(argv=launch_argv)
-    ls.include_launch_description(ld)
+    ))
     return ls.run()
 
 
