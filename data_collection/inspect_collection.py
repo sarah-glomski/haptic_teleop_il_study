@@ -344,12 +344,20 @@ def main():
         print(f'No episode_*.hdf5 files found in {args.collection}')
         sys.exit(1)
 
-    # Skip episodes already in exclude.txt
+    # Skip episodes fully dropped in exclude.txt (ignore `crop` lines / comments,
+    # which inspect_transitions.py writes for downstream end-cropping).
     exclude_file = os.path.join(args.collection, 'exclude.txt')
     excluded = set()
     if os.path.exists(exclude_file):
         with open(exclude_file) as f:
-            excluded = {line.strip() for line in f if line.strip()}
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == 'crop':
+                    continue
+                excluded.add(parts[0])
         if excluded:
             print(f'Skipping {len(excluded)} excluded episodes: {", ".join(sorted(excluded))}')
     paths = [p for p in paths

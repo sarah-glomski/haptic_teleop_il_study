@@ -42,6 +42,8 @@ from launch import LaunchDescription, LaunchService
 from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
 
+from launch_rosbridge import make_rosbridge_node, start_discovery_broadcaster
+
 
 _PYTHON = '/usr/bin/python3.12'
 
@@ -68,26 +70,11 @@ def generate_launch_description(
 
         # ── 1. rosbridge WebSocket server ─────────────────────────────────────
         # The HoloLens Unity app connects to ws://<host-ip>:9090.
+        # Shared definition with launch_rosbridge.py via make_rosbridge_node().
         # Skip with --no-rosbridge when rosbridge is already running so the
-        # HoloLens stays connected across pipeline restarts.
-        # Force system python3 in PATH so the #!/usr/bin/env python3 shebang
-        # doesn't resolve to miniforge Python 3.13 (which lacks rclpy C extensions).
-        *([Node(
-            package='rosbridge_server',
-            executable='rosbridge_websocket',
-            name='rosbridge_websocket',
-            output='screen',
-            parameters=[{
-                'port': 9090,
-                'address': '',
-            }],
-            additional_env={
-                'PATH': ':'.join(
-                    p for p in os.environ.get('PATH', '').split(':')
-                    if 'miniforge' not in p and 'conda' not in p
-                ),
-            },
-        )] if not no_rosbridge else []),
+        # HoloLens stays connected across pipeline restarts. The matching
+        # discovery broadcaster is started in main() only when we own rosbridge.
+        *([make_rosbridge_node()] if not no_rosbridge else []),
 
         # ── 2. HoloLens TF publisher ──────────────────────────────────────────
         ExecuteProcess(
@@ -212,7 +199,7 @@ def main(argv=sys.argv[1:]):
     print('  Make sure the HoloLens app is pointed at ws://<this-machine-ip>:9090')
     print()
     print('Keyboard controls (pygame window):')
-    print('  R - Reset robot   S - Start   D - Done/Save')
+    print('  R - Reset robot   S - Start   D - Done/Save   C - Cancel/discard')
     print('  P - Pause         U - Unpause Q - Quit')
     print('=' * 60)
 
@@ -244,6 +231,11 @@ def main(argv=sys.argv[1:]):
         if probe.returncode == 0:
             print('Rosbridge already running on port 9090 — skipping launch (HoloLens connection preserved)')
             args.no_rosbridge = True
+
+    # Broadcast the discovery URL only when this process owns the rosbridge.
+    # When --no-rosbridge is set, launch_rosbridge.py is already broadcasting.
+    if not args.no_rosbridge:
+        start_discovery_broadcaster()
 
     ld = generate_launch_description(
         robot_ip=args.robot_ip,

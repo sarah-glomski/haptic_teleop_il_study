@@ -13,7 +13,7 @@ KinovaImageDataset.
 Output zarr schema:
   output.zarr/
   ├── data/
-  │   ├── zed_front_rgb:      (N, 224, 224, 3)  uint8   HWC
+  │   ├── zed_isometric_rgb:  (N, 224, 224, 3)  uint8   HWC
   │   ├── dji_wrist_rgb:      (N, 224, 224, 3)  uint8   HWC
   │   ├── pose:               (N, 10)            float32 [xyz, rot6d, gripper_obs]
   │   ├── action:             (N, 10)            float32 [xyz, rot6d, gripper_cmd]
@@ -40,9 +40,35 @@ from scipy.spatial.transform import Rotation
 IMG_SIZE = 224
 
 CAMERA_KEYS = {
-    "images/zed_front": "zed_front_rgb",
-    "images/dji_wrist":  "dji_wrist_rgb",
+    "images/zed_isometric": "zed_isometric_rgb",   # matches the HDF5 key + task shape_meta
+    "images/dji_wrist":     "dji_wrist_rgb",
 }
+
+
+def parse_exclude(exclude_path: str):
+    """Read a curation exclude.txt written by inspect_transitions.py.
+
+    Format (originals are never modified — crops are applied here at read time):
+        episode_N              drop the whole episode
+        episode_N crop S E     keep frames [S:E) (end-crop)
+
+    Returns (full_drops:set[str], crops:dict[str,(start,end)]).
+    """
+    full, crops = set(), {}
+    if not os.path.exists(exclude_path):
+        return full, crops
+    with open(exclude_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            name = parts[0]
+            if len(parts) >= 4 and parts[1] == "crop":
+                crops[name] = (int(parts[2]), int(parts[3]))
+            else:
+                full.add(name)
+    return full, crops
 
 
 def quat_xyzw_to_10d(pose_7: np.ndarray, gripper: np.ndarray) -> np.ndarray:
@@ -74,6 +100,16 @@ def convert(input_dir: str, output_path: str, max_episodes: int = None):
         print(f"No episode_*.hdf5 files found in {input_dir}")
         return
 
+    # Curation: drop fully-excluded episodes and end-crop the rest per exclude.txt.
+    full_drops, crops = parse_exclude(os.path.join(input_dir, "exclude.txt"))
+    if full_drops:
+        h5_files = [p for p in h5_files if p.stem not in full_drops]
+        print(f"exclude.txt: dropping {len(full_drops)} episode(s): "
+              f"{', '.join(sorted(full_drops))}")
+    if crops:
+        print(f"exclude.txt: end-cropping {len(crops)} episode(s): "
+              f"{', '.join(f'{n}[{s}:{e}]' for n, (s, e) in sorted(crops.items()))}")
+
     if max_episodes is not None:
         h5_files = h5_files[:max_episodes]
 
@@ -89,11 +125,14 @@ def convert(input_dir: str, output_path: str, max_episodes: int = None):
     for ep_idx, h5_path in enumerate(h5_files):
         print(f"  [{ep_idx + 1}/{len(h5_files)}] {h5_path.name} ", end="")
 
+        # End-crop window [cs:ce) — keeps timing intact (start never moved).
+        cs, ce = crops.get(h5_path.stem, (0, None))
+
         with h5py.File(h5_path, "r") as f:
-            obs_pose = f["observation/pose"][:]
-            obs_grip = f["observation/gripper"][:]
-            act_pose = f["action/pose"][:]
-            act_grip = f["action/gripper"][:]
+            obs_pose = f["observation/pose"][cs:ce]
+            obs_grip = f["observation/gripper"][cs:ce]
+            act_pose = f["action/pose"][cs:ce]
+            act_grip = f["action/gripper"][cs:ce]
 
             pose_10d   = quat_xyzw_to_10d(obs_pose, obs_grip)
             action_10d = quat_xyzw_to_10d(act_pose, act_grip)
@@ -102,15 +141,18 @@ def convert(input_dir: str, output_path: str, max_episodes: int = None):
             cam_data = {}
             for h5_key, zarr_key in CAMERA_KEYS.items():
                 if h5_key in f:
-                    cam_data[zarr_key] = resize_images(f[h5_key][:], IMG_SIZE)
+                    cam_data[zarr_key] = resize_images(f[h5_key][cs:ce], IMG_SIZE)
                 else:
                     print(f"\n    Warning: {h5_key} not found, skipping")
 
             if "piezense/pressure_input" in f:
-                piezense = f["piezense/pressure_input"][:].astype(np.float32)
+                piezense = f["piezense/pressure_input"][cs:ce].astype(np.float32)
             else:
                 print("\n    Warning: piezense/pressure_input not found, writing zeros")
                 piezense = np.zeros((T, 2), dtype=np.float32)
+
+        if h5_path.stem in crops:
+            print(f"[crop {cs}:{ce}] ", end="")
 
         ep_data = {
             "pose":              pose_10d,

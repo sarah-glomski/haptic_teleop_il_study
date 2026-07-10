@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 """
+============================================================================
+DEPRECATED — DO NOT USE.  Use training/convert_data.py instead.
+============================================================================
+This converter encodes rotations with a DIFFERENT, incompatible convention
+than training/convert_data.py (pytorch3d rows + a misread quaternion, vs.
+scipy columns + the correct quaternion). Data made here will NOT match the
+inference decoder (testing/inference.py), which is aligned to convert_data.py
+— training with this script silently produces the ~90° wrist-rotation bug.
+convert_data.py is now the single canonical converter (correct rotation, correct
+ZED key `images/zed_isometric`, and exclude.txt drop + end-crop support).
+Kept only for reference; running it requires --force.
+============================================================================
+
 Convert HDF5 episodes (from hdf5_data_collector.py) to UMI-style flat zarr
 format for diffusion policy training.
 
@@ -38,6 +51,14 @@ import argparse
 import glob
 import os
 import sys
+
+# Deprecation guard — fail fast before heavy imports (rotation_transformer/pytorch3d).
+if __name__ == '__main__' and '--force' not in sys.argv:
+    sys.exit(
+        "\nDEPRECATED: hdf5_to_zarr.py is retired — use training/convert_data.py.\n"
+        "It uses an incompatible rotation convention (pytorch3d rows + misread\n"
+        "quaternion) that does NOT match testing/inference.py and causes the ~90°\n"
+        "wrist-rotation bug. If you really must run it anyway, pass --force.\n")
 
 import cv2
 import h5py
@@ -156,6 +177,8 @@ def main():
     parser.add_argument('output_zarr',  help='Output zarr path')
     parser.add_argument('--max-episodes', type=int, default=None,
                         help='Limit number of episodes to convert')
+    parser.add_argument('--force', action='store_true',
+                        help='Override the deprecation guard (NOT recommended)')
     args = parser.parse_args()
 
     h5_files = natsorted(glob.glob(os.path.join(args.input_dir, 'episode_*.hdf5')))

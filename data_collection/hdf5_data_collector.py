@@ -41,7 +41,8 @@ HDF5 schema (per episode):
 Pygame keyboard controls:
   R — Reset robot to home position
   S — Start recording episode
-  D — Done / end recording and save
+  D — Done / end recording and SAVE (increments episode counter)
+  C — Done / CANCEL recording (discard buffer, do not save or increment)
   P — Pause recording and robot motion
   U — Unpause / resume
   Q — Quit
@@ -443,6 +444,21 @@ class HDF5DataCollector(Node):
             )
             self.demo_count += 1
 
+    def cancel_collection(self):
+        """End recording WITHOUT saving. Discards the buffer and does not
+        increment demo_count, so the next Start reuses the same episode index."""
+        if self.is_collecting:
+            self.is_collecting = False
+            if self._enable_dji:
+                self._dji_cam_active = False
+                self._dji_enable_pub.publish(Bool(data=False))
+            n = len(self._buf_action_pose)
+            with self._lock:
+                self._reset_buffers()
+            self.get_logger().info(
+                f'Episode {self.demo_count} CANCELLED — discarded {n} frames (not saved)'
+            )
+
     def pause_collection(self):
         if not self.is_paused:
             self.is_paused = True
@@ -554,7 +570,7 @@ class HDF5DataCollector(Node):
 def run_pygame(node: HDF5DataCollector):
     """Pygame keyboard control loop. Runs in the main thread."""
     pygame.init()
-    screen     = pygame.display.set_mode((620, 300))
+    screen     = pygame.display.set_mode((620, 340))
     pygame.display.set_caption('Haptic Teleop IL — Data Collection')
     font       = pygame.font.Font(None, 32)
     small_font = pygame.font.Font(None, 24)
@@ -568,6 +584,7 @@ def run_pygame(node: HDF5DataCollector):
                 if   event.key == pygame.K_r:      node.reset_robot()
                 elif event.key == pygame.K_s:      node.start_collection()
                 elif event.key == pygame.K_d:      node.end_collection()
+                elif event.key == pygame.K_c:      node.cancel_collection()
                 elif event.key == pygame.K_p:      node.pause_collection()
                 elif event.key == pygame.K_u:      node.unpause_collection()
                 elif event.key in (pygame.K_q, pygame.K_ESCAPE):
@@ -627,7 +644,8 @@ def run_pygame(node: HDF5DataCollector):
             'Controls:',
             '  R - Reset robot to home',
             '  S - Start recording',
-            '  D - Done / save episode',
+            '  D - Done / SAVE episode',
+            '  C - Done / CANCEL (discard, no save)',
             '  P - Pause',
             '  U - Unpause',
             '  Q - Quit',

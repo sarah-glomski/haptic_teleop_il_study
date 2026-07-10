@@ -19,7 +19,7 @@ ZED M (front)   ──▶  /zed_isometric/zed_node/left/image_rect_color
 DJI Osmo Action 4 ──▶  /dji_wrist/dji_wrist/color/image_raw
 
 hdf5_data_collector  ──▶  episode_N.hdf5
-hdf5_to_zarr         ──▶  output.zarr  (for diffusion policy training)
+convert_data.py      ──▶  output.zarr  (for diffusion policy training)
 ```
 
 ## Hardware
@@ -228,7 +228,7 @@ Metadata: `num_frames`, `collection_rate_hz=30`, `episode_index`
 After collecting episodes:
 ```bash
 conda activate umi
-python hdf5_to_zarr.py demo_data/ output.zarr
+python ../training/convert_data.py --input demo_data/CollectionN --output CollectionN.zarr
 ```
 
 Zarr output (UMI-style flat concatenation):
@@ -283,4 +283,4 @@ workspace_z_scale  = 1.0
 | `kinova_state_publisher.py` | Reads Kinova state → `robot_obs/*` at 30 Hz |
 | `kinova_hand_controller.py` | P-loop velocity controller with workspace safety limits |
 | `hdf5_data_collector.py` | 7-stream synchronized recording with pygame UI |
-| `hdf5_to_zarr.py` | Converts HDF5 episodes to UMI-style Zarr for training |
+| `hdf5_to_zarr.py` | DEPRECATED — use `training/convert_data.py` (incompatible rot6d) |

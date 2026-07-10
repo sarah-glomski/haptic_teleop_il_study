@@ -108,6 +108,104 @@ episode_N.hdf5
 **Collection rate:** ~30 Hz (set by ApproximateTimeSynchronizer throughput).
 **Attributes:** `num_frames`, `collection_rate_hz`, `episode_index`.
 
+### 3.4 Curation / Outlier Screening
+
+Two inspectors screen a collection **before** zarr conversion. Both read
+`episode_*.hdf5`, honor a per-collection `exclude.txt` (episodes listed there
+are skipped on subsequent runs and by conversion), and can write that file via
+`--exclude` (omit numbers to accept the recommendation).
+
+```bash
+cd data_collection/
+# Generic outlier scan — flags ±2σ duration/path-length/tracking + gripper faults.
+python3.12 inspect_collection.py demo_data/Collection4/
+# → prints a ranked table, saves demo_data/Collection4/inspection.png
+```
+
+**`inspect_transitions.py`** curates for a *diffusion-policy state machine* in
+the low-data regime, where the goal is broad **state** diversity but few
+**transition** modes (a simpler distribution to fit while tuning latency /
+hyperparameters). It treats the task as 7 **states** —
+`servo → descend → grasp → lift → transport → place → release` (segmented off
+gripper events + vertical/lateral motion) — and the 6 **transitions** as the
+switches between consecutive states. A **state** is a behavioral mode; a
+**transition** is the *condition to move on* to the next state.
+
+- **STATE diversity** (want HIGH): the range of situations spanned *within* each
+  state across the dataset — e.g. many object/transport positions. Measured as
+  the cross-demo spread of each state's TCP centroid.
+- **TRANSITION diversity** (want LOW): the cross-demo spread of the robot
+  *condition at each switch frame* — Z height, TCP speed, gripper, and (for
+  `place→release`) XY over the fixed tape. Tight clusters = one consistent,
+  easy-to-learn trigger per switch.
+- **transition messiness** (rank for exclusion): how far a demo's switch
+  conditions deviate from the dataset median — inconsistent switch height/speed,
+  place-over-tape scatter, non-crisp gripper switches (TCP still moving while
+  grasping/releasing), gripper indecisiveness, plus hard faults (re-grasp, broken
+  state sequence).
+- **state novelty** (protect from exclusion): rarity of the grasp location, so a
+  messy-but-unique start is kept to preserve state coverage.
+- **entry condition** (`start→servo`): the *initial* state is also checked — the
+  arm should begin at the home pose and the gripper open. Episodes that start
+  off-home (`--home-dev-max`, default 0.08 m) or not-open (`--home-grip-max`,
+  default 0.5, where 0 = open) are flagged `bad_home`.
+- **recommended exclusions**: broken state machines, off-home/not-open starts,
+  plus any episode injecting a distinct extra transition mode (fumbled
+  multi-second gripper close/open, or a genuine ≥2-toggle re-grasp) even if novel
+  — because a few-modes dataset is worth more here than marginal state coverage.
+
+```bash
+python3.12 inspect_transitions.py demo_data/Collection4/            # table + dashboard
+python3.12 inspect_transitions.py demo_data/Collection4/ --detail 22 31  # state segmentation of specific episodes
+python3.12 inspect_transitions.py demo_data/Collection4/ --exclude  # accept & write exclude.txt
+```
+
+The dashboard is saved to a **timestamped** `transition_inspection_<ts>.png`
+(never overwrites `inspection.png`) and shows the state-vs-transition split:
+grasp-location spread (state coverage), per-switch box plots of switch height and
+speed, place-over-tape tightness, per-state coverage vs per-switch condition
+spread bars, a messiness-vs-novelty scatter for the keep/drop call, and a
+`start→servo` entry row (initial home XY, initial gripper, arm off-home).
+Add `MPLBACKEND=Agg` to run headless (skips the interactive window, still saves the PNG).
+Tune the entry thresholds if the defaults over/under-flag, e.g.
+`--home-grip-max 0.75` (only clearly-closed starts) or `--home-dev-max 0.05`.
+
+#### End-cropping (`--crop`)
+
+After outliers are dropped, `--crop` trims trailing out-of-distribution frames —
+e.g. a late uptick in the gripper command after the final release, when it should
+stay ≈0. **Only the end is cropped, never the start** (moving the start would break
+demonstration timing), and the **source HDF5 files are never modified** — crops are
+stored as indices in `exclude.txt` and applied at conversion time.
+
+```bash
+python3.12 inspect_transitions.py demo_data/Collection4/ --crop        # review episodes with a suggested crop
+python3.12 inspect_transitions.py demo_data/Collection4/ --crop 3 9    # review specific episodes
+```
+
+Each candidate is shown (gripper / Z / speed vs frame, with the proposed crop line
+and dropped tail shaded) for manual **approve / edit / skip**. The suggestion
+targets the first trailing gripper uptick after the release; you can override the
+frame (`e <frame>`) before approving.
+
+`exclude.txt` is a plain-text curation file read by both inspectors and by
+`convert_data.py`:
+
+```
+# episode_N            → drop whole episode
+# episode_N crop S E   → keep frames [S:E) at conversion (end-crop)
+episode_28
+episode_12 crop 0 340
+```
+
+`convert_data.py` skips `drop` episodes and truncates `crop` episodes to `[S:E)`
+while reading (originals stay intact). Run curation, then convert:
+
+```bash
+cd training/
+python convert_data.py --input ../data_collection/demo_data/Collection4 --output kinova_teleop.zarr
+```
+
 ---
 
 ## 4. Data Conversion
@@ -175,20 +273,54 @@ Chunked at `(1, 224, 224, 3)` — one frame per chunk for efficient random acces
 
 ## 5. Training
 
-### 5.1 Launch
+### 5.1 Environment & Launch
+
+Training runs in the **`umi` miniforge conda env (Python 3.9)** — *not* `base`
+(`base`/`python3.12` holds the data-prep tools: h5py/cv2/zarr). `train.py`
+path-imports `diffusion_policy`/`robomimic` from
+`../../Robomimic/dt_ag-main/universal_manipulation_interface/`, so that repo must
+stay at that relative location.
 
 ```bash
+conda activate umi
 cd training/
 
-# Point to the zarr dataset (or set env var)
-export KINOVA_ZARR_PATH=kinova_teleop.zarr
+python train.py --config-name=train_diffusion_unet_timm_kinova \
+    task.dataset_path=../data_collection/demo_data/Collection4/kinova_teleop.zarr
 
-python train.py --config-name=train_diffusion_unet_timm_kinova
+# (alternatively set the dataset via env var instead of the Hydra override)
+export KINOVA_ZARR_PATH=../data_collection/demo_data/Collection4/kinova_teleop.zarr
 
 # Options
 python train.py --config-name=train_diffusion_unet_timm_kinova training.debug=True
 python train.py --config-name=train_diffusion_unet_timm_kinova logging.mode=disabled
 python train.py --config-name=train_diffusion_unet_timm_kinova training.num_epochs=200
+```
+
+Checkpoints land in `training/data/outputs/<date>/<time>/checkpoints/` (what
+`testing/launch_inference.py --latest` picks up).
+
+#### Recreating the `umi` env
+
+The exact known-good environment is captured in
+[`training/umi_2026-07-02.yaml`](umi_2026-07-02.yaml) (regenerate anytime with
+`conda env export -n umi --no-builds`). Recreate it with:
+
+```bash
+conda env create -f training/umi_2026-07-02.yaml   # creates env named "umi"
+conda activate umi
+```
+
+Critical constraint baked into that file: the workstation GPU is an **RTX 5070
+(Blackwell, sm_120)**, which needs the **cu128** PyTorch build
+(`torch==2.7.1+cu128`, pulled via the pinned `--extra-index-url`); the older
+cu121 torch fails with `CUDA error: no kernel image is available for execution on
+the device`. Keep Python 3.9 (torch ≥2.8 drops 3.9 wheels); NVIDIA driver ≥570.
+Verify the GPU after creating:
+
+```bash
+python -c "import torch; print(torch.__version__); print('sm_120' in torch.cuda.get_arch_list(), torch.cuda.is_available())"
+# → 2.7.1+cu128 / True True
 ```
 
 ### 5.2 Policy Architecture
@@ -557,13 +689,15 @@ haptic_teleop_il_study/
 │   ├── kinova_hand_controller.py    — HoloLens → Kortex velocity control
 │   ├── hololens_hand_node.py        — hand joint → hand/pose, hand/gripper_cmd
 │   ├── hololens_tf_publisher_ros2.py— HoloLens joints → TF2
-│   ├── hdf5_to_zarr.py              — HDF5 → flat (UMI-style) zarr (alt format)
+│   ├── hdf5_to_zarr.py              — DEPRECATED (incompatible rot6d); use training/convert_data.py
 │   ├── dji_camera_node.py           — DJI Osmo → ROS2 Image (1280×720 capture → 224×224 publish)
 │   ├── dji_camera_validate.py       — verify DJI device/feed (--model-view shows the 224×224 policy input)
 │   ├── launch_teleop.py             — teleoperation only (no recording)
 │   ├── preflight_check.py           — topic/sensor health check
 │   ├── replay_episode.py            — episode replay + end-to-end latency tuning loop
 │   ├── visualize_episode.py         — HDF5 episode viewer (images + time-series plots)
+│   ├── inspect_collection.py        — batch outlier scan (duration / path / tracking / gripper)
+│   ├── inspect_transitions.py       — state-machine curation: state vs transition diversity
 │   ├── view_cameras.py              — standalone live camera viewer (ZED + DJI)
 │   ├── handtracking.md              — analysis notes: Unity→ROS hand tracking transform
 │   └── README.md                    — data collection subsystem docs
@@ -583,12 +717,15 @@ haptic_teleop_il_study/
 └── README.md                        — this document
 ```
 
-**Note on zarr converters:** Both `data_collection/hdf5_to_zarr.py` and
-`training/convert_data.py` produce the same flat (UMI-style) zarr format with
-`data/` arrays and `meta/episode_ends`. `hdf5_to_zarr.py` writes additional
-passthrough keys (`joint_states`, `holo_palm_pose`, `holo_hand_width`,
-`holo_finger_tips`) useful for analysis; `convert_data.py` writes only the
-five keys needed for training.
+**Note on zarr converters:** `training/convert_data.py` is the single canonical
+converter. `data_collection/hdf5_to_zarr.py` is **DEPRECATED** — despite writing
+the same flat layout, it encodes rotations with a *different, incompatible*
+convention (pytorch3d rows + a misread quaternion) than `convert_data.py` (scipy
+columns + the correct quaternion). `testing/inference.py` is aligned to
+`convert_data.py`, so training with `hdf5_to_zarr.py` silently causes the ~90°
+wrist-rotation bug. `convert_data.py` also reads the correct ZED key
+(`images/zed_isometric`) and supports `exclude.txt` drops **and** end-crops.
+`hdf5_to_zarr.py` now refuses to run without `--force`.
 
 ---
 
