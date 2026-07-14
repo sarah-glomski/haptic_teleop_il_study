@@ -59,6 +59,8 @@ def generate_launch_description(
     no_cameras: bool = False,
     no_piezense: bool = False,
     no_rosbridge: bool = False,
+    orientation: bool = False,
+    zed_uvc: bool = False,
 ) -> LaunchDescription:
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -105,6 +107,7 @@ def generate_launch_description(
             cmd=[
                 _PYTHON, script('kinova_hand_controller.py'),
                 '--ros-args', '-p', f'robot_ip:={robot_ip}',
+                '-p', f'enable_orientation:={"true" if orientation else "false"}',
             ],
             name='kinova_hand_controller',
             output='screen',
@@ -131,6 +134,18 @@ def generate_launch_description(
         ),
 
         # ── 7. ZED M camera — front view ──────────────────────────────────────
+        # Two modes, both publishing the left image on
+        # /zed_isometric/zed_node/left/image_rect_color:
+        #   • zed-camera mode (--zed-uvc): lightweight UVC node, no ZED SDK. Reads
+        #     the ZED M as a plain stereo webcam and crops the left image. Use this
+        #     when the ZED SDK / zed-ros2-wrapper is not installed.
+        #   • SDK mode (default): the full zed_wrapper node (rectified + depth).
+        *([ExecuteProcess(
+            cmd=[_PYTHON, script('zed_uvc_node.py')],
+            name='zed_uvc_node',
+            output='screen',
+        )] if (not no_zed and zed_uvc) else []),
+
         *([Node(
             package='zed_wrapper',
             executable='zed_wrapper',
@@ -149,7 +164,7 @@ def generate_launch_description(
                 'depth.depth_mode':      1,               # PERFORMANCE
                 'video.extrinsic_in_camera_frame': False,
             }],
-        )] if not no_zed else []),
+        )] if (not no_zed and not zed_uvc) else []),
 
         # ── 8. DJI Osmo Action 4 — wrist-mounted camera ──────────────────────
         *([ExecuteProcess(
@@ -178,6 +193,11 @@ def main(argv=sys.argv[1:]):
                              'Run dji_camera_validate.py first to confirm.')
     parser.add_argument('--no-zed', action='store_true',
                         help='Skip launching the ZED M camera node (e.g. if ZED SDK is not installed).')
+    parser.add_argument('--zed-uvc', action='store_true',
+                        help='ZED-camera mode: read the ZED M as a plain UVC stereo webcam and '
+                             'publish its left image, instead of the full ZED SDK zed_wrapper node. '
+                             'Use when the ZED SDK / zed-ros2-wrapper is not installed. '
+                             'Requires the ZED M on a USB 3.0 port so its video interface enumerates.')
     parser.add_argument('--no-cameras', action='store_true',
                         help='Skip all camera nodes and disable camera sync in the data collector. '
                              'Implies --no-zed. Use when cameras are unavailable.')
@@ -186,6 +206,10 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('--no-rosbridge', action='store_true',
                         help='Skip launching rosbridge (use when it is already running '
                              'so the HoloLens stays connected across pipeline restarts).')
+    parser.add_argument('--orientation', action='store_true',
+                        help='Enable hand-orientation wrist teleop in kinova_hand_controller '
+                             '(clutched delta from enable-time reference, quaternion P-loop, '
+                             'tilt/yaw clamped). Default: translation-only, orientation held at home.')
     args, launch_argv = parser.parse_known_args(argv)
 
     print('=' * 60)
@@ -211,6 +235,7 @@ def main(argv=sys.argv[1:]):
         ('kinova_hand_controller',     'kinova_hand_controller'),
         ('hdf5_data_collector',        'hdf5_data_collector'),
         ('dji_camera_node',            'dji_camera_node'),
+        ('zed_uvc_node',               'zed_uvc_node'),
     ]
     if not args.no_piezense:
         stale_patterns.append(('ar_teleop_piezense_launch', 'piezense_launch'))
@@ -245,6 +270,8 @@ def main(argv=sys.argv[1:]):
         no_cameras=args.no_cameras,
         no_piezense=args.no_piezense,
         no_rosbridge=args.no_rosbridge,
+        orientation=args.orientation,
+        zed_uvc=args.zed_uvc,
     )
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)

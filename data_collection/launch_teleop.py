@@ -39,7 +39,7 @@ from launch_ros.actions import Node
 _PYTHON = '/usr/bin/python3.12'
 
 
-def generate_launch_description(robot_ip: str) -> LaunchDescription:
+def generate_launch_description(robot_ip: str, orientation: bool = False) -> LaunchDescription:
     d = os.path.dirname(os.path.abspath(__file__))
 
     def script(name):
@@ -84,6 +84,7 @@ def generate_launch_description(robot_ip: str) -> LaunchDescription:
             cmd=[
                 _PYTHON, script('kinova_hand_controller.py'),
                 '--ros-args', '-p', f'robot_ip:={robot_ip}',
+                '-p', f'enable_orientation:={"true" if orientation else "false"}',
             ],
             name='kinova_hand_controller',
             output='screen',
@@ -102,6 +103,9 @@ def main(argv=sys.argv[1:]):
     parser = argparse.ArgumentParser(description='Minimal HoloLens → Kinova teleop')
     parser.add_argument('--robot-ip', default='192.168.1.10',
                         help='Kinova Gen3 IP address')
+    parser.add_argument('--orientation', action='store_true',
+                        help='Enable hand-orientation wrist teleop (clutched delta, quaternion '
+                             'P-loop, tilt/yaw clamped). Default: translation-only.')
     args, launch_argv = parser.parse_known_args(argv)
 
     # Print your machine's IP so the user knows what to enter in the HoloLens app
@@ -136,7 +140,7 @@ def main(argv=sys.argv[1:]):
         p for p in path_parts if 'miniforge' not in p and 'conda' not in p
     )
 
-    ld = generate_launch_description(robot_ip=args.robot_ip)
+    ld = generate_launch_description(robot_ip=args.robot_ip, orientation=args.orientation)
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)
     return ls.run()

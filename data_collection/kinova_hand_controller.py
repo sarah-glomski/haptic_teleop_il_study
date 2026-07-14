@@ -137,6 +137,33 @@ class KinovaHandController(Node):
         self.position_scale       = self.declare_parameter('position_scale',              1.0).value
         self.p_gain               = self.declare_parameter('p_gain',                    2.0).value
 
+        # ── Orientation teleop (opt-in; default OFF = translation-only) ────────
+        # Enabled via --orientation on launch_data_collection.py / launch_teleop.py
+        # (which pass -p enable_orientation:=true). The wrist tracks the palm
+        # orientation as a CLUTCHED DELTA from the enable-time reference — same
+        # scheme as position, so it starts from the robot's current orientation
+        # with no jump. Control uses quaternion/rotation-matrix error (rotvec),
+        # NEVER raw Kortex Euler error: the Kortex ZYX decomposition has a gimbal
+        # singularity at theta_x≈±180° (the home orientation) that makes Euler
+        # components flip; rotation-matrix error is immune to representation flips.
+        self.enable_orientation   = self.declare_parameter('enable_orientation',      False).value
+        # Safety clamps, applied to the target's rotation FROM HOME (rotvec split
+        # into tilt = component ⊥ base z, yaw = component about base z):
+        #  - tilt limit keeps the gripper from pitching into the table (the XYZ
+        #    workspace box assumes a roughly downward tool; tilting sweeps the
+        #    fingers below the TCP, so keep this conservative)
+        #  - yaw limit keeps the wrist joint away from its travel limits
+        #    (sustained chase into a joint limit faults the arm — seen at ~38 s
+        #    in earlier testing)
+        self.max_tilt_deg         = self.declare_parameter('max_tilt_deg',            30.0).value
+        self.max_yaw_deg          = self.declare_parameter('max_yaw_deg',             60.0).value
+        self.orientation_p_gain   = self.declare_parameter('orientation_p_gain',       2.0).value
+        # Yaw offset (deg) between the HoloLens world frame and the robot base
+        # frame. The orientation delta is expressed in HoloLens-world axes; if the
+        # operator does not face along the robot's +x, conjugate the delta by this
+        # yaw so hand tilts map to matching robot tilts. 0 = frames assumed aligned.
+        self.orientation_yaw_offset_deg = self.declare_parameter('orientation_yaw_offset_deg', 0.0).value
+
         self.home_x  = self.declare_parameter('home_x',   0.35).value
         self.home_y  = self.declare_parameter('home_y',   0.0).value
         self.home_z  = self.declare_parameter('home_z',   0.12).value
@@ -158,6 +185,9 @@ class KinovaHandController(Node):
             f' Max linear {self.max_linear_speed * 1000:.0f} mm/s',
             f' Max angular {self.max_angular_speed:.0f} deg/s',
             f' Watchdog   {TWIST_WATCHDOG_MS} ms',
+            (f' Orientation ON — tilt ≤ {self.max_tilt_deg:.0f}°, yaw ≤ ±{self.max_yaw_deg:.0f}° from home'
+             if self.enable_orientation else
+             ' Orientation OFF (translation-only; --orientation to enable)'),
         ]
         _W = max(len(r) for r in _rows) + 2
         self.get_logger().info(
@@ -176,12 +206,25 @@ class KinovaHandController(Node):
         self.hand_tracking_active  = False
         self._smoothed_vel         = np.zeros(3)  # exponentially smoothed velocity
 
+        # Orientation-mode state (only used when enable_orientation)
+        self.target_rot            = None   # scipy Rotation — clamped target orientation
+        self._smoothed_ang_vel     = np.zeros(3)  # smoothed angular velocity (deg/s, base frame)
+        self._home_rot             = R.from_euler('xyz', [
+            math.radians(self.home_tx),
+            math.radians(self.home_ty),
+            math.radians(self.home_tz),
+        ])
+
         # References captured at arm-enable (after settling).
         # Position uses a delta approach: target = ref_robot_pos + (holo - ref_holo) * scale,
         # so workspace offsets in hololens_hand_node cancel out and no calibration is needed.
         # Yaw is fixed at home_tz — not tracked from hand orientation.
         self._ref_holo_pos: np.ndarray | None = None
         self._ref_robot_pos: np.ndarray | None = None
+        # Orientation references, captured in the SAME settling block as position
+        # (so anything that clears _ref_robot_pos re-captures these too).
+        self._ref_holo_rot = None    # scipy Rotation of the palm at enable
+        self._ref_robot_rot = None   # scipy Rotation of the TCP at enable
         # Monotonic time when arm tracking was last enabled.  Reference capture is
         # deferred 0.5 s to let MRTK hand tracking stabilise — MRTK can return
         # tracked=True with identity rotation for 1-2 frames on first acquisition,
@@ -370,12 +413,24 @@ class KinovaHandController(Node):
                     fb.base.tool_pose_y,
                     fb.base.tool_pose_z,
                 ])
+                self._ref_robot_rot = R.from_euler('xyz', [
+                    math.radians(fb.base.tool_pose_theta_x),
+                    math.radians(fb.base.tool_pose_theta_y),
+                    math.radians(fb.base.tool_pose_theta_z),
+                ])
             except Exception:
                 self._ref_robot_pos = np.array([self.home_x, self.home_y, self.home_z])
+                self._ref_robot_rot = self._home_rot
+            # Palm orientation reference (identity-safe: after the 0.5 s settle
+            # MRTK's first-frame identity glitch has passed; a genuinely identity
+            # quaternion here would only make the delta start at zero — harmless).
+            o = msg.pose.orientation
+            self._ref_holo_rot = R.from_quat([o.x, o.y, o.z, o.w])
             self.get_logger().info(
                 f'Reference captured (after settling): '
                 f'robot_pos=({self._ref_robot_pos[0]:.3f}, {self._ref_robot_pos[1]:.3f}, {self._ref_robot_pos[2]:.3f})  '
                 f'holo_pos=({current_holo_pos[0]:.3f}, {current_holo_pos[1]:.3f}, {current_holo_pos[2]:.3f})'
+                + (f'  holo_quat=({o.x:.2f},{o.y:.2f},{o.z:.2f},{o.w:.2f})' if self.enable_orientation else '')
             )
 
         # ── Position target (delta from reference) ────────────────────────────
@@ -387,7 +442,37 @@ class KinovaHandController(Node):
         else:
             self.target_position = clipped
 
-        self._publish_pose(self.action_pose_pub, self.target_position, self.target_theta_z_deg, msg.header.stamp)
+        # ── Orientation target (clutched delta, clamped) ──────────────────────
+        # Skipped in vertical_only mode (freeze orientation with position x/y).
+        if self.enable_orientation and self._ref_holo_rot is not None and not self.vertical_only:
+            o = msg.pose.orientation
+            q = np.array([o.x, o.y, o.z, o.w])
+            if np.linalg.norm(q) > 0.5:  # guard against zero/garbage quaternions
+                hand_rot = R.from_quat(q / np.linalg.norm(q))
+                # Delta since clutch, in HoloLens-world axes …
+                delta_rot = hand_rot * self._ref_holo_rot.inv()
+                # … optionally conjugated into robot-base axes by a fixed yaw
+                if abs(self.orientation_yaw_offset_deg) > 1e-6:
+                    rz = R.from_euler('z', math.radians(self.orientation_yaw_offset_deg))
+                    delta_rot = rz * delta_rot * rz.inv()
+                target_raw = delta_rot * self._ref_robot_rot
+
+                # Safety clamp relative to HOME orientation: split the rotation-
+                # from-home into yaw (about base z) and tilt (⊥ base z), clamp each.
+                r_home = (target_raw * self._home_rot.inv()).as_rotvec()
+                yaw_component = float(r_home[2])
+                tilt_vec = np.array([r_home[0], r_home[1], 0.0])
+                tilt_mag = float(np.linalg.norm(tilt_vec))
+                max_tilt = math.radians(self.max_tilt_deg)
+                max_yaw = math.radians(self.max_yaw_deg)
+                if tilt_mag > max_tilt:
+                    tilt_vec *= max_tilt / tilt_mag
+                yaw_component = float(np.clip(yaw_component, -max_yaw, max_yaw))
+                r_clamped = tilt_vec + np.array([0.0, 0.0, yaw_component])
+                self.target_rot = R.from_rotvec(r_clamped) * self._home_rot
+
+        self._publish_pose(self.action_pose_pub, self.target_position, self.target_theta_z_deg, msg.header.stamp,
+                           rot=self.target_rot if self.enable_orientation else None)
 
     def _gripper_cb(self, msg: Float32):
         # Always publish goal gripper for visualization, regardless of enabled state.
@@ -441,6 +526,10 @@ class KinovaHandController(Node):
             self._smoothed_vel[:] = 0.0
             self._ref_holo_pos = None
             self._ref_robot_pos = None
+            self.target_rot = None
+            self._ref_holo_rot = None
+            self._ref_robot_rot = None
+            self._smoothed_ang_vel[:] = 0.0
             self._send_zero_twist()
             self.get_logger().info('Arm tracking disabled — robot stopped')
         elif not self.arm_enabled and enabled:
@@ -473,6 +562,10 @@ class KinovaHandController(Node):
             self._smoothed_vel[:] = 0.0
             self._ref_holo_pos = None
             self._ref_robot_pos = None
+            self.target_rot = None
+            self._ref_holo_rot = None
+            self._ref_robot_rot = None
+            self._smoothed_ang_vel[:] = 0.0
             self._arm_enabled_at = time.monotonic()  # re-settle when tracking resumes
             self._send_zero_twist()  # no-op during reset (reset owns the arm)
             if self.is_resetting:
@@ -582,7 +675,10 @@ class KinovaHandController(Node):
             self.get_logger().info('Kinova resumed')
 
     # ── Publishers ────────────────────────────────────────────────────────────
-    def _publish_pose(self, pub, position: np.ndarray, theta_z_deg: float, stamp):
+    def _publish_pose(self, pub, position: np.ndarray, theta_z_deg: float, stamp, rot=None):
+        """Publish a pose. If `rot` (scipy Rotation) is given — orientation mode —
+        it is used verbatim, so robot_action/pose records the true commanded
+        orientation. Otherwise the legacy fixed home_tx/home_ty + theta_z is used."""
         msg = PoseStamped()
         msg.header.stamp = stamp
         msg.header.frame_id = 'base_link'
@@ -590,11 +686,11 @@ class KinovaHandController(Node):
         msg.pose.position.y = float(position[1])
         msg.pose.position.z = float(position[2])
 
-        quat = R.from_euler('xyz', [
+        quat = (rot.as_quat() if rot is not None else R.from_euler('xyz', [
             math.radians(self.home_tx),
             math.radians(self.home_ty),
             math.radians(theta_z_deg),
-        ]).as_quat()
+        ]).as_quat())
         msg.pose.orientation.x = float(quat[0])
         msg.pose.orientation.y = float(quat[1])
         msg.pose.orientation.z = float(quat[2])
@@ -662,21 +758,60 @@ class KinovaHandController(Node):
                 if smooth_speed > self.max_linear_speed:
                     send_vel = send_vel * (self.max_linear_speed / smooth_speed)
 
-                # Angular velocities are all zero: SINGLE_LEVEL_SERVOING holds
-                # the current EEF orientation passively when no angular velocity
-                # is commanded. We avoid angular P-loop entirely because the Kortex
-                # ZYX Euler decomposition has a gimbal singularity near theta_x=±180°
-                # (the arm's home orientation), causing theta_z to flip between
-                # 89.3° and ≈0°/180° — a P-loop would chase that noise.
+                # ── Angular velocity ─────────────────────────────────────────
+                # Translation-only mode (default): all angular velocities zero —
+                # SINGLE_LEVEL_SERVOING holds the current EEF orientation
+                # passively. We historically avoided an angular P-loop because
+                # the Kortex ZYX Euler decomposition has a gimbal singularity
+                # near theta_x=±180° (the arm's home orientation), causing
+                # theta_z to flip between 89.3° and ≈0°/180°.
+                #
+                # Orientation mode (enable_orientation): P-loop on the FULL
+                # ROTATION error instead of Euler components. Euler feedback is
+                # converted to a rotation matrix first — different Euler triplets
+                # near the singularity represent the SAME rotation, so the matrix
+                # (and thus the error rotvec) is immune to the flips that made
+                # Euler-based control unusable.
+                ang_send = np.zeros(3)
+                if self.enable_orientation and self.target_rot is not None:
+                    current_rot = R.from_euler('xyz', [
+                        math.radians(feedback.base.tool_pose_theta_x),
+                        math.radians(feedback.base.tool_pose_theta_y),
+                        math.radians(feedback.base.tool_pose_theta_z),
+                    ])
+                    # Base-frame rotation error target ∘ current⁻¹, as rotvec (rad)
+                    err_deg = np.degrees(
+                        (self.target_rot * current_rot.inv()).as_rotvec())
+                    raw_ang = self.orientation_p_gain * err_deg  # deg/s
+                    ang_speed = float(np.linalg.norm(raw_ang))
+                    if ang_speed > self.max_angular_speed:
+                        raw_ang *= self.max_angular_speed / ang_speed
+                    self._smoothed_ang_vel = (
+                        self.vel_alpha * raw_ang
+                        + (1.0 - self.vel_alpha) * self._smoothed_ang_vel
+                    )
+                    ang_send = self._smoothed_ang_vel.copy()
+                    ang_speed = float(np.linalg.norm(ang_send))
+                    if ang_speed > self.max_angular_speed:
+                        ang_send *= self.max_angular_speed / ang_speed
+                else:
+                    self._smoothed_ang_vel[:] = 0.0
+
                 cmd = Base_pb2.TwistCommand()
-                cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED
+                # BASE frame when commanding angular velocity (our error rotvec is
+                # base-frame; this matches testing/inference.py). Keep the legacy
+                # MIXED frame in translation-only mode — with zero angulars the
+                # two are equivalent for linear velocity, so behavior is unchanged.
+                cmd.reference_frame = (Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE
+                                       if self.enable_orientation
+                                       else Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED)
                 cmd.duration = TWIST_WATCHDOG_MS
                 cmd.twist.linear_x  = float(send_vel[0])
                 cmd.twist.linear_y  = float(send_vel[1])
                 cmd.twist.linear_z  = float(send_vel[2])
-                cmd.twist.angular_x = 0.0
-                cmd.twist.angular_y = 0.0
-                cmd.twist.angular_z = 0.0
+                cmd.twist.angular_x = float(ang_send[0])
+                cmd.twist.angular_y = float(ang_send[1])
+                cmd.twist.angular_z = float(ang_send[2])
                 self._base.SendTwistCommand(cmd)
 
             except Exception as e:
