@@ -68,6 +68,13 @@ if _UMI_REAL not in sys.path:
 
 from diffusion_policy.common.replay_buffer import ReplayBuffer  # noqa: E402
 
+# Canonical home pose — the fixed wrt_start anchor, shared with
+# testing/inference.py so training and rollout measure against the same frame.
+_DATA_COLLECTION_DIR = os.path.abspath(os.path.join(_THIS_DIR, "..", "data_collection"))
+if _DATA_COLLECTION_DIR not in sys.path:
+    sys.path.insert(0, _DATA_COLLECTION_DIR)
+from kinova_arm import home_pose_vec6  # noqa: E402
+
 IMG_SIZE = 224
 # Robotiq 2F-85 stroke. Only consistency with inference.py matters (range
 # normalizer self-calibrates), but meters keeps UMI semantic conventions.
@@ -142,10 +149,19 @@ def load_episode(h5_path: Path, crop) -> dict:
     act_pos, act_rotvec = quat_pose_to_pos_rotvec(act_pose)
     T = len(obs_pos)
 
-    # Episode start/end pose [pos, rotvec], repeated per frame (required by
-    # umi_dataset for the _wrt_start observation; end pose kept for parity with
-    # UMI's own pipeline output).
-    start_pose = np.concatenate([obs_pos[0], obs_rotvec[0]]).astype(np.float32)
+    # Start/end pose [pos, rotvec], repeated per frame (umi_dataset reads
+    # start_pose to build the _wrt_start observation; end pose is kept for
+    # parity with UMI's own pipeline output).
+    #
+    # start_pose is the FIXED home pose, NOT this episode's first frame. Using
+    # the episode's own first frame makes wrt_start mean "how far have I turned
+    # since this recording began", so a demo that only covers the second half of
+    # the task claims to be at the beginning, and a rollout started mid-task
+    # does the same. Anchoring to home makes it mean "how far am I from home" —
+    # identical at the same point in the task however the episode was cut.
+    # Full-length demos start at home anyway, so this agrees with the old
+    # convention for them; it is partial episodes that need it.
+    start_pose = home_pose_vec6()
     end_pose = np.concatenate([obs_pos[-1], obs_rotvec[-1]]).astype(np.float32)
 
     action = np.concatenate(

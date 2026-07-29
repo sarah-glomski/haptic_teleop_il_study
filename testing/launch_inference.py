@@ -48,9 +48,6 @@ def generate_launch_description(
     model_path: str,
     robot_ip: str = "192.168.1.10",
     dji_device: int = 0,
-    dt: float = 0.1,
-    n_action_steps: int = 8,
-    diffusion_steps: int = 16,
     latency_offset_s: float = 0.0,
     no_pygame: bool = False,
     record: bool = False,
@@ -60,9 +57,8 @@ def generate_launch_description(
     inference_cmd = [
         _PYTHON, _INFERENCE_SCRIPT,
         "--model", model_path,
-        "--dt", str(dt),
-        "--n-action-steps", str(n_action_steps),
-        "--diffusion-steps", str(diffusion_steps),
+        # dt / n-action-steps / diffusion-steps are read from the checkpoint
+        # by inference.py (load_run_config) and are no longer passed through.
         "--latency-offset-s", str(latency_offset_s),
     ]
     if no_pygame:
@@ -116,13 +112,11 @@ def main(argv=sys.argv[1:]):
     parser.add_argument("--robot-ip",        type=str,   default="192.168.1.10")
     parser.add_argument("--dji-device",      type=int,   default=-1,
                         help="V4L2 device index for DJI wrist camera (default: -1 = auto-detect by USB id)")
-    parser.add_argument("--dt",              type=float, default=0.1,
-                        help="Action step period in seconds (default: 0.1 = 10 Hz, "
-                             "matching training obs_down_sample_steps 3 @ 30 Hz)")
-    parser.add_argument("--n-action-steps",  type=int,   default=8,
-                        help="Actions to execute per inference cycle (default: 8)")
-    parser.add_argument("--diffusion-steps", type=int,   default=16,
-                        help="DDIM inference steps (default: 16)")
+    # Read from the checkpoint instead of flags — see inference.load_run_config.
+    # Uncomment here AND in inference.py to override a trained value deliberately.
+    # parser.add_argument("--dt",              type=float, default=None)
+    # parser.add_argument("--n-action-steps",  type=int,   default=None)
+    # parser.add_argument("--diffusion-steps", type=int,   default=None)
     parser.add_argument("--latency-offset-s", type=float, default=0.0,
                         help="System latency to compensate in seconds (default: 0)")
     parser.add_argument("--no-pygame",       action="store_true",
@@ -149,13 +143,13 @@ def main(argv=sys.argv[1:]):
     print("=" * 60)
     print(f"  Model:           {args.model}")
     print(f"  Robot IP:        {args.robot_ip}")
-    print(f"  DJI device:      /dev/video{args.dji_device}")
-    print(f"  dt:              {args.dt}s  ({1/args.dt:.0f} Hz)")
-    print(f"  Num action steps:{args.n_action_steps}")
-    print(f"  Diffusion steps: {args.diffusion_steps}")
+    # -1 means "auto-detect by USB id" — printing /dev/video-1 for it looks like
+    # a resolved device that does not exist.
+    print("  DJI device:      auto-detect by USB id" if args.dji_device < 0
+          else f"  DJI device:      /dev/video{args.dji_device}")
+    print(f"  dt / action steps / diffusion steps: from checkpoint config")
     if args.latency_offset_s:
-        print(f"  Latency offset:  {args.latency_offset_s*1000:.0f} ms "
-              f"({round(args.latency_offset_s / args.dt)} steps)")
+        print(f"  Latency offset:  {args.latency_offset_s*1000:.0f} ms")
     print()
     if args.record:
         print(f"  Recording:       ON → {args.record_dir or 'testing/rollout_data'}")
@@ -171,9 +165,6 @@ def main(argv=sys.argv[1:]):
         model_path=args.model,
         robot_ip=args.robot_ip,
         dji_device=args.dji_device,
-        dt=args.dt,
-        n_action_steps=args.n_action_steps,
-        diffusion_steps=args.diffusion_steps,
         latency_offset_s=args.latency_offset_s,
         no_pygame=args.no_pygame,
         record=args.record,

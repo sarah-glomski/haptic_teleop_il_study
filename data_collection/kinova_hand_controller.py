@@ -77,12 +77,13 @@ from scipy.spatial.transform import Rotation as R
 from rcl_interfaces.msg import SetParametersResult
 from std_msgs.msg import Bool, Float32, String
 
-from kortex_api.TCPTransport import TCPTransport
-from kortex_api.RouterClient import RouterClient
-from kortex_api.SessionManager import SessionManager
-from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
-from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
-from kortex_api.autogen.messages import Session_pb2, Base_pb2
+from kortex_api.autogen.messages import Base_pb2
+
+# Shared arm-control layer, also used by testing/inference.py. Session
+# lifecycle, speed caps, workspace bounds, orientation clamps, the fault latch
+# and the stall guard all live there, so teleop and policy rollout cannot drift
+# apart the way they had by 2026-07-29.
+from kinova_arm import ArmLimits, KinovaArm, HOME_JOINTS_DEG, TWIST_WATCHDOG_MS
 
 # Optional dependency for tracking_mode:=ff_ruckig (pip install ruckig).
 try:
@@ -106,19 +107,8 @@ def spring_reference_step(ref_pos, ref_vel, target, wn, dt):
     return ref_pos, ref_vel
 
 
-# If the node misses this many ms worth of control ticks the Kortex SDK stops
-# the robot automatically. Must be > 1/(control_rate) * 1000 to avoid false
-# trips but short enough to stop the arm quickly on node crash.
-# At 30 Hz one tick ≈ 33 ms → 200 ms gives ~6 missed cycles of margin.
-TWIST_WATCHDOG_MS = 200
-
-# Joint-space home configuration (degrees, joints 1-7). Measured from the
-# physical arm 2026-07-27 while parked at the far-forward home posture
-# (TCP 0.5715, 0.0137, 0.1068, tool down). Used by _do_reset via
-# reach_joint_angles so the 7-DOF arm returns to an IDENTICAL posture every
-# episode (a Cartesian home is IK-ambiguous — the elbow could settle
-# differently each time).
-HOME_JOINTS_DEG = [358.258, 47.071, 181.685, 284.279, 357.708, 303.052, 89.735]
+# TWIST_WATCHDOG_MS and HOME_JOINTS_DEG are imported from kinova_arm — change
+# them there and BOTH teleop and inference pick the new values up.
 
 
 class KinovaHandController(Node):
@@ -140,21 +130,30 @@ class KinovaHandController(Node):
         self.username  = self.declare_parameter('username',  'admin').value
         self.password  = self.declare_parameter('password',  'admin').value
 
-        self.control_rate          = self.declare_parameter('control_rate',            30.0).value
-        self.max_linear_speed      = self.declare_parameter('max_linear_speed_mps',    0.50).value
-        self.max_angular_speed     = self.declare_parameter('max_angular_speed_dps',   45.0).value
-        self.vel_alpha             = self.declare_parameter('vel_alpha',               0.7).value
+        # ── Shared safety limits ─────────────────────────────────────────────
+        # Every default below comes from kinova_arm.ArmLimits, which
+        # testing/inference.py loads too. Edit a workspace bound, a speed cap,
+        # an orientation clamp or the home posture THERE and both teleop and
+        # policy rollout move together — that coupling is the entire point of
+        # the shared module. These stay ROS params so a single session can be
+        # overridden at launch without editing code.
+        _lim = ArmLimits()
 
-        self.x_min = self.declare_parameter('workspace_x_min',  0.25).value
-        self.x_max = self.declare_parameter('workspace_x_max',  0.70).value
-        self.y_min = self.declare_parameter('workspace_y_min', -0.35).value
-        self.y_max = self.declare_parameter('workspace_y_max',  0.35).value
-        self.z_min = self.declare_parameter('workspace_z_min',  0.025).value
-        self.z_max = self.declare_parameter('workspace_z_max',  0.25).value
-        self.soft_margin = self.declare_parameter('workspace_soft_margin_m', 0.01).value
+        self.control_rate          = self.declare_parameter('control_rate',            30.0).value
+        self.max_linear_speed      = self.declare_parameter('max_linear_speed_mps',    _lim.max_linear_speed_mps).value
+        self.max_angular_speed     = self.declare_parameter('max_angular_speed_dps',   _lim.max_angular_speed_dps).value
+        self.vel_alpha             = self.declare_parameter('vel_alpha',               _lim.vel_alpha).value
+
+        self.x_min = self.declare_parameter('workspace_x_min',  _lim.x[0]).value
+        self.x_max = self.declare_parameter('workspace_x_max',  _lim.x[1]).value
+        self.y_min = self.declare_parameter('workspace_y_min',  _lim.y[0]).value
+        self.y_max = self.declare_parameter('workspace_y_max',  _lim.y[1]).value
+        self.z_min = self.declare_parameter('workspace_z_min',  _lim.z[0]).value
+        self.z_max = self.declare_parameter('workspace_z_max',  _lim.z[1]).value
+        self.soft_margin = self.declare_parameter('workspace_soft_margin_m', _lim.soft_margin_m).value
 
         self.position_scale       = self.declare_parameter('position_scale',              1.0).value
-        self.p_gain               = self.declare_parameter('p_gain',                    2.0).value
+        self.p_gain               = self.declare_parameter('p_gain',                    _lim.p_gain).value
 
         # ── Tracking mode (latency work, 2026-07) ────────────────────────────
         # legacy    : original P + EMA path, byte-identical (default).
@@ -195,9 +194,9 @@ class KinovaHandController(Node):
         # moving below stall_move_mps for stall_timeout_s continuously, and
         # re-anchors the clutch instead of letting the hand/arm offset build up
         # into a max-speed dash. Set stall_timeout_s to 0 to disable.
-        self.stall_timeout_s = self.declare_parameter('stall_timeout_s',  0.4).value
-        self.stall_cmd_mps   = self.declare_parameter('stall_cmd_mps',   0.03).value
-        self.stall_move_mps  = self.declare_parameter('stall_move_mps',  0.01).value
+        self.stall_timeout_s = self.declare_parameter('stall_timeout_s', _lim.stall_timeout_s).value
+        self.stall_cmd_mps   = self.declare_parameter('stall_cmd_mps',   _lim.stall_cmd_mps).value
+        self.stall_move_mps  = self.declare_parameter('stall_move_mps',  _lim.stall_move_mps).value
         self._stall_since = None
 
         # ── Orientation teleop (opt-in; default OFF = translation-only) ────────
@@ -229,12 +228,12 @@ class KinovaHandController(Node):
         # other way. This replaces the 2026-07-27 pitch-dominant guess: on
         # hardware the tool-forward motion turned out to live on base z, not
         # base y, so the wide range moved from pitch to yaw.
-        self.max_roll_deg         = self.declare_parameter('max_roll_deg',             3.0).value
-        self.pitch_min_deg        = self.declare_parameter('pitch_min_deg',           -3.0).value
-        self.pitch_max_deg        = self.declare_parameter('pitch_max_deg',            3.0).value
-        self.yaw_min_deg          = self.declare_parameter('yaw_min_deg',             -3.0).value
-        self.yaw_max_deg          = self.declare_parameter('yaw_max_deg',             93.0).value
-        self.orientation_p_gain   = self.declare_parameter('orientation_p_gain',       2.0).value
+        self.max_roll_deg         = self.declare_parameter('max_roll_deg',      _lim.max_roll_deg).value
+        self.pitch_min_deg        = self.declare_parameter('pitch_min_deg',     _lim.pitch_min_deg).value
+        self.pitch_max_deg        = self.declare_parameter('pitch_max_deg',     _lim.pitch_max_deg).value
+        self.yaw_min_deg          = self.declare_parameter('yaw_min_deg',       _lim.yaw_min_deg).value
+        self.yaw_max_deg          = self.declare_parameter('yaw_max_deg',       _lim.yaw_max_deg).value
+        self.orientation_p_gain   = self.declare_parameter('orientation_p_gain', _lim.orientation_p_gain).value
         # Yaw offset (deg) between the HoloLens world frame and the robot base
         # frame. The orientation delta is expressed in HoloLens-world axes; if the
         # operator does not face along the robot's +x, conjugate the delta by this
