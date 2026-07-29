@@ -13,7 +13,7 @@ Collects time-synchronized data from:
 Additional data captured as latest-value at each sync tick (not in sync filter):
   - robot_obs/joint_states
   - hand/gripper_cmd, hand/hand_width, hand/finger_tips
-  - raw HoloLens: /hololens/palm/right, /hololens/thumb/right, /hololens/index/right, /hololens/gaze
+  - raw HoloLens: /hololens/palm/right, /hololens/thumb/right, /hololens/index/right, /hololens/looking_at_wrist
   - piezense/data (pressure_pa, 2 input channels)
 
 HDF5 schema (per episode):
@@ -26,10 +26,10 @@ HDF5 schema (per episode):
   │   ├── gripper:       (T,)    float32   current gripper
   │   └── joint_states:  (T, 7)  float32   joint angles (rad)
   ├── hololens/
-  │   ├── palm_pose:     (T, 7)  float32   [xyz, qxyzw]  (Unity/ROS frame)
-  │   ├── thumb_pose:    (T, 7)  float32
-  │   ├── index_pose:    (T, 7)  float32
-  │   ├── gaze_pose:     (T, 7)  float32
+  │   ├── palm_pose:        (T, 7)  float32   [xyz, qxyzw]  (Unity/ROS frame)
+  │   ├── thumb_pose:       (T, 7)  float32
+  │   ├── index_pose:       (T, 7)  float32
+  │   ├── looking_at_wrist: (T,)    uint8    1=gaze on the (open) wrist-cam view, else 0
   │   ├── finger_tips:   (T, 15) float32   [thumb(3), index(3), middle(3), ring(3), pinky(3)]
   │   └── hand_width:    (T,)    float32   thumb-index distance (m)
   ├── piezense/
@@ -185,13 +185,18 @@ class HDF5DataCollector(Node):
         self._latest_holo_palm  = None
         self._latest_holo_thumb = None
         self._latest_holo_index = None
-        self._latest_holo_gaze  = None
         self._holo_last_seen    = None   # palm pose → hands actively tracked
         self._holo_link_seen    = None   # any /hololens/* topic → app connected
         self.create_subscription(PoseStamped, '/hololens/palm/right',  self._holo_palm_cb,                    10)
         self.create_subscription(PoseStamped, '/hololens/thumb/right', self._holo_latest_cb('_latest_holo_thumb'), 10)
         self.create_subscription(PoseStamped, '/hololens/index/right', self._holo_latest_cb('_latest_holo_index'), 10)
-        self.create_subscription(PoseStamped, '/hololens/gaze',        self._holo_latest_cb('_latest_holo_gaze'),  10)
+
+        # Gaze attention encoder (replaces the old gaze-pose stream + on-screen
+        # ball). The HoloLens app publishes a single Bool: True iff the wrist-cam
+        # view is open AND the wearer's gaze ray intersects that view panel.
+        # Recorded per-frame as looking_at_wrist (0/1).
+        self._latest_looking_at_wrist = 0
+        self.create_subscription(Bool, '/hololens/looking_at_wrist', self._looking_at_wrist_cb, 10)
 
         # QR-anchor status from the HoloLens app (health dot: teleop frame is
         # only valid once the wall-QR calibration has locked → "initialized").
@@ -199,19 +204,10 @@ class HDF5DataCollector(Node):
         self._qr_value     = ''
         self.create_subscription(String, '/hololens/qr_status', self._qr_cb, 10)
 
-        # Per-episode first-person video via HoloLens Mixed Reality Capture.
-        # Start on S, stop+download to demo_data/episode_N.mp4 on D, discard on
-        # C. All portal calls run in daemon threads and failures only warn —
-        # data collection never blocks on the headset.
-        self._enable_mrc = self.declare_parameter('enable_mrc', True).value
-        self._mrc = None
-        if self._enable_mrc:
-            try:
-                from hololens_mrc import MRCClient
-                self._mrc = MRCClient()
-                self.get_logger().info('MRC per-episode video enabled (HoloLens Device Portal)')
-            except Exception as e:
-                self.get_logger().warn(f'MRC video disabled: {e}')
+        # NOTE: per-episode HoloLens MRC first-person video was removed — the
+        # on-device compositing overheated the headset. Attention is now
+        # captured cheaply as the looking_at_wrist boolean above instead of a
+        # recorded gaze video/pose.
 
         # Piezense pressure input (latest-value side channel)
         self._enable_piezense    = self.declare_parameter('enable_piezense', True).value
@@ -273,7 +269,7 @@ class HDF5DataCollector(Node):
         self._buf_holo_palm_pose   = []   # raw Unity-frame palm
         self._buf_holo_thumb_pose  = []
         self._buf_holo_index_pose  = []
-        self._buf_holo_gaze_pose   = []
+        self._buf_looking_at_wrist = []   # 0/1 gaze-on-wristcam encoder
         self._buf_finger_tips      = []
         self._buf_hand_width       = []
         self._buf_piezense_input   = []
@@ -325,6 +321,12 @@ class HDF5DataCollector(Node):
         self._latest_holo_palm = msg
         self._holo_last_seen   = time.monotonic()
         self._holo_link_seen   = self._holo_last_seen
+
+    def _looking_at_wrist_cb(self, msg: Bool):
+        """Gaze attention encoder from the HoloLens app: True iff the wrist-cam
+        view is open and the wearer is looking at it. Also marks the link alive."""
+        self._latest_looking_at_wrist = 1 if msg.data else 0
+        self._holo_link_seen = time.monotonic()
 
     def get_hololens_health(self) -> str:
         """ready = hands tracked; waiting = app connected but hands not visible;
@@ -390,7 +392,7 @@ class HDF5DataCollector(Node):
             self._buf_holo_palm_pose.append(_pose_to_vec7_raw(self._latest_holo_palm))
             self._buf_holo_thumb_pose.append(_pose_to_vec7_raw(self._latest_holo_thumb))
             self._buf_holo_index_pose.append(_pose_to_vec7_raw(self._latest_holo_index))
-            self._buf_holo_gaze_pose.append(_pose_to_vec7_raw(self._latest_holo_gaze))
+            self._buf_looking_at_wrist.append(self._latest_looking_at_wrist)
             self._buf_finger_tips.append(self._latest_finger_tips.copy())
             self._buf_hand_width.append(self._latest_hand_width)
 
@@ -494,39 +496,6 @@ class HDF5DataCollector(Node):
             return 'waiting' if (now - self._node_start_time) < 5.0 else 'dead'
         return 'ready' if (now - self._piezense_last_seen) < 3.0 else 'dead'
 
-    # ── HoloLens MRC video (all calls threaded; failures warn, never block) ──
-    def _mrc_start(self):
-        if self._mrc is None:
-            return
-        def run():
-            try:
-                self._mrc.start()
-                self.get_logger().info('MRC first-person video: recording')
-            except Exception as e:
-                self.get_logger().warn(f'MRC start failed: {e} — episode continues without video')
-        threading.Thread(target=run, daemon=True).start()
-
-    def _mrc_finish(self, episode_idx: int):
-        if self._mrc is None:
-            return
-        dest = os.path.join(self._save_dir, f'episode_{episode_idx}.mp4')
-        def run():
-            try:
-                path, size = self._mrc.stop_and_fetch(dest)
-                self.get_logger().info(f'Saved {path} ({size / 1e6:.1f} MB)')
-            except Exception as e:
-                self.get_logger().warn(f'MRC video fetch failed: {e}')
-        threading.Thread(target=run, daemon=True).start()
-
-    def _mrc_discard(self):
-        if self._mrc is None:
-            return
-        def run():
-            try:
-                self._mrc.stop_and_discard()
-            except Exception as e:
-                self.get_logger().warn(f'MRC discard failed: {e}')
-        threading.Thread(target=run, daemon=True).start()
 
     # ── Collection controls ───────────────────────────────────────────────────
     def start_collection(self):
@@ -544,7 +513,6 @@ class HDF5DataCollector(Node):
                 # stale image that looks live.
                 self._latest_dji_frame = None
                 self._dji_enable_pub.publish(Bool(data=True))
-            self._mrc_start()
             self.get_logger().info(f'Started recording episode {self.demo_count}')
 
     def end_collection(self):
@@ -559,7 +527,6 @@ class HDF5DataCollector(Node):
             self.get_logger().info(
                 f'Episode {self.demo_count} | {n} frames | {dur:.1f}s | {n/dur:.1f} Hz'
             )
-            self._mrc_finish(self.demo_count)
             self.demo_count += 1
 
     def cancel_collection(self):
@@ -573,7 +540,6 @@ class HDF5DataCollector(Node):
             n = len(self._buf_action_pose)
             with self._lock:
                 self._reset_buffers()
-            self._mrc_discard()
             self.get_logger().info(
                 f'Episode {self.demo_count} CANCELLED — discarded {n} frames (not saved)'
             )
@@ -629,7 +595,7 @@ class HDF5DataCollector(Node):
             holo_palm       = np.array(self._buf_holo_palm_pose,  dtype=np.float32)
             holo_thumb      = np.array(self._buf_holo_thumb_pose, dtype=np.float32)
             holo_index      = np.array(self._buf_holo_index_pose, dtype=np.float32)
-            holo_gaze       = np.array(self._buf_holo_gaze_pose,  dtype=np.float32)
+            looking_at_wrist = np.array(self._buf_looking_at_wrist, dtype=np.uint8)
             finger_tips      = np.array(self._buf_finger_tips,      dtype=np.float32)
             hand_width       = np.array(self._buf_hand_width,       dtype=np.float32)
             if self._enable_piezense:
@@ -657,7 +623,7 @@ class HDF5DataCollector(Node):
             hl.create_dataset('palm_pose',   data=holo_palm)
             hl.create_dataset('thumb_pose',  data=holo_thumb)
             hl.create_dataset('index_pose',  data=holo_index)
-            hl.create_dataset('gaze_pose',   data=holo_gaze)
+            hl.create_dataset('looking_at_wrist', data=looking_at_wrist)
             hl.create_dataset('finger_tips', data=finger_tips)
             hl.create_dataset('hand_width',  data=hand_width)
             # hand/pose (robot-frame palm) lives here too for easy access

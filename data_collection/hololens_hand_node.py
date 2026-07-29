@@ -20,7 +20,6 @@ Subscribed topics (from HoloLens Unity app via rosbridge):
   /hololens/middle/right   geometry_msgs/PoseStamped  (optional — finger_tips[6:9])
   /hololens/ring/right     geometry_msgs/PoseStamped  (optional — finger_tips[9:12])
   /hololens/pinky/right    geometry_msgs/PoseStamped  (optional — finger_tips[12:15])
-  /hololens/gaze           geometry_msgs/PoseStamped  (stored for logging)
 
 ROS2 Parameters:
   pinch_close_m   float  0.025  distance (m) below which gripper fully closes
@@ -117,7 +116,6 @@ class HoloLensHandNode(Node):
         self._middle_msg = None
         self._ring_msg   = None
         self._pinky_msg  = None
-        self._gaze_msg   = None
         self._last_palm_t = None  # monotonic time of last palm message
 
         # ── Publishers ──────────────────────────────────────────────────────────
@@ -140,8 +138,6 @@ class HoloLensHandNode(Node):
                                  self._ring_cb,   10)
         self.create_subscription(PoseStamped, '/hololens/pinky/right',
                                  self._pinky_cb,  10)
-        self.create_subscription(PoseStamped, '/hololens/gaze',
-                                 self._gaze_cb,   10)
 
         # ── Processing timer at 30 Hz ───────────────────────────────────────────
         self.create_timer(1.0 / 30.0, self._process_and_publish)
@@ -181,7 +177,6 @@ class HoloLensHandNode(Node):
     def _middle_cb(self, msg: PoseStamped): self._middle_msg = msg
     def _ring_cb(self,   msg: PoseStamped): self._ring_msg   = msg
     def _pinky_cb(self,  msg: PoseStamped): self._pinky_msg  = msg
-    def _gaze_cb(self,   msg: PoseStamped): self._gaze_msg   = msg
 
     # ── Helpers ──────────────────────────────────────────────────────────────
     def _is_tracking(self) -> bool:

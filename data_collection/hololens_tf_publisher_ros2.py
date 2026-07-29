@@ -19,7 +19,6 @@ TF tree broadcasts (parent → child):
   Unity → left_palm
   Unity → right_thumb
   Unity → right_index
-  Unity → gaze
   Unity → virtual_base_link
   virtual_base_link → base_link  (static identity)
 
@@ -45,7 +44,6 @@ class HoloLensTFPublisher(Node):
         '/hololens/palm/left':        'left_palm',
         '/hololens/thumb/right':      'right_thumb',
         '/hololens/index/right':      'right_index',
-        '/hololens/gaze':             'gaze',
         '/hololens/virtual_base_link': 'virtual_base_link',
     }
 
