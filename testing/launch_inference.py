@@ -147,7 +147,7 @@ def main(argv=sys.argv[1:]):
     # a resolved device that does not exist.
     print("  DJI device:      auto-detect by USB id" if args.dji_device < 0
           else f"  DJI device:      /dev/video{args.dji_device}")
-    print(f"  dt / action steps / diffusion steps: from checkpoint config")
+    print("  dt / action steps / diffusion steps: from checkpoint config")
     if args.latency_offset_s:
         print(f"  Latency offset:  {args.latency_offset_s*1000:.0f} ms")
     print()

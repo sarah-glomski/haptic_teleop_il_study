@@ -77,13 +77,19 @@ from scipy.spatial.transform import Rotation as R
 from rcl_interfaces.msg import SetParametersResult
 from std_msgs.msg import Bool, Float32, String
 
-from kortex_api.autogen.messages import Base_pb2
+from kortex_api.TCPTransport import TCPTransport
+from kortex_api.RouterClient import RouterClient
+from kortex_api.SessionManager import SessionManager
+from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
+from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
+from kortex_api.autogen.messages import Session_pb2, Base_pb2
 
-# Shared arm-control layer, also used by testing/inference.py. Session
-# lifecycle, speed caps, workspace bounds, orientation clamps, the fault latch
-# and the stall guard all live there, so teleop and policy rollout cannot drift
-# apart the way they had by 2026-07-29.
-from kinova_arm import ArmLimits, KinovaArm, HOME_JOINTS_DEG, TWIST_WATCHDOG_MS
+# Shared safety limits and home posture, also used by testing/inference.py, so
+# a workspace bound or speed cap edited there moves both consumers.
+# NOTE: this node still owns its own Kortex session and control loop (the
+# imports above) — only the LIMITS are shared so far. Rewiring _connect and the
+# control loop onto KinovaArm is the remaining half of that refactor.
+from kinova_arm import ArmLimits, HOME_JOINTS_DEG, TWIST_WATCHDOG_MS
 
 # Optional dependency for tracking_mode:=ff_ruckig (pip install ruckig).
 try:
