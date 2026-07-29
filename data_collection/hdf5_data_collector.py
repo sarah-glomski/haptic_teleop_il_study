@@ -66,7 +66,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image, JointState
-from std_msgs.msg import Bool, Float32, Float32MultiArray
+from std_msgs.msg import Bool, Float32, Float32MultiArray, String
 from piezense_interfaces.msg import PiezenseSystemArray
 
 
@@ -186,11 +186,32 @@ class HDF5DataCollector(Node):
         self._latest_holo_thumb = None
         self._latest_holo_index = None
         self._latest_holo_gaze  = None
-        self._holo_last_seen    = None
-        self.create_subscription(PoseStamped, '/hololens/palm/right',  self._holo_palm_cb,                                    10)
-        self.create_subscription(PoseStamped, '/hololens/thumb/right', lambda m: setattr(self, '_latest_holo_thumb', m),      10)
-        self.create_subscription(PoseStamped, '/hololens/index/right', lambda m: setattr(self, '_latest_holo_index', m),      10)
-        self.create_subscription(PoseStamped, '/hololens/gaze',        lambda m: setattr(self, '_latest_holo_gaze',  m),      10)
+        self._holo_last_seen    = None   # palm pose → hands actively tracked
+        self._holo_link_seen    = None   # any /hololens/* topic → app connected
+        self.create_subscription(PoseStamped, '/hololens/palm/right',  self._holo_palm_cb,                    10)
+        self.create_subscription(PoseStamped, '/hololens/thumb/right', self._holo_latest_cb('_latest_holo_thumb'), 10)
+        self.create_subscription(PoseStamped, '/hololens/index/right', self._holo_latest_cb('_latest_holo_index'), 10)
+        self.create_subscription(PoseStamped, '/hololens/gaze',        self._holo_latest_cb('_latest_holo_gaze'),  10)
+
+        # QR-anchor status from the HoloLens app (health dot: teleop frame is
+        # only valid once the wall-QR calibration has locked → "initialized").
+        self._qr_last_seen = None
+        self._qr_value     = ''
+        self.create_subscription(String, '/hololens/qr_status', self._qr_cb, 10)
+
+        # Per-episode first-person video via HoloLens Mixed Reality Capture.
+        # Start on S, stop+download to demo_data/episode_N.mp4 on D, discard on
+        # C. All portal calls run in daemon threads and failures only warn —
+        # data collection never blocks on the headset.
+        self._enable_mrc = self.declare_parameter('enable_mrc', True).value
+        self._mrc = None
+        if self._enable_mrc:
+            try:
+                from hololens_mrc import MRCClient
+                self._mrc = MRCClient()
+                self.get_logger().info('MRC per-episode video enabled (HoloLens Device Portal)')
+            except Exception as e:
+                self.get_logger().warn(f'MRC video disabled: {e}')
 
         # Piezense pressure input (latest-value side channel)
         self._enable_piezense    = self.declare_parameter('enable_piezense', True).value
@@ -293,15 +314,51 @@ class HDF5DataCollector(Node):
                 'Piezense: no data on piezense/data — is piezense_driver running?'
             )
 
+    def _holo_latest_cb(self, attr: str):
+        """Latest-value setter that also marks the HoloLens link alive."""
+        def cb(msg):
+            setattr(self, attr, msg)
+            self._holo_link_seen = time.monotonic()
+        return cb
+
     def _holo_palm_cb(self, msg: PoseStamped):
         self._latest_holo_palm = msg
         self._holo_last_seen   = time.monotonic()
+        self._holo_link_seen   = self._holo_last_seen
 
     def get_hololens_health(self) -> str:
+        """ready = hands tracked; waiting = app connected but hands not visible;
+        dead = no HoloLens traffic at all.
+
+        Hand tracking drops out routinely (hands leave the FOV whenever the
+        operator is not actively teleoperating), which is normal and should not
+        look like a failure. Only a dead link earns a red dot, so the two are
+        tracked on separate timestamps: palm pose for tracking, ANY /hololens/*
+        topic for the link — gaze and qr_status keep publishing while the app
+        runs regardless of hands.
+        """
         now = time.monotonic()
-        if self._holo_last_seen is None:
+        if self._holo_link_seen is None:
             return 'waiting' if (now - self._node_start_time) < 5.0 else 'dead'
-        return 'ready' if (now - self._holo_last_seen) < 3.0 else 'dead'
+        if (now - self._holo_link_seen) > 3.0:
+            return 'dead'
+        if self._holo_last_seen is None or (now - self._holo_last_seen) > 3.0:
+            return 'waiting'
+        return 'ready'
+
+    def _qr_cb(self, msg: String):
+        self._qr_last_seen = time.monotonic()
+        self._qr_value = msg.data
+        self._holo_link_seen = self._qr_last_seen
+
+    def get_qr_health(self) -> str:
+        """Green only once the headset reports the QR anchor has locked."""
+        now = time.monotonic()
+        if self._qr_last_seen is None:
+            return 'waiting' if (now - self._node_start_time) < 5.0 else 'dead'
+        if (now - self._qr_last_seen) > 3.0:
+            return 'dead'
+        return 'ready' if self._qr_value == 'initialized' else 'waiting'
 
     # ── Core synced callback ──────────────────────────────────────────────────
     def _zed_cb(self, msg: Image):
@@ -408,6 +465,27 @@ class HDF5DataCollector(Node):
                                 else ('waiting' if last is None else 'dead'))
         return result
 
+    def get_dji_preview(self):
+        """Latest DJI wrist frame as HWC RGB uint8, or None when not streaming.
+
+        These are the exact pixels buffered into images/dji_wrist, so the GUI
+        preview doubles as a check that the camera has not rotated its output
+        mid-episode. Returns None whenever the DJI node is not streaming (it is
+        disabled between episodes) so the GUI shows a placeholder rather than a
+        frozen last frame.
+
+        Reading _latest_dji_frame without the lock is safe: the callback rebinds
+        the attribute to a fresh array rather than mutating in place, so we get
+        either the previous or the next frame, never a torn one. Same pattern as
+        _synced_callback.
+        """
+        if not (self._enable_dji and self._dji_cam_active):
+            return None
+        frame = self._latest_dji_frame
+        if frame is None:
+            return None
+        return frame.transpose(1, 2, 0)  # CHW → HWC
+
     def get_piezense_health(self) -> str:
         if not self._enable_piezense:
             return 'disabled'
@@ -415,6 +493,40 @@ class HDF5DataCollector(Node):
         if self._piezense_last_seen is None:
             return 'waiting' if (now - self._node_start_time) < 5.0 else 'dead'
         return 'ready' if (now - self._piezense_last_seen) < 3.0 else 'dead'
+
+    # ── HoloLens MRC video (all calls threaded; failures warn, never block) ──
+    def _mrc_start(self):
+        if self._mrc is None:
+            return
+        def run():
+            try:
+                self._mrc.start()
+                self.get_logger().info('MRC first-person video: recording')
+            except Exception as e:
+                self.get_logger().warn(f'MRC start failed: {e} — episode continues without video')
+        threading.Thread(target=run, daemon=True).start()
+
+    def _mrc_finish(self, episode_idx: int):
+        if self._mrc is None:
+            return
+        dest = os.path.join(self._save_dir, f'episode_{episode_idx}.mp4')
+        def run():
+            try:
+                path, size = self._mrc.stop_and_fetch(dest)
+                self.get_logger().info(f'Saved {path} ({size / 1e6:.1f} MB)')
+            except Exception as e:
+                self.get_logger().warn(f'MRC video fetch failed: {e}')
+        threading.Thread(target=run, daemon=True).start()
+
+    def _mrc_discard(self):
+        if self._mrc is None:
+            return
+        def run():
+            try:
+                self._mrc.stop_and_discard()
+            except Exception as e:
+                self.get_logger().warn(f'MRC discard failed: {e}')
+        threading.Thread(target=run, daemon=True).start()
 
     # ── Collection controls ───────────────────────────────────────────────────
     def start_collection(self):
@@ -427,7 +539,12 @@ class HDF5DataCollector(Node):
             if self._enable_dji:
                 self._dji_cam_active = True
                 self._cam_drop_warned['dji_wrist'] = False  # re-arm warning for this episode
+                # Drop the last episode's frame: the DJI node takes a moment to
+                # reopen the device, and the GUI preview would otherwise show a
+                # stale image that looks live.
+                self._latest_dji_frame = None
                 self._dji_enable_pub.publish(Bool(data=True))
+            self._mrc_start()
             self.get_logger().info(f'Started recording episode {self.demo_count}')
 
     def end_collection(self):
@@ -442,6 +559,7 @@ class HDF5DataCollector(Node):
             self.get_logger().info(
                 f'Episode {self.demo_count} | {n} frames | {dur:.1f}s | {n/dur:.1f} Hz'
             )
+            self._mrc_finish(self.demo_count)
             self.demo_count += 1
 
     def cancel_collection(self):
@@ -455,6 +573,7 @@ class HDF5DataCollector(Node):
             n = len(self._buf_action_pose)
             with self._lock:
                 self._reset_buffers()
+            self._mrc_discard()
             self.get_logger().info(
                 f'Episode {self.demo_count} CANCELLED — discarded {n} frames (not saved)'
             )
@@ -567,10 +686,50 @@ class HDF5DataCollector(Node):
 
 # ── Pygame UI ─────────────────────────────────────────────────────────────────
 
+PANEL_W    = 620   # left control panel — the original window width
+PREVIEW_PX = 224   # DJI preview edge, shown 1:1 with the policy input
+GUI_W      = PANEL_W + PREVIEW_PX + 40
+GUI_H      = 340
+
+
+def _draw_dji_preview(screen, node, small_font):
+    """Draw the live DJI wrist feed at native 224x224, or a placeholder.
+
+    Rendered 1:1 with no scaling so it is exactly what gets written to
+    images/dji_wrist and fed to the policy — which makes a mid-session camera
+    rotation visible while there is still time to redo the demo.
+    """
+    x, y = PANEL_W + 20, 46
+    screen.blit(small_font.render('DJI wrist — policy input', True, (200, 200, 200)), (x, 20))
+
+    frame = node.get_dji_preview()
+    if frame is None:
+        pygame.draw.rect(screen, (30, 33, 39), (x, y, PREVIEW_PX, PREVIEW_PX))
+        # Two short lines: as one line this text is wider than the 224 px box
+        # and spills past the border on both sides.
+        lines = ['idle', 'streams while recording']
+        ly = y + PREVIEW_PX // 2 - 10 * len(lines)
+        for line in lines:
+            label = small_font.render(line, True, (110, 118, 128))
+            screen.blit(label, (x + max(0, (PREVIEW_PX - label.get_width()) // 2), ly))
+            ly += 20
+    else:
+        # make_surface wants (W, H, 3); the frame arrives HWC.
+        surf = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
+        if surf.get_size() != (PREVIEW_PX, PREVIEW_PX):
+            surf = pygame.transform.smoothscale(surf, (PREVIEW_PX, PREVIEW_PX))
+        screen.blit(surf, (x, y))
+        h, w = frame.shape[:2]
+        screen.blit(small_font.render(f'{w}x{h}', True, (120, 130, 140)),
+                    (x, y + PREVIEW_PX + 6))
+
+    pygame.draw.rect(screen, (90, 96, 105), (x, y, PREVIEW_PX, PREVIEW_PX), 1)
+
+
 def run_pygame(node: HDF5DataCollector):
     """Pygame keyboard control loop. Runs in the main thread."""
     pygame.init()
-    screen     = pygame.display.set_mode((620, 340))
+    screen     = pygame.display.set_mode((GUI_W, GUI_H))
     pygame.display.set_caption('Haptic Teleop IL — Data Collection')
     font       = pygame.font.Font(None, 32)
     small_font = pygame.font.Font(None, 24)
@@ -600,7 +759,7 @@ def run_pygame(node: HDF5DataCollector):
             ('idle',     ( 60, 100, 160)),
             ('disabled', ( 80,  80,  80)),
         ]
-        kx = screen.get_width() - 90
+        kx = PANEL_W - 90
         for row, (label, kcolor) in enumerate(key):
             ky = 12 + row * 18
             pygame.draw.circle(screen, kcolor, (kx, ky + 5), 4)
@@ -631,13 +790,21 @@ def run_pygame(node: HDF5DataCollector):
         health_items = list(node.get_camera_health().items())
         health_items.append(('piezense', node.get_piezense_health()))
         health_items.append(('hololens', node.get_hololens_health()))
+        health_items.append(('qr', node.get_qr_health()))
+        # Flow the chips left-to-right using their MEASURED widths: a fixed
+        # step overlaps as soon as one label is wider than its share of the row
+        # ('zed_isometric' alone exceeds a fifth of it).
         row_left  = 20
-        row_right = screen.get_width() - 20
-        step = (row_right - row_left) // len(health_items)
-        for i, (label, status) in enumerate(health_items):
-            x = row_left + i * step
-            pygame.draw.circle(screen, health_colors[status], (x + 6, 132), 6)
-            screen.blit(small_font.render(label, True, (200, 200, 200)), (x + 16, 126))
+        row_right = PANEL_W - 20
+        chips = [(small_font.render(label, True, (200, 200, 200)), status)
+                 for label, status in health_items]
+        chips_w = sum(16 + surf.get_width() for surf, _ in chips)   # 16 = dot + pad
+        gap = max(6, (row_right - row_left - chips_w) // max(1, len(chips) - 1))
+        cx = row_left
+        for surf, status in chips:
+            pygame.draw.circle(screen, health_colors[status], (cx + 6, 132), 6)
+            screen.blit(surf, (cx + 16, 126))
+            cx += 16 + surf.get_width() + gap
 
         # Controls
         controls = [
@@ -654,6 +821,8 @@ def run_pygame(node: HDF5DataCollector):
         for line in controls:
             screen.blit(small_font.render(line, True, (120, 130, 140)), (20, y))
             y += 20
+
+        _draw_dji_preview(screen, node, small_font)
 
         pygame.display.flip()
         clock.tick(30)

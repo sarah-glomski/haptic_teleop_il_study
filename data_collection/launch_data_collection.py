@@ -22,7 +22,7 @@ Usage:
 
   --robot-ip       ROBOT_IP       Kinova Gen3 IP (default 192.168.1.10)
   --zed-serial     SERIAL_NO      ZED M serial number as string (default '')
-  --dji-device     N              V4L2 device index for DJI camera (default 0)
+  --dji-device     N              V4L2 device index for DJI camera (default -1 = auto-detect)
 
 Keyboard controls (in the pygame window):
   R - Reset robot to home
@@ -177,6 +177,17 @@ def generate_launch_description(
             name='dji_wrist_camera',
             output='screen',
         )] if not no_cameras else []),
+
+        # ── 9. Wrist-cam relay — JPEG stream for the HoloLens window ─────────
+        # Compresses the DJI feed to /dji_wrist/compressed so the headset's
+        # "Camera" voice-toggled window can show it over rosbridge. Also keeps
+        # the DJI enabled so the view works during teleop, not only while
+        # recording.
+        *([ExecuteProcess(
+            cmd=[_PYTHON, script('wrist_cam_relay.py')],
+            name='wrist_cam_relay',
+            output='screen',
+        )] if not no_cameras else []),
     ])
 
 
@@ -188,9 +199,9 @@ def main(argv=sys.argv[1:]):
                         help='Kinova Gen3 IP address (default: 192.168.1.10)')
     parser.add_argument('--zed-serial', default=ZED_SERIAL,
                         help=f'ZED M serial number (default: {ZED_SERIAL})')
-    parser.add_argument('--dji-device', type=int, default=0,
-                        help='V4L2 device index for DJI Osmo Action 4 (default: 0). '
-                             'Run dji_camera_validate.py first to confirm.')
+    parser.add_argument('--dji-device', type=int, default=-1,
+                        help='V4L2 device index for DJI Osmo Action 4. Default -1 = '
+                             'auto-detect by USB id (immune to /dev/videoN reordering).')
     parser.add_argument('--no-zed', action='store_true',
                         help='Skip launching the ZED M camera node (e.g. if ZED SDK is not installed).')
     parser.add_argument('--zed-uvc', action='store_true',
@@ -209,7 +220,7 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('--orientation', action='store_true',
                         help='Enable hand-orientation wrist teleop in kinova_hand_controller '
                              '(clutched delta from enable-time reference, quaternion P-loop, '
-                             'tilt/yaw clamped). Default: translation-only, orientation held at home.')
+                             'roll/pitch/yaw clamped). Default: translation-only, orientation held at home.')
     args, launch_argv = parser.parse_known_args(argv)
 
     print('=' * 60)
@@ -236,6 +247,7 @@ def main(argv=sys.argv[1:]):
         ('hdf5_data_collector',        'hdf5_data_collector'),
         ('dji_camera_node',            'dji_camera_node'),
         ('zed_uvc_node',               'zed_uvc_node'),
+        ('wrist_cam_relay',            'wrist_cam_relay'),
     ]
     if not args.no_piezense:
         stale_patterns.append(('ar_teleop_piezense_launch', 'piezense_launch'))

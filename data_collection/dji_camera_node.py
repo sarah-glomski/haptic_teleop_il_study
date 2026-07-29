@@ -32,6 +32,8 @@ Usage:
   /usr/bin/python3.12 dji_camera_node.py --ros-args -r /wrist_cam/image_raw:=/dji_wrist/dji_wrist/color/image_raw
 """
 
+import glob
+import os
 import time
 import threading
 
@@ -43,12 +45,40 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 
 
+def find_dji_device() -> int:
+    """Return the /dev/videoN index of the DJI's streaming UVC interface, or -1.
+
+    Matches the stable /dev/v4l/by-id symlink name so the right camera is found
+    regardless of USB enumeration order (e.g. when the ZED grabs video0/1 and
+    pushes the DJI to video2). The lowest-numbered interface is the streaming
+    one (index0); the second is metadata.
+    """
+    candidates = []
+    for link in glob.glob('/dev/v4l/by-id/*'):
+        name = os.path.basename(link).lower()
+        if 'dji' in name or 'osmoaction' in name:
+            target = os.path.basename(os.path.realpath(link))   # e.g. 'video2'
+            if target.startswith('video') and target[5:].isdigit():
+                candidates.append(int(target[5:]))
+    return min(candidates) if candidates else -1
+
+
 class DJICameraNode(Node):
 
     def __init__(self):
         super().__init__('dji_camera_node')
 
-        self.device_index = self.declare_parameter('device_index', 0).value
+        # -1 (default) = auto-detect the DJI by its USB id, immune to
+        # /dev/videoN reordering. Pass an explicit N only to override.
+        self.device_index = self.declare_parameter('device_index', -1).value
+        self._auto_detect = self.device_index < 0
+        if self._auto_detect:
+            detected = find_dji_device()
+            if detected < 0:
+                self.get_logger().warn(
+                    'No DJI camera found under /dev/v4l/by-id — is it in UVC '
+                    'mode? Will retry on enable.')
+            self.device_index = detected
         # Published / output size. Frames are resized down to this once, here, so
         # both data collection and inference consume the exact same pixels with
         # the same latency (no per-consumer resize). Defaults to the 224x224
@@ -106,6 +136,16 @@ class DJICameraNode(Node):
     def _open_camera(self):
         if self._cap is not None:
             self._cap.release()
+
+        # In auto mode, re-resolve by USB id on every open — the index can
+        # change if devices were (re)plugged since startup.
+        if self._auto_detect:
+            detected = find_dji_device()
+            if detected >= 0:
+                self.device_index = detected
+
+        if self.device_index < 0:
+            raise RuntimeError('No DJI camera found (UVC mode? cable?)')
 
         self._cap = cv2.VideoCapture(self.device_index, cv2.CAP_V4L2)
         if not self._cap.isOpened():

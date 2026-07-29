@@ -114,8 +114,8 @@ def main(argv=sys.argv[1:]):
     parser.add_argument("--latest",          action="store_true",
                         help="Use the newest run's checkpoint in training/data/outputs/")
     parser.add_argument("--robot-ip",        type=str,   default="192.168.1.10")
-    parser.add_argument("--dji-device",      type=int,   default=0,
-                        help="V4L2 device index for DJI wrist camera (default: 0)")
+    parser.add_argument("--dji-device",      type=int,   default=-1,
+                        help="V4L2 device index for DJI wrist camera (default: -1 = auto-detect by USB id)")
     parser.add_argument("--dt",              type=float, default=0.1,
                         help="Action step period in seconds (default: 0.1 = 10 Hz, "
                              "matching training obs_down_sample_steps 3 @ 30 Hz)")
