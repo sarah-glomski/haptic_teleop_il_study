@@ -78,11 +78,17 @@ def append_hold(src_path: pathlib.Path, dst_path: pathlib.Path, n_hold: int,
     with h5py.File(src_path, "r") as fin:
         rate = int(fin.attrs.get("collection_rate_hz", 30))
 
-        # Collect every dataset (recursively) and its data.
+        # Collect every dataset (recursively) and its data, plus the attrs
+        # hanging off intermediate GROUPS (piezense/channel_ids, piezense/units).
+        # visititems yields groups and datasets separately, so collecting only
+        # datasets silently drops that metadata.
         datasets = {}
+        group_attrs = {}
         def collect(name, obj):
             if isinstance(obj, h5py.Dataset):
                 datasets[name] = obj[()]
+            elif isinstance(obj, h5py.Group):
+                group_attrs[name] = dict(obj.attrs)
         fin.visititems(collect)
 
         # Apply the end-crop FIRST so the held frame is the last kept frame,
@@ -107,10 +113,20 @@ def append_hold(src_path: pathlib.Path, dst_path: pathlib.Path, n_hold: int,
                     pad[:] = 0.0                             # fully open
 
                 out = np.concatenate([arr, pad], axis=0)
-                fout.create_dataset(name, data=out, compression="gzip"
-                                    if arr.ndim > 1 and arr.dtype == np.uint8 else None)
+                # Match hdf5_data_collector.py exactly: lzf on the image stacks,
+                # no compression anywhere else. gzip packs ~35% smaller but is
+                # far slower to read, and a collection whose codec depends on
+                # which script last touched it is a needless surprise.
+                comp = 'lzf' if (arr.ndim > 1 and arr.dtype == np.uint8) else None
+                fout.create_dataset(name, data=out, compression=comp)
 
-            # Preserve + update attrs.
+            # Preserve group-level attrs (create_dataset made the groups above).
+            for gname, attrs in group_attrs.items():
+                if gname in fout:
+                    for k, v in attrs.items():
+                        fout[gname].attrs[k] = v
+
+            # Preserve + update root attrs.
             for k, v in fin.attrs.items():
                 fout.attrs[k] = v
             fout.attrs["num_frames"] = n_orig + n_hold
