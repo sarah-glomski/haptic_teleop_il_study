@@ -13,7 +13,7 @@ Collects time-synchronized data from:
 Additional data captured as latest-value at each sync tick (not in sync filter):
   - robot_obs/joint_states
   - hand/gripper_cmd, hand/hand_width, hand/finger_tips
-  - raw HoloLens: /hololens/palm/right, /hololens/thumb/right, /hololens/index/right, /hololens/looking_at_wrist
+  - raw HoloLens: /hololens/palm/right, /hololens/thumb/right, /hololens/index/right, /hololens/gaze, /hololens/looking_at_wrist
   - piezense/data (pressure_pa, 2 input channels)
 
 HDF5 schema (per episode):
@@ -29,6 +29,7 @@ HDF5 schema (per episode):
   │   ├── palm_pose:        (T, 7)  float32   [xyz, qxyzw]  (Unity/ROS frame)
   │   ├── thumb_pose:       (T, 7)  float32
   │   ├── index_pose:       (T, 7)  float32
+  │   ├── gaze_pose:        (T, 7)  float32   raw gaze ray pose (Unity/ROS frame)
   │   ├── looking_at_wrist: (T,)    uint8    1=gaze on the (open) wrist-cam view, else 0
   │   ├── finger_tips:   (T, 15) float32   [thumb(3), index(3), middle(3), ring(3), pinky(3)]
   │   └── hand_width:    (T,)    float32   thumb-index distance (m)
@@ -185,16 +186,19 @@ class HDF5DataCollector(Node):
         self._latest_holo_palm  = None
         self._latest_holo_thumb = None
         self._latest_holo_index = None
+        self._latest_holo_gaze  = None
         self._holo_last_seen    = None   # palm pose → hands actively tracked
         self._holo_link_seen    = None   # any /hololens/* topic → app connected
         self.create_subscription(PoseStamped, '/hololens/palm/right',  self._holo_palm_cb,                    10)
         self.create_subscription(PoseStamped, '/hololens/thumb/right', self._holo_latest_cb('_latest_holo_thumb'), 10)
         self.create_subscription(PoseStamped, '/hololens/index/right', self._holo_latest_cb('_latest_holo_index'), 10)
+        self.create_subscription(PoseStamped, '/hololens/gaze',        self._holo_latest_cb('_latest_holo_gaze'),  10)
 
-        # Gaze attention encoder (replaces the old gaze-pose stream + on-screen
-        # ball). The HoloLens app publishes a single Bool: True iff the wrist-cam
-        # view is open AND the wearer's gaze ray intersects that view panel.
-        # Recorded per-frame as looking_at_wrist (0/1).
+        # Gaze attention encoder. The HoloLens app publishes a single Bool: True
+        # iff the wrist-cam view is open AND the wearer's gaze ray intersects
+        # that view panel. Recorded per-frame as looking_at_wrist (0/1),
+        # alongside the raw gaze_pose stream above (kept for analysis; the old
+        # on-screen gaze ball + MRC video were removed).
         self._latest_looking_at_wrist = 0
         self.create_subscription(Bool, '/hololens/looking_at_wrist', self._looking_at_wrist_cb, 10)
 
@@ -269,6 +273,7 @@ class HDF5DataCollector(Node):
         self._buf_holo_palm_pose   = []   # raw Unity-frame palm
         self._buf_holo_thumb_pose  = []
         self._buf_holo_index_pose  = []
+        self._buf_holo_gaze_pose   = []
         self._buf_looking_at_wrist = []   # 0/1 gaze-on-wristcam encoder
         self._buf_finger_tips      = []
         self._buf_hand_width       = []
@@ -392,6 +397,7 @@ class HDF5DataCollector(Node):
             self._buf_holo_palm_pose.append(_pose_to_vec7_raw(self._latest_holo_palm))
             self._buf_holo_thumb_pose.append(_pose_to_vec7_raw(self._latest_holo_thumb))
             self._buf_holo_index_pose.append(_pose_to_vec7_raw(self._latest_holo_index))
+            self._buf_holo_gaze_pose.append(_pose_to_vec7_raw(self._latest_holo_gaze))
             self._buf_looking_at_wrist.append(self._latest_looking_at_wrist)
             self._buf_finger_tips.append(self._latest_finger_tips.copy())
             self._buf_hand_width.append(self._latest_hand_width)
@@ -595,6 +601,7 @@ class HDF5DataCollector(Node):
             holo_palm       = np.array(self._buf_holo_palm_pose,  dtype=np.float32)
             holo_thumb      = np.array(self._buf_holo_thumb_pose, dtype=np.float32)
             holo_index      = np.array(self._buf_holo_index_pose, dtype=np.float32)
+            holo_gaze       = np.array(self._buf_holo_gaze_pose,  dtype=np.float32)
             looking_at_wrist = np.array(self._buf_looking_at_wrist, dtype=np.uint8)
             finger_tips      = np.array(self._buf_finger_tips,      dtype=np.float32)
             hand_width       = np.array(self._buf_hand_width,       dtype=np.float32)
@@ -623,6 +630,7 @@ class HDF5DataCollector(Node):
             hl.create_dataset('palm_pose',   data=holo_palm)
             hl.create_dataset('thumb_pose',  data=holo_thumb)
             hl.create_dataset('index_pose',  data=holo_index)
+            hl.create_dataset('gaze_pose',   data=holo_gaze)
             hl.create_dataset('looking_at_wrist', data=looking_at_wrist)
             hl.create_dataset('finger_tips', data=finger_tips)
             hl.create_dataset('hand_width',  data=hand_width)
