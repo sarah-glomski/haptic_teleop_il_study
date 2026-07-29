@@ -28,6 +28,7 @@ import math
 import multiprocessing
 import os
 import pathlib
+import queue
 import sys
 import threading
 import time
@@ -64,11 +65,17 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 import message_filters
 from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float32, Bool
 from cv_bridge import CvBridge
 from scipy.spatial.transform import Rotation as R
 from piezense_interfaces.msg import PiezenseSystemArray
+
+# Rollout recorder lives alongside this script (testing/). Ensure the dir is
+# importable even after os.chdir(_UMI_ROOT) above.
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+from rollout_recorder import RolloutRecorder
 
 from kortex_api.TCPTransport import TCPTransport
 from kortex_api.RouterClient import RouterClient
@@ -115,6 +122,9 @@ GRIPPER_MAX_WIDTH_M = 0.085
 
 CAMERA_KEYS = ["camera0_rgb"]
 CAMERA_TOPICS = {"camera0_rgb": DJI_WRIST_TOPIC}
+
+# Rollout recording (opt-in via --record); episode_N.hdf5 under testing/.
+ROLLOUT_DIR_DEFAULT = os.path.join(_THIS_DIR, "rollout_data")
 
 
 # ── UMI-schema encode/decode helpers ───────────────────────────────────────────
@@ -226,7 +236,8 @@ def load_obs_meta(model_path: str):
 class PolicyNode(Node):
     """ROS2 node: collects observations (UMI schema), tracks policy targets via P-loop."""
 
-    def __init__(self, shared_obs: dict, start_time: float, model_path: str, dt: float):
+    def __init__(self, shared_obs: dict, start_time: float, model_path: str, dt: float,
+                 record: bool = False, record_dir: str = None, pred_queue=None):
         super().__init__("kinova_policy_node")
         np.set_printoptions(suppress=True, precision=4)
 
@@ -298,6 +309,19 @@ class PolicyNode(Node):
         self.create_subscription(
             PiezenseSystemArray, PIEZENSE_TOPIC, self._piezense_cb, 10
         )
+
+        # ── Rollout recording (opt-in) ───────────────────────────────────────
+        # joint_states is recorded for parity with collected demos; not used by
+        # the policy, so it's a latest-value side channel like the collector's.
+        self._latest_joint_states = np.zeros(7, dtype=np.float32)
+        self.create_subscription(JointState, 'robot_obs/joint_states',
+                                 self._joint_states_cb, sensor_qos)
+        self._pred_queue = pred_queue
+        self._recorder = RolloutRecorder(record_dir or ROLLOUT_DIR_DEFAULT) if record else None
+        if self._recorder is not None:
+            self.get_logger().info(
+                f"Rollout recording ON → {record_dir or ROLLOUT_DIR_DEFAULT}  "
+                f"(S start, D save, R/Q discard)")
 
         self.create_timer(1.0 / 30.0, self.update_observation)
         self.create_timer(1.0 / 30.0, self.control_callback)
@@ -372,6 +396,37 @@ class PolicyNode(Node):
             buf.append((img, now))
             if len(buf) > self.raw_buffer_len:
                 buf.pop(0)
+
+        # ── Rollout recording ────────────────────────────────────────────────
+        # Record one frame per synced tick while an episode is active. Gated on a
+        # live action target so the few frames between S and the first executed
+        # action are skipped, keeping obs/action/image buffers equal length.
+        rec = self._recorder
+        if (rec is not None and rec.is_recording and not self.paused
+                and not self.is_resetting and self.current_target_xyz is not None
+                and self.current_target_euler is not None):
+            obs_pose7 = np.array([
+                pose_msg.pose.position.x, pose_msg.pose.position.y, pose_msg.pose.position.z,
+                pose_msg.pose.orientation.x, pose_msg.pose.orientation.y,
+                pose_msg.pose.orientation.z, pose_msg.pose.orientation.w,
+            ], dtype=np.float32)
+            q = R.from_euler("xyz", self.current_target_euler, degrees=True).as_quat()  # xyzw
+            action_pose7 = np.concatenate(
+                [np.asarray(self.current_target_xyz, dtype=np.float32), q.astype(np.float32)])
+            # Re-decode the wrist image to uint8 CHW RGB (the loop above made a
+            # float32/255 copy for the policy; the collector stores uint8).
+            img_u8 = self._bridge.imgmsg_to_cv2(wrist_msg, desired_encoding="rgb8")
+            if img_u8.shape[0] != IMG_SIZE or img_u8.shape[1] != IMG_SIZE:
+                img_u8 = cv2.resize(img_u8, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+            img_u8 = np.ascontiguousarray(img_u8.transpose(2, 0, 1))
+            rec.append(obs_pose7, float(self.gripper_state), action_pose7,
+                       float(self.current_gripper_cmd), self._latest_joint_states.copy(),
+                       self._latest_piezense.copy(), img_u8, now)
+
+    def _joint_states_cb(self, msg: JointState):
+        angles = list(msg.position)[:7]
+        if len(angles) == 7:
+            self._latest_joint_states = np.array(angles, dtype=np.float32)
 
     def _enable_dji_camera(self):
         msg = Bool()
@@ -480,6 +535,17 @@ class PolicyNode(Node):
     # ── Velocity control (identical to inference.py) ──────────────────────────
 
     def control_callback(self):
+        # Drain predicted action horizons from the GPU process into the recorder.
+        # append_prediction no-ops when not recording, so this also keeps the
+        # queue from backing up between episodes.
+        if self._recorder is not None and self._pred_queue is not None:
+            while True:
+                try:
+                    horizon, t = self._pred_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._recorder.append_prediction(horizon, t)
+
         if self.is_resetting:
             self._smoothed_vel[:] = 0.0
             return
@@ -576,6 +642,24 @@ class PolicyNode(Node):
         self.get_logger().info("Resumed.")
         self.paused = False
         self.shared_obs["paused"] = False
+        if self._recorder is not None:
+            self._recorder.start()   # begin a new rollout episode
+
+    def save_recording(self):
+        """Flush the in-progress rollout episode to disk (called on D)."""
+        if self._recorder is None:
+            return
+        res = self._recorder.save()
+        if res:
+            path, n = res
+            self.get_logger().info(f"Saved rollout {path}  ({n} frames)")
+        else:
+            self.get_logger().info("No rollout data to save")
+
+    def discard_recording(self):
+        """Drop the in-progress rollout episode (called on R and Q/close)."""
+        if self._recorder is not None:
+            self._recorder.discard()
 
     def reset_to_home(self):
         if self.is_resetting:
@@ -587,6 +671,7 @@ class PolicyNode(Node):
         self._smoothed_vel[:] = 0.0
         self.episode_start_pose_mat = None   # re-anchor _wrt_start on next obs
         self.is_resetting = True
+        self.discard_recording()             # abandon any partial rollout
         threading.Thread(target=self._do_home_reset, daemon=True).start()
 
     def _do_home_reset(self):
@@ -649,7 +734,7 @@ class PolicyNode(Node):
 def inference_loop(model_path, shared_obs, action_queue,
                    n_action_steps=8, device="cuda", start_time=0,
                    dt=0.1, num_inference_steps=16,
-                   latency_offset_s=0.0):
+                   latency_offset_s=0.0, pred_queue=None):
     """GPU process: load model and run inference, posting targets to the main process."""
     import sys as _sys
     _sys.stdout.reconfigure(line_buffering=True)
@@ -731,6 +816,9 @@ def inference_loop(model_path, shared_obs, action_queue,
             print(f"predict_action output: {actions.shape[0]} steps × {actions.shape[1]} dims", flush=True)
 
         t_start = time.monotonic()
+        # Publish the FULL predicted horizon (raw model output) for recording.
+        if pred_queue is not None:
+            pred_queue.put((actions.copy().astype(np.float32), t_start - start_time))
         action_queue.put(("CLEAR_PENDING", t_start))
         start_idx = min(latency_steps, len(actions) - 1)
         for i, act in enumerate(actions[start_idx: start_idx + n_action_steps]):
@@ -766,16 +854,19 @@ def monitor_keys(policy_node: PolicyNode, shared_obs: dict):
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     policy_node.pause_policy()
+                    policy_node.discard_recording()
                     os._exit(0)
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_d:
                         policy_node.pause_policy()
+                        policy_node.save_recording()
                     elif event.key == pygame.K_s:
                         policy_node.resume_policy()
                     elif event.key == pygame.K_r:
                         policy_node.reset_to_home()
                     elif event.key == pygame.K_q:
                         policy_node.pause_policy()
+                        policy_node.discard_recording()
                         time.sleep(0.2)
                         os._exit(0)
 
@@ -815,6 +906,10 @@ def main():
     parser.add_argument("--latency-offset-s", type=float, default=0.0,
                         help="System latency to compensate (seconds)")
     parser.add_argument("--no-pygame",       action="store_true",      help="Disable pygame window")
+    parser.add_argument("--record",          action="store_true",
+                        help="Record rollouts to episode_N.hdf5 (S start, D save, R/Q discard)")
+    parser.add_argument("--record-dir",      type=str, default=ROLLOUT_DIR_DEFAULT,
+                        help=f"Directory for rollout episodes (default: {ROLLOUT_DIR_DEFAULT})")
     args = parser.parse_args()
 
     multiprocessing.set_start_method("spawn", force=True)
@@ -822,6 +917,7 @@ def main():
     manager   = Manager()
     shared_obs = manager.dict(obs=None, paused=True)
     action_queue = Queue()
+    pred_queue = Queue() if args.record else None
     start_time = time.monotonic()
 
     rclpy.init()
@@ -839,12 +935,13 @@ def main():
         target=inference_loop,
         args=(args.model, shared_obs, action_queue,
               args.n_action_steps, device, start_time,
-              args.dt, args.diffusion_steps, args.latency_offset_s),
+              args.dt, args.diffusion_steps, args.latency_offset_s, pred_queue),
         daemon=True,
     )
     inf_proc.start()
 
-    node = PolicyNode(shared_obs, start_time, args.model, args.dt)
+    node = PolicyNode(shared_obs, start_time, args.model, args.dt,
+                      record=args.record, record_dir=args.record_dir, pred_queue=pred_queue)
 
     def action_executor():
         pending = []

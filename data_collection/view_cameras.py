@@ -27,7 +27,7 @@ from std_msgs.msg import Bool
 
 # Defaults matching launch_data_collection.py
 ZED_SERIAL = '17875187'
-DJI_DEVICE = 0
+DJI_DEVICE = -1  # -1 = auto-detect by USB id
 
 CAMERA_STREAMS = {
     'zed_isometric': '/zed_isometric/zed_node/left/image_rect_color',

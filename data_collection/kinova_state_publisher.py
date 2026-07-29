@@ -25,6 +25,7 @@ Usage:
 """
 
 import math
+import signal
 import time
 
 import rclpy
@@ -152,18 +153,36 @@ class KinovaStatePublisher(Node):
 
     # ── Cleanup ────────────────────────────────────────────────────────────────
     def destroy_node(self):
+        """Close the Kortex session, one step per try/except.
+
+        An abandoned session (close skipped, or the process killed outright)
+        makes the arm latch a NETWORK_ERROR fault that persists into the next
+        run, so neither step may be skipped because the other failed.
+        """
         self.get_logger().info('Disconnecting from Kinova Gen3 …')
-        try:
-            self._session_manager.CloseSession()
-            self._transport.disconnect()
-        except Exception:
-            pass
+        for label, step in (
+            ('close session', lambda: self._session_manager.CloseSession()),
+            ('disconnect',    lambda: self._transport.disconnect()),
+        ):
+            try:
+                step()
+            except Exception as e:
+                self.get_logger().warn(f'Shutdown step "{label}" failed: {e}')
         super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = KinovaStatePublisher()
+
+    # This node is cleared with `pkill -f kinova_state_publisher` (SIGTERM) by
+    # launch_data_collection.py. Python's default SIGTERM handling skips the
+    # finally block, abandoning the Kortex session — route it through the same
+    # orderly shutdown as Ctrl-C instead.
+    def _term(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

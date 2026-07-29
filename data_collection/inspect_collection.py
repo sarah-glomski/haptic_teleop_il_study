@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import datetime as _dt
 import glob
 import os
 import sys
@@ -34,15 +35,74 @@ except ImportError:
     _sort = sorted
 
 
+# ── exclude.txt: full drops + end-crops ─────────────────────────────────────────
+#
+# Format (shared with inspect_transitions.py — keep the two in sync):
+#     episode_N              drop the whole episode
+#     episode_N crop S E     keep frames [S:E) at conversion (end-crop only)
+# Both readers and writers here are ADDITIVE: an exclude written by this script
+# must never discard crops recorded by inspect_transitions.py, nor drops made in
+# an earlier run. To remove an entry, edit exclude.txt by hand.
+
+def _epnum(name):
+    digits = ''.join(c for c in name.replace('episode_', '') if c.isdigit())
+    return int(digits) if digits else 0
+
+
+def parse_exclude(path):
+    """Return (full_drops:set[str], crops:dict[str,(start,end)])."""
+    full, crops = set(), {}
+    if os.path.exists(path):
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                name = parts[0]
+                if len(parts) >= 4 and parts[1] == 'crop':
+                    crops[name] = (int(parts[2]), int(parts[3]))
+                else:
+                    full.add(name)
+    return full, crops
+
+
+def write_exclude(path, full, crops):
+    lines = ['# episode_N            → drop whole episode',
+             '# episode_N crop S E   → keep frames [S:E) at conversion (end-crop)']
+    for n in sorted(full, key=_epnum):
+        lines.append(n)
+    for n in sorted(crops, key=_epnum):
+        if n in full:
+            continue                       # a full drop supersedes a crop
+        s, e = crops[n]
+        lines.append(f'{n} crop {s} {e}')
+    with open(path, 'w') as fh:
+        fh.write('\n'.join(lines) + '\n')
+
+
 # ── Per-episode stats ──────────────────────────────────────────────────────────
 
-def compute_stats(path: str) -> dict | None:
+def compute_stats(path: str, crop=None) -> dict | None:
+    """crop=(start,end) truncates to the same window conversion will use, so the
+    table and dashboard reflect the to-be-converted data. Originals are never
+    modified — the crop lives only in exclude.txt."""
     try:
         with h5py.File(path, 'r') as f:
             hz  = float(f.attrs.get('collection_rate_hz', 30))
             act_pos = f['action/pose'][:, :3].astype(np.float64)    # (T,3)
             obs_pos = f['observation/pose'][:, :3].astype(np.float64)
             act_grip = f['action/gripper'][()].astype(np.float64)   # (T,)
+            # Piezense force is optional — collections recorded before the
+            # sensor existed, or with enable_piezense:=false, have no group.
+            force = (f['piezense/pressure_input'][()].astype(np.float64)
+                     if 'piezense/pressure_input' in f else None)   # (T,2) Pa
+
+        if crop is not None:
+            s, e = crop
+            act_pos, obs_pos, act_grip = act_pos[s:e], obs_pos[s:e], act_grip[s:e]
+            if force is not None:
+                force = force[s:e]
 
         T = len(act_pos)
         steps = np.diff(act_pos, axis=0)
@@ -68,6 +128,8 @@ def compute_stats(path: str) -> dict | None:
             act_pos    = act_pos,
             obs_pos    = obs_pos,
             act_grip   = act_grip,
+            force      = force,
+            crop       = crop,
         )
     except Exception as e:
         print(f'[WARN] Could not load {path}: {e}')
@@ -110,6 +172,10 @@ def print_table(rows: list[dict]):
         flag_str = ', '.join(flags) if flags else ''
         color = RED if flags else GREEN
         ep = r['name'].replace('episode_', '').replace('.hdf5', '')
+        if r.get('crop') is not None:
+            # Mark it: the row shows post-crop numbers, so a short duration here
+            # is the crop doing its job rather than a truncated demo.
+            ep += ' (crop)'
         print(
             f"{color}{ep:<12}{RESET} "
             f"{r['T']:>6d} "
@@ -129,7 +195,8 @@ def print_table(rows: list[dict]):
 
 # ── Dashboard figure ───────────────────────────────────────────────────────────
 
-def plot_dashboard(rows: list[dict], collection_dir: str, num_steps: int):
+def plot_dashboard(rows: list[dict], collection_dir: str, num_steps: int,
+                   out_path: str):
     n   = len(rows)
     eps = [r['name'].replace('episode_', 'ep').replace('.hdf5', '') for r in rows]
     x   = np.arange(n)
@@ -143,8 +210,10 @@ def plot_dashboard(rows: list[dict], collection_dir: str, num_steps: int):
 
     colors = ['tomato' if f else 'steelblue' for f in flagged]
 
-    fig = plt.figure(figsize=(18, 14))
-    gs  = fig.add_gridspec(3, 3, hspace=0.45, wspace=0.35)
+    fig = plt.figure(figsize=(18, 16))
+    # Last row holds only the text summary, so it needs less height than the plots.
+    gs  = fig.add_gridspec(4, 3, hspace=0.45, wspace=0.35,
+                           height_ratios=[1, 1, 1, 0.4])
 
     # ── Duration ──────────────────────────────────────────────────────────────
     ax = fig.add_subplot(gs[0, 0])
@@ -242,8 +311,40 @@ def plot_dashboard(rows: list[dict], collection_dir: str, num_steps: int):
     ax.set_title('Gripper Command Profiles', fontsize=9)
     ax.tick_params(labelsize=7)
 
+    # ── Piezense force profiles (normalised time) ─────────────────────────────
+    # One line per episode, same overlay style as the gripper panel, so a demo
+    # with an atypical contact profile stands out against the others. The two
+    # input channels get their own axes — a per-channel offset or a dead channel
+    # is invisible when they share one. ch2/ch3 naming matches
+    # visualize_episode.py (array columns 0 and 1).
+    with_force = [r for r in rows if r.get('force') is not None]
+    for ch, col_idx in ((0, 1), (1, 2)):
+        ax = fig.add_subplot(gs[2, col_idx])
+        plotted = 0
+        for i, r in enumerate(rows):
+            fr = r.get('force')
+            if fr is None or fr.ndim != 2 or fr.shape[1] <= ch:
+                continue
+            t   = np.linspace(0, 1, len(fr))
+            lw  = 1.5 if flagged[i] else 0.4
+            col = 'red' if flagged[i] else cmap(i % 20)
+            ax.plot(t, fr[:, ch], linewidth=lw, color=col, alpha=0.7)
+            plotted += 1
+        if plotted:
+            ax.set_xlabel('Normalised time', fontsize=8)
+            ax.set_ylabel('Pressure (Pa)', fontsize=8)
+            ax.set_title(f'Force Profile — ch{ch + 2}  '
+                         f'({plotted}/{n} episodes, red = flagged)', fontsize=9)
+        else:
+            ax.text(0.5, 0.5, 'no piezense data recorded', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=8, color='grey')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f'Force Profile — ch{ch + 2}', fontsize=9)
+        ax.tick_params(labelsize=7)
+
     # ── Flagged episodes summary ───────────────────────────────────────────────
-    ax = fig.add_subplot(gs[2, 1:])
+    ax = fig.add_subplot(gs[3, :])
     ax.axis('off')
     lines = [f'Collection: {os.path.basename(collection_dir.rstrip("/"))}',
              f'{n} episodes   {dur.mean():.1f}s avg   {dur.std():.1f}s σ',
@@ -262,7 +363,6 @@ def plot_dashboard(rows: list[dict], collection_dir: str, num_steps: int):
     fig.suptitle(f'Collection inspection — {os.path.basename(collection_dir.rstrip("/"))}',
                  fontsize=11)
 
-    out_path = os.path.join(collection_dir, 'inspection.png')
     plt.savefig(out_path, dpi=130, bbox_inches='tight')
     print(f'\nDashboard saved → {out_path}')
     plt.show()
@@ -335,8 +435,11 @@ def main():
     parser.add_argument('--detail', nargs='*', metavar='N',
                         help='Episode numbers to open in detail view (e.g. --detail 3 7)')
     parser.add_argument('--exclude', nargs='*', metavar='N',
-                        help='Write an exclude list (e.g. --exclude 0 4 6). '
-                             'Omit numbers to be prompted interactively.')
+                        help='Add to the exclude list (e.g. --exclude 0 4 6). '
+                             'Omit numbers to be prompted interactively. '
+                             'Additive — existing drops and crops are preserved.')
+    parser.add_argument('--out', default=None,
+                        help='Dashboard path (default: timestamped, never overwrites)')
     args = parser.parse_args()
 
     paths = _sort(glob.glob(os.path.join(args.collection, 'episode_*.hdf5')))
@@ -344,38 +447,42 @@ def main():
         print(f'No episode_*.hdf5 files found in {args.collection}')
         sys.exit(1)
 
-    # Skip episodes fully dropped in exclude.txt (ignore `crop` lines / comments,
-    # which inspect_transitions.py writes for downstream end-cropping).
+    # Skip episodes fully dropped in exclude.txt. Crops are read too — not to
+    # apply them here, but so they survive an --exclude write later on.
     exclude_file = os.path.join(args.collection, 'exclude.txt')
-    excluded = set()
-    if os.path.exists(exclude_file):
-        with open(exclude_file) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] == 'crop':
-                    continue
-                excluded.add(parts[0])
-        if excluded:
-            print(f'Skipping {len(excluded)} excluded episodes: {", ".join(sorted(excluded))}')
+    excluded, existing_crops = parse_exclude(exclude_file)
+    if excluded:
+        print(f'Skipping {len(excluded)} excluded episodes: '
+              f'{", ".join(sorted(excluded, key=_epnum))}')
+    if existing_crops:
+        print(f'{len(existing_crops)} end-crop(s) recorded (applied at conversion, '
+              f'not here): '
+              f'{", ".join(f"{n}[:{e}]" for n, (s, e) in sorted(existing_crops.items(), key=lambda kv: _epnum(kv[0])))}')
     paths = [p for p in paths
              if os.path.basename(p).replace('.hdf5', '') not in excluded]
 
     print(f'Loading {len(paths)} episodes from {args.collection} …')
 
-    # Load stats (no images yet — keep memory low)
+    # Load stats (no images yet — keep memory low). Cropped episodes are
+    # truncated here so every stat, flag and plot describes the data that will
+    # actually be converted, not the discarded tail.
     rows = []
     for p in paths:
-        s = compute_stats(p)
+        s = compute_stats(p, existing_crops.get(
+            os.path.basename(p).replace('.hdf5', '')))
         if s:
             rows.append(s)
     print(f'Loaded {len(rows)} episodes.')
 
     rows = flag_outliers(rows)
     print_table(rows)
-    plot_dashboard(rows, args.collection, args.num_steps)
+
+    # Timestamped so successive runs never overwrite each other — same
+    # convention as inspect_transitions.py's transition_inspection_<ts>.png.
+    out = args.out or os.path.join(
+        args.collection,
+        f'collection_inspection_{_dt.datetime.now():%Y%m%d_%H%M%S}.png')
+    plot_dashboard(rows, args.collection, args.num_steps, out)
 
     # Exclude list
     if args.exclude is not None:
@@ -385,18 +492,34 @@ def main():
             print('\nEnter episode numbers to exclude (space-separated), then ENTER:')
             to_exclude = input('> ').split()
 
+        # `rows` holds only the episodes still in play, so an already-excluded
+        # number must count as valid too — otherwise re-running --exclude 3
+        # reports episode 3 as "unknown".
         valid_names = {r['name'].replace('episode_', '').replace('.hdf5', '') for r in rows}
+        valid_names |= {str(_epnum(n)) for n in excluded}
         bad = [e for e in to_exclude if e not in valid_names]
         if bad:
             print(f'[WARN] Unknown episode numbers (ignored): {bad}')
         to_exclude = [e for e in to_exclude if e in valid_names]
 
-        out = os.path.join(args.collection, 'exclude.txt')
-        with open(out, 'w') as f:
-            for e in sorted(to_exclude, key=lambda s: int(s)):
-                f.write(f'episode_{e}\n')
-        print(f'\nExclude list written → {out}')
-        print('  ' + '  '.join(f'episode_{e}' for e in sorted(to_exclude, key=lambda s: int(s))))
+        # ADDITIVE: union with what is already in the file, and carry the crop
+        # lines through untouched. This used to open the file with 'w' and write
+        # only the newly chosen numbers, which silently destroyed both earlier
+        # drops and every end-crop recorded by inspect_transitions.py.
+        merged = set(excluded) | {f'episode_{e}' for e in to_exclude}
+        added  = sorted(merged - set(excluded), key=_epnum)
+        write_exclude(exclude_file, merged, existing_crops)
+
+        print(f'\nExclude list written → {exclude_file}')
+        print('  dropped: ' + '  '.join(sorted(merged, key=_epnum)))
+        if added:
+            print('  added this run: ' + '  '.join(added))
+        else:
+            print('  (nothing new — all selections were already listed)')
+        if existing_crops:
+            print('  crops preserved: ' + '  '.join(
+                f'{n}[{s}:{e}]' for n, (s, e) in
+                sorted(existing_crops.items(), key=lambda kv: _epnum(kv[0]))))
 
     plt.close('all')   # clear dashboard before opening detail windows
 
@@ -410,7 +533,14 @@ def main():
                 print(f'\nLoading detail for {r["name"]} …')
                 with h5py.File(r['path'], 'r') as f:
                     if 'images/dji_wrist' in f:
-                        r['dji_wrist'] = f['images/dji_wrist'][()]
+                        # Slice to the same window as the signals — otherwise the
+                        # camera strip would show frames from the cropped-away
+                        # tail while the plots below it stop at the crop.
+                        if r.get('crop') is not None:
+                            cs, ce = r['crop']
+                            r['dji_wrist'] = f['images/dji_wrist'][cs:ce]
+                        else:
+                            r['dji_wrist'] = f['images/dji_wrist'][()]
                 plot_episode_detail(r, args.num_steps)
 
 

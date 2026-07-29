@@ -53,6 +53,8 @@ def generate_launch_description(
     diffusion_steps: int = 16,
     latency_offset_s: float = 0.0,
     no_pygame: bool = False,
+    record: bool = False,
+    record_dir: str = None,
 ) -> LaunchDescription:
 
     inference_cmd = [
@@ -65,6 +67,10 @@ def generate_launch_description(
     ]
     if no_pygame:
         inference_cmd.append("--no-pygame")
+    if record:
+        inference_cmd.append("--record")
+        if record_dir:
+            inference_cmd += ["--record-dir", record_dir]
 
     return LaunchDescription([
 
@@ -108,8 +114,8 @@ def main(argv=sys.argv[1:]):
     parser.add_argument("--latest",          action="store_true",
                         help="Use the newest run's checkpoint in training/data/outputs/")
     parser.add_argument("--robot-ip",        type=str,   default="192.168.1.10")
-    parser.add_argument("--dji-device",      type=int,   default=0,
-                        help="V4L2 device index for DJI wrist camera (default: 0)")
+    parser.add_argument("--dji-device",      type=int,   default=-1,
+                        help="V4L2 device index for DJI wrist camera (default: -1 = auto-detect by USB id)")
     parser.add_argument("--dt",              type=float, default=0.1,
                         help="Action step period in seconds (default: 0.1 = 10 Hz, "
                              "matching training obs_down_sample_steps 3 @ 30 Hz)")
@@ -121,6 +127,11 @@ def main(argv=sys.argv[1:]):
                         help="System latency to compensate in seconds (default: 0)")
     parser.add_argument("--no-pygame",       action="store_true",
                         help="Disable pygame keyboard control window")
+    parser.add_argument("--record",          action="store_true",
+                        help="Record rollouts to testing/rollout_data/episode_N.hdf5 "
+                             "(S start, D save, R/Q discard)")
+    parser.add_argument("--record-dir",      type=str, default=None,
+                        help="Directory for rollout episodes (default: testing/rollout_data)")
     args, launch_argv = parser.parse_known_args(argv)
 
     if args.latest:
@@ -146,8 +157,13 @@ def main(argv=sys.argv[1:]):
         print(f"  Latency offset:  {args.latency_offset_s*1000:.0f} ms "
               f"({round(args.latency_offset_s / args.dt)} steps)")
     print()
+    if args.record:
+        print(f"  Recording:       ON → {args.record_dir or 'testing/rollout_data'}")
+    print()
     print("Keyboard controls (focus pygame window):")
     print("  S - Start / Resume | D - Done / Pause | R - Reset home | Q - Quit")
+    if args.record:
+        print("  (recording: S starts an episode, D saves it, R/Q discard it)")
     print("=" * 60)
 
     ls = LaunchService(argv=launch_argv)
@@ -160,6 +176,8 @@ def main(argv=sys.argv[1:]):
         diffusion_steps=args.diffusion_steps,
         latency_offset_s=args.latency_offset_s,
         no_pygame=args.no_pygame,
+        record=args.record,
+        record_dir=args.record_dir,
     ))
     return ls.run()
 

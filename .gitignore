@@ -28,3 +28,7 @@ training/wandb/
 *.whl
 .claude/
 *.log
+
+# Device credentials (never commit)
+data_collection/hololens_portal.json
+*.mp4

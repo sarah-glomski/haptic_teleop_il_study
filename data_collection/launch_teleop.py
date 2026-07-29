@@ -29,17 +29,20 @@ Stopping:
 
 import argparse
 import os
+import subprocess
 import sys
 
 from launch import LaunchDescription, LaunchService
 from launch.actions import ExecuteProcess
-from launch_ros.actions import Node
+
+from launch_rosbridge import make_rosbridge_node, start_discovery_broadcaster
 
 
 _PYTHON = '/usr/bin/python3.12'
 
 
-def generate_launch_description(robot_ip: str, orientation: bool = False) -> LaunchDescription:
+def generate_launch_description(robot_ip: str, orientation: bool = False,
+                                no_rosbridge: bool = False) -> LaunchDescription:
     d = os.path.dirname(os.path.abspath(__file__))
 
     def script(name):
@@ -47,13 +50,12 @@ def generate_launch_description(robot_ip: str, orientation: bool = False) -> Lau
 
     return LaunchDescription([
         # ── rosbridge WebSocket (HoloLens → ROS2) ─────────────────────────────
-        Node(
-            package='rosbridge_server',
-            executable='rosbridge_websocket',
-            name='rosbridge_websocket',
-            output='screen',
-            parameters=[{'port': 9090}],
-        ),
+        # Shared definition with launch_rosbridge.py via make_rosbridge_node().
+        # Skip with --no-rosbridge when rosbridge is already running (e.g. from
+        # launch_rosbridge.py) so the HoloLens stays connected across restarts.
+        # The matching discovery broadcaster is started in main() only when we
+        # own rosbridge.
+        *([make_rosbridge_node()] if not no_rosbridge else []),
 
         # ── HoloLens TF publisher ──────────────────────────────────────────────
         ExecuteProcess(
@@ -105,7 +107,10 @@ def main(argv=sys.argv[1:]):
                         help='Kinova Gen3 IP address')
     parser.add_argument('--orientation', action='store_true',
                         help='Enable hand-orientation wrist teleop (clutched delta, quaternion '
-                             'P-loop, tilt/yaw clamped). Default: translation-only.')
+                             'P-loop, roll/pitch/yaw clamped). Default: translation-only.')
+    parser.add_argument('--no-rosbridge', action='store_true',
+                        help='Skip launching rosbridge (use when it is already running, '
+                             'e.g. from launch_rosbridge.py, so the HoloLens stays connected).')
     args, launch_argv = parser.parse_known_args(argv)
 
     # Print your machine's IP so the user knows what to enter in the HoloLens app
@@ -140,7 +145,23 @@ def main(argv=sys.argv[1:]):
         p for p in path_parts if 'miniforge' not in p and 'conda' not in p
     )
 
-    ld = generate_launch_description(robot_ip=args.robot_ip, orientation=args.orientation)
+    # Auto-detect a running rosbridge (e.g. from launch_rosbridge.py) so we don't
+    # start a second one or disconnect the HoloLens. If something is already on
+    # port 9090, treat it as an intentional persistent rosbridge and leave it alone.
+    if not args.no_rosbridge:
+        probe = subprocess.run(['fuser', '9090/tcp'],
+                               stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        if probe.returncode == 0:
+            print('Rosbridge already running on port 9090 — skipping launch (HoloLens connection preserved)')
+            args.no_rosbridge = True
+
+    # Broadcast the discovery URL only when this process owns rosbridge.
+    # When --no-rosbridge is set, launch_rosbridge.py is already broadcasting.
+    if not args.no_rosbridge:
+        start_discovery_broadcaster()
+
+    ld = generate_launch_description(robot_ip=args.robot_ip, orientation=args.orientation,
+                                     no_rosbridge=args.no_rosbridge)
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)
     return ls.run()

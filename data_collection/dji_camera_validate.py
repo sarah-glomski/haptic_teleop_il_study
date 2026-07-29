@@ -45,6 +45,8 @@ Press Q in the preview window to quit.
 from __future__ import annotations
 
 import argparse
+import glob
+import os
 import subprocess
 import sys
 import time
@@ -123,6 +125,38 @@ def _macos_camera_names() -> dict[int, str]:
     return names
 
 
+def _linux_byid_names() -> dict[int, str]:
+    """Return {video index: by-id link name} from /dev/v4l/by-id.
+
+    These carry the USB product name (e.g. 'usb-DJI_OsmoAction4_...-video-index0'),
+    which plain /dev/video* globbing does not.
+    """
+    names = {}
+    for link in sorted(glob.glob('/dev/v4l/by-id/*')):
+        target = os.path.basename(os.path.realpath(link))
+        if target.startswith('video') and target[5:].isdigit():
+            names.setdefault(int(target[5:]), os.path.basename(link))
+    return names
+
+
+def dji_device_indices() -> list[int]:
+    """Return the DJI's /dev/videoN indices, lowest first, from /dev/v4l/by-id.
+
+    Matching the stable by-id symlink is immune to USB enumeration order: with a
+    ZED also connected the DJI lands on video2/video3, not video0. The lowest
+    index is the streaming interface, the next is metadata. Mirrors
+    find_dji_device() in dji_camera_node.py.
+    """
+    indices = []
+    for link in glob.glob('/dev/v4l/by-id/*'):
+        name = os.path.basename(link).lower()
+        if 'dji' in name or 'osmoaction' in name:
+            target = os.path.basename(os.path.realpath(link))
+            if target.startswith('video') and target[5:].isdigit():
+                indices.append(int(target[5:]))
+    return sorted(indices)
+
+
 def list_camera_devices() -> dict[int, str]:
     """
     Return {device_index: description} for all capture devices.
@@ -150,18 +184,31 @@ def list_camera_devices() -> dict[int, str]:
                     except ValueError:
                         pass
         except (FileNotFoundError, subprocess.CalledProcessError):
-            import glob
+            # v4l2-ctl is not installed here. Fall back to /dev/v4l/by-id, which
+            # still carries the USB product name. Naming devices '/dev/videoN'
+            # instead (the old behaviour) matched no vendor keyword at all, which
+            # is how the ZED on video0 ended up being chosen as the DJI.
+            byid = _linux_byid_names()
             for path in sorted(glob.glob('/dev/video*')):
                 try:
                     idx = int(path.replace('/dev/video', ''))
-                    devices[idx] = path
                 except ValueError:
-                    pass
+                    continue
+                devices[idx] = byid.get(idx, path)
         return devices
 
 
 def find_dji_device_index(devices: dict[int, str]) -> int | None:
-    for idx, name in devices.items():
+    """Pick the DJI's streaming device index, or None if it isn't present.
+
+    Prefers /dev/v4l/by-id (authoritative and order-independent); falls back to
+    matching the descriptive name reported by v4l2-ctl.
+    """
+    if IS_LINUX:
+        indices = dji_device_indices()
+        if indices:
+            return indices[0]
+    for idx, name in sorted(devices.items()):
         if any(k in name.lower() for k in ('dji', 'action', 'osmo')):
             return idx
     return None
@@ -213,13 +260,21 @@ def check_hardware(args) -> int | None:
             print( '      System Settings → Privacy & Security → Camera → Terminal ✓')
         return None
 
+    # Resolve the DJI's own video nodes up front. Only these are ever opened —
+    # probing every /dev/video* would open the ZED too, which is slow and can
+    # steal the device from a running zed_wrapper.
+    dji_indices = set(dji_device_indices()) if IS_LINUX else set()
+
     # Print device list — on macOS names come from system_profiler (no camera opened)
     for idx, name in sorted(devices.items()):
         label = f'/dev/video{idx}' if IS_LINUX else f'Camera {idx}'
-        if IS_LINUX:
+        if IS_LINUX and idx in dji_indices:
             success, w, h, fps = probe_device(idx)
             cap_str = f'{w}×{h} @ {fps:.0f} fps' if success else 'not readable (metadata node)'
             status = ok if success else warn
+        elif IS_LINUX:
+            cap_str = 'skipped — not a DJI device'
+            status = warn
         else:
             cap_str = 'listed by system_profiler'
             status = ok
@@ -240,21 +295,14 @@ def check_hardware(args) -> int | None:
         print(f'\n  {ok(f"Auto-detected DJI camera at {label}")}')
         return dji_idx
 
+    # No "first readable device" fallback: that silently opened /dev/video0,
+    # which is the ZED whenever it is plugged in. Never open a camera we have not
+    # positively identified as the DJI — fail loudly instead.
+    print(f'\n  {fail("Could not identify a DJI camera — refusing to open another device")}')
+    print( '    □ Enable UVC mode:  Menu → Settings → Control Method → UVC Camera')
     if IS_LINUX:
-        # On Linux we can safely probe to find the first readable device
-        for idx in sorted(devices.keys()):
-            success, _, _, _ = probe_device(idx)
-            if success:
-                print(f'\n  {warn(f"DJI not auto-detected by name — falling back to /dev/video{idx}")}')
-                print( '    If this is the wrong camera, rerun with  --device N')
-                return idx
-    elif devices:
-        # On macOS, never open a camera blindly — require explicit --device
-        print(f'\n  {warn("DJI camera not found by name in the list above.")}')
-        print( '    Rerun with  --device N  to specify which camera to open.')
-        return None
-
-    print(f'\n  {fail("Could not find a DJI camera device")}')
+        print( '    □ Check the by-id link:  ls -l /dev/v4l/by-id/ | grep -i dji')
+    print( '    □ Or open a device explicitly:  --device N')
     return None
 
 
