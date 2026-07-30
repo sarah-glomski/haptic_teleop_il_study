@@ -89,7 +89,7 @@ _DATA_COLLECTION_DIR = os.path.abspath(
 if _DATA_COLLECTION_DIR not in sys.path:
     sys.path.insert(0, _DATA_COLLECTION_DIR)
 from kinova_arm import (ArmLimits, KinovaArm, HOME_JOINTS_DEG,
-                        TWIST_WATCHDOG_MS, home_pose_vec6)
+                        TWIST_WATCHDOG_MS)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -322,18 +322,11 @@ class PolicyNode(Node):
         self.paused = True
         self.is_resetting = False
 
-        # Anchor for robot0_eef_rot_axis_angle_wrt_start: the FIXED home pose,
-        # matching what convert_data.py writes as robot0_demo_start_pose.
-        #
-        # It is deliberately constant and never re-anchored. wrt_start therefore
-        # means "how far the wrist is from home", which is the same quantity at
-        # the same point in the task regardless of where the rollout was
-        # started — that is what makes starting halfway through the task valid.
-        # Anchoring to wherever the episode began would instead report identity
-        # at the start of every rollout, telling the policy it is at the
-        # beginning of the task when it is not.
-        self.episode_start_pose_mat = pose_to_mat(
-            home_pose_vec6()[:6].astype(np.float64))
+        # Episode start pose (4x4 mat) for robot0_eef_rot_axis_angle_wrt_start.
+        # Captured from the first observation after each home reset — the same
+        # anchor as training's robot0_demo_start_pose (episode's first frame,
+        # robot at home). Cleared on every reset.
+        self.episode_start_pose_mat = None
 
         sensor_qos = QoSProfile(
             depth=10,
@@ -458,8 +451,12 @@ class PolicyNode(Node):
         if len(self.pose_buffer) > self.raw_buffer_len:
             self.pose_buffer.pop(0)
 
-        # No per-episode start-pose capture: episode_start_pose_mat is the FIXED
-        # home pose, set once in __init__ (see the comment there).
+        # Capture episode start pose on the first observation after a reset
+        # completes (mirrors training's demo_start_pose = episode's first frame).
+        if self.episode_start_pose_mat is None and not self.is_resetting:
+            self.episode_start_pose_mat = pose_to_mat(raw7[:6].astype(np.float64))
+            self.get_logger().info(
+                f"Episode start pose captured: xyz={np.round(raw7[:3], 4)}")
 
         for cam_key in CAMERA_KEYS:
             msg = wrist_msg
@@ -740,10 +737,10 @@ class PolicyNode(Node):
         self.arm.reset_velocity_state()
 
     def resume_policy(self):
-        # episode_start_pose_mat is intentionally NOT touched: wrt_start is
-        # anchored to the fixed home pose, so a rollout begun partway through
-        # the task reports its true offset from home rather than resetting to
-        # identity.
+        # episode_start_pose_mat is NOT cleared here. It is the anchor for the
+        # episode, re-captured only after a home reset, so pausing and resuming
+        # mid-rollout continues to measure wrt_start from where this episode
+        # actually began rather than from the pause point.
         self._reset_obs_buffers()
         self.get_logger().info("Resumed — observation history cleared.")
         self.paused = False
@@ -776,6 +773,7 @@ class PolicyNode(Node):
         self.current_target_xyz = None
         self.current_target_euler = None
         self.arm.reset_velocity_state()
+        self.episode_start_pose_mat = None   # re-anchor _wrt_start on next obs
         self.is_resetting = True
         self.discard_recording()             # abandon any partial rollout
         threading.Thread(target=self._do_home_reset, daemon=True).start()

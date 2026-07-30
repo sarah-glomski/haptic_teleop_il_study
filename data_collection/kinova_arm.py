@@ -55,34 +55,6 @@ TWIST_WATCHDOG_MS = 200
 # elbow could settle differently each time.
 HOME_JOINTS_DEG = [358.258, 47.071, 181.685, 284.279, 357.708, 303.052, 89.735]
 
-# The TCP pose HOME_JOINTS_DEG puts the arm in. Measured on the physical arm at
-# the same time as the joint angles above.
-HOME_TCP_XYZ = (0.5715, 0.0137, 0.1068)
-HOME_TCP_EULER_DEG = (-180.0, 0.0, 90.0)          # Kortex Euler XYZ
-
-
-def home_pose_vec6() -> np.ndarray:
-    """Canonical home pose as [x, y, z, rotvec(3)] — the FIXED wrt_start anchor.
-
-    robot0_eef_rot_axis_angle_wrt_start is deliberately measured against this
-    constant rather than against each episode's own first frame. Anchoring per
-    episode means the observation only says "how far have I turned since this
-    recording began", which makes a demo (or a rollout) that starts partway
-    through the task describe itself as if it were at the beginning. Anchoring
-    to a fixed home makes it say "how far am I from home" — the same thing at
-    the same point in the task no matter where the episode was cut in.
-
-    Every demo is recorded from this home pose, so for full-length episodes the
-    two conventions agree; the fixed anchor is what makes PARTIAL episodes and
-    mid-task rollout starts describe themselves consistently.
-
-    Only the rotation survives into the observation (the consumer keeps
-    mat_to_pose10d(...)[:, 3:]), so the position here is inert for wrt_start —
-    it is included to keep the pose a well-formed 6-vector.
-    """
-    rotvec = R.from_euler('xyz', np.radians(HOME_TCP_EULER_DEG)).as_rotvec()
-    return np.concatenate([np.array(HOME_TCP_XYZ), rotvec]).astype(np.float32)
-
 
 @dataclass
 class ArmLimits:
