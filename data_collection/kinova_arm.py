@@ -108,8 +108,18 @@ class ArmLimits:
 
     # Orientation clamps, applied to the rotation FROM HOME split into three
     # independent per-axis rotvec components in the base frame.
+    #
+    # Roll stays locked to a small tolerance. Pitch is open to -48 deg to let the
+    # tool tilt for the task, and yaw is open to +93 deg toward tool-forward;
+    # both keep only a 3 deg tolerance the other way.
+    #
+    # WARNING: a downward-pointing tool sweeps its fingers BELOW the TCP as it
+    # tilts, and the workspace z floor (z[0]) is enforced on the TCP only. At
+    # 48 deg the fingertips sit roughly 0.74 x (finger length) under the TCP, so
+    # the z floor no longer guarantees table clearance. Raise z[0] if tilting
+    # near the table.
     max_roll_deg: float = 3.0              # about base x, symmetric
-    pitch_min_deg: float = -3.0            # about base y
+    pitch_min_deg: float = -48.0           # about base y — open for tool tilt
     pitch_max_deg: float = 3.0
     yaw_min_deg: float = -3.0              # about base z
     yaw_max_deg: float = 93.0              # open toward tool-forward

@@ -228,12 +228,11 @@ class KinovaHandController(Node):
         # seen at ~38 s in earlier testing). NOTE: roll↔base-x, pitch↔base-y,
         # yaw↔base-z is a naming convention; relabel the limits if your tool
         # axes are named the other way.
-        # Yaw-dominant wrist teleop (2026-07-28): roll and pitch locked to a
-        # small ±3° tolerance; YAW is the free axis — open through +93° toward
-        # tool-forward (plug insertion at the far table edge) with only 3° the
-        # other way. This replaces the 2026-07-27 pitch-dominant guess: on
-        # hardware the tool-forward motion turned out to live on base z, not
-        # base y, so the wide range moved from pitch to yaw.
+        # Current defaults live in kinova_arm.ArmLimits and are shared with
+        # inference: roll locked to ±3°, PITCH open to -48° for tool tilt, YAW
+        # open to +93° toward tool-forward, each with only 3° the other way.
+        # See the WARNING there — tilting sweeps the fingers below the TCP, and
+        # the workspace z floor is enforced on the TCP only.
         self.max_roll_deg         = self.declare_parameter('max_roll_deg',      _lim.max_roll_deg).value
         self.pitch_min_deg        = self.declare_parameter('pitch_min_deg',     _lim.pitch_min_deg).value
         self.pitch_max_deg        = self.declare_parameter('pitch_max_deg',     _lim.pitch_max_deg).value
