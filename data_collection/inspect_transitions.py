@@ -1,31 +1,37 @@
 #!/usr/bin/env python3
 """
-Transition / state-machine inspector for a pick-and-place collection.
+Transition / state-machine inspector for a pick-and-drop collection.
 
 Where inspect_collection.py ranks episodes by size + tracking quality, this
 script curates for a *diffusion-policy state machine*. It segments every episode
-into the 7 task STATES, then separates two things:
+into the 6 task STATES, then separates two things:
 
     STATE diversity      (want HIGH) — the range of situations spanned WITHIN
         each state across the dataset (e.g. many object/transport positions).
     TRANSITION diversity (want LOW)  — the spread, across demos, of the robot
         CONDITION at each state→state switch (the "condition to move on").
 
-The 7 states (segmented from gripper events + vertical/lateral motion):
+The 6 states (segmented from gripper events + vertical/lateral motion):
     1 servo      visual-servo laterally until gripper is above the object
     2 descend    lower straight down until gripper is around the object
     3 grasp      close the gripper decisively (TCP roughly still)
     4 lift       raise straight up with the object
-    5 transport  move laterally over to the light-blue target tape
-    6 place      lower straight down onto the tape
-    7 release    open the gripper decisively (TCP roughly still)
+    5 transport  move laterally over to the bowl
+    6 release    open the gripper decisively over the bowl (TCP roughly still)
 
-The 6 transitions are the switches between consecutive states. A clean state
+There is deliberately no `place` state between transport and release: the object
+is dropped from transport height rather than lowered onto a target first, so the
+release condition IS the transport→release switch. The switch frame is where the
+gripper sits over the bowl at the moment it opens, and its XY scatter across
+demos measures how consistently the demos find the bowl (the bowl does not move,
+so tight is good).
+
+The 5 transitions are the switches between consecutive states. A clean state
 machine fires each switch under a CONSISTENT condition, so per boundary we read
 the robot's (Z height, TCP speed, gripper, XY) at the switch frame and measure
 how tightly those cluster across demos.
 
-A 7th "start→servo" entry condition checks the *initial* state: the arm should
+A 6th "start→servo" entry condition checks the *initial* state: the arm should
 begin at the home pose (--home-dev-max) with the gripper open (--home-grip-max).
 Episodes that start off-home or not-open are flagged `bad_home` and recommended
 for exclusion regardless of state novelty.
@@ -33,7 +39,7 @@ for exclusion regardless of state novelty.
 Per-episode signals
     transition messiness  (rank for exclusion) — deviation of this demo's switch
         conditions from the dataset median: inconsistent switch height / speed,
-        place-over-tape scatter (the tape is FIXED), non-crisp gripper switches
+        release-over-bowl scatter (the bowl is FIXED), non-crisp gripper switches
         (TCP still moving while grasping/releasing), gripper indecisiveness,
         plus hard faults (re-grasp, broken state sequence).
     state novelty         (protect from exclusion) — how rare this episode's
@@ -66,16 +72,15 @@ try:
 except ImportError:
     _sort = sorted
 
-PHASES = ['servo', 'descend', 'grasp', 'lift', 'transport', 'place', 'release']
-# The 6 transitions are the switches between consecutive states; each is named
+PHASES = ['servo', 'descend', 'grasp', 'lift', 'transport', 'release']
+# The 5 transitions are the switches between consecutive states; each is named
 # by the state it enters. The switch frame is that state's first frame.
 TRANSITIONS = [
-    ('servo→descend',    'descend'),
-    ('descend→grasp',    'grasp'),
-    ('grasp→lift',       'lift'),
-    ('lift→transport',   'transport'),
-    ('transport→place',  'place'),
-    ('place→release',    'release'),
+    ('servo→descend',     'descend'),
+    ('descend→grasp',     'grasp'),
+    ('grasp→lift',        'lift'),
+    ('lift→transport',    'transport'),
+    ('transport→release', 'release'),
 ]
 EPS = 1e-9
 
@@ -157,21 +162,20 @@ def segment(pos, grip, hz):
         0, gc_lo, (vertness > 0.5) & (vz < 0), default=int(0.6 * gc_lo))
     descend_start = int(np.clip(descend_start, 1, gc_lo - 1)) if gc_lo > 1 else gc_lo
 
-    # Between grasp and release [gc_hi, go_lo): lift (up) → transport → place (down).
+    # Between grasp and release [gc_hi, go_lo): lift (up) → transport, and that
+    # is all. The object is dropped from transport height, so there is no
+    # lowering leg to look for — transport runs straight into the release, and
+    # go_lo (the frame the gripper starts opening) ends it.
     lift_end = _first_run_end(
         gc_hi, go_lo, (vertness > 0.4) & (vz > 0), default=gc_hi + max(1, (go_lo - gc_hi) // 3))
-    place_start = _last_run_start(
-        gc_hi, go_lo, (vertness > 0.4) & (vz < 0), default=go_lo - max(1, (go_lo - gc_hi) // 3))
     lift_end = int(np.clip(lift_end, gc_hi + 1, go_lo - 1))
-    place_start = int(np.clip(place_start, lift_end, go_lo - 1))
 
     bounds = {
         'servo':     (0, descend_start),
         'descend':   (descend_start, gc_lo),
         'grasp':     (gc_lo, gc_hi + 1),
         'lift':      (gc_hi + 1, lift_end),
-        'transport': (lift_end, place_start),
-        'place':     (place_start, go_lo),
+        'transport': (lift_end, go_lo),
         'release':   (go_lo, go_hi),
     }
     # Any empty phase → note partial and pad by one frame so profiles exist.
@@ -238,7 +242,10 @@ def compute_stats(path, crop=None):
             grip=float(grip[f]), xy=pos[f, :2].copy())
 
     row['grasp_xy'] = pos[bounds['grasp'][0]][:2]        # object location (STATE diversity)
-    row['place_xy'] = pos[bounds['release'][0]][:2]      # place→release switch over the tape
+    # transport→release switch: where the gripper is when it starts opening,
+    # i.e. the drop point over the bowl. No descent precedes it, so this is the
+    # release location outright.
+    row['release_xy'] = pos[bounds['release'][0]][:2]
     gb, rb = bounds['grasp'], bounds['release']
     # Gripper decisiveness = ramp seconds (short = crisp switch).
     row['grasp_decis'] = (gb[1] - gb[0]) / hz
@@ -270,20 +277,20 @@ def score(rows, home_grip_max=0.5, home_dev_max=0.08):
             vals = np.array([r['switch'][name][feat] for r in ok])
             med[(name, feat)] = float(np.median(vals))
             sd[(name, feat)] = float(vals.std()) + EPS
-    place_med = np.median([r['place_xy'] for r in ok], axis=0)
+    release_med = np.median([r['release_xy'] for r in ok], axis=0)
     grasp_xy = np.array([r['grasp_xy'] for r in ok])
 
     # Per-episode transition-messiness components — how far this demo's switch
     # conditions sit from the dataset consensus.
     comps = {k: [] for k in
-             ('switch_z', 'switch_speed', 'place_dev', 'crisp', 'indecisive',
+             ('switch_z', 'switch_speed', 'release_dev', 'crisp', 'indecisive',
               'home_dev', 'home_grip')}
     for r in ok:
         comps['switch_z'].append(sum(
             abs((r['switch'][n]['z'] - med[(n, 'z')]) / sd[(n, 'z')]) for n in trans_names))
         comps['switch_speed'].append(sum(
             abs((r['switch'][n]['speed'] - med[(n, 'speed')]) / sd[(n, 'speed')]) for n in trans_names))
-        comps['place_dev'].append(float(np.linalg.norm(r['place_xy'] - place_med)))
+        comps['release_dev'].append(float(np.linalg.norm(r['release_xy'] - release_med)))
         comps['crisp'].append(r['grasp_still'] + r['release_still'])
         comps['indecisive'].append(r['grasp_decis'] + r['release_decis'])
         r['home_dev'] = float(np.linalg.norm(r['home_pos'] - home_med))
@@ -349,7 +356,7 @@ def score(rows, home_grip_max=0.5, home_dev_max=0.08):
             r['messy'] = float('nan')
             r['novelty'] = float('nan')
 
-    return rows, div, place_med, home_med
+    return rows, div, release_med, home_med
 
 
 # ── Terminal table ───────────────────────────────────────────────────────────────
@@ -358,7 +365,7 @@ def print_table(rows):
     GREEN, RED, YELLOW, RESET, BOLD = (
         '\033[92m', '\033[91m', '\033[93m', '\033[0m', '\033[1m')
     hdr = (f"{'Episode':<10} {'Messy':>6} {'Novelty':>8} {'Grasp dec':>9} "
-           f"{'Rel dec':>8} {'PlaceDev':>9} {'HomeDev':>8} {'Grip0':>6} {'Pause%':>7}  Flags")
+           f"{'Rel dec':>8} {'RelDev':>9} {'HomeDev':>8} {'Grip0':>6} {'Pause%':>7}  Flags")
     print(f'\n{BOLD}{hdr}{RESET}')
     print('─' * len(hdr))
     for r in rows:
@@ -373,24 +380,24 @@ def print_table(rows):
                   f"{'—':>8} {'—':>9} {hd} {r['home_grip']:>6.2f} "
                   f"{r['pause_frac']*100:>6.0f}%  {YELLOW}{', '.join(flags)}{RESET}")
             continue
-        pd = np.linalg.norm(r['place_xy'] - r.get('_place_med', r['place_xy']))
+        rd = np.linalg.norm(r['release_xy'] - r.get('_release_med', r['release_xy']))
         print(f"{color}{ep:<10}{RESET} {r['messy']:>6.2f} {r['novelty']*100:>7.1f}c "
               f"{r['grasp_decis']:>8.2f}s {r['release_decis']:>7.2f}s "
-              f"{pd*1000:>7.0f}mm {r['home_dev']*1000:>6.0f}mm {r['home_grip']:>6.2f} "
+              f"{rd*1000:>7.0f}mm {r['home_dev']*1000:>6.0f}mm {r['home_grip']:>6.2f} "
               f"{r['pause_frac']*100:>6.0f}%  {YELLOW}{', '.join(flags)}{RESET}")
     rec = [r['name'].replace('.hdf5', '') for r in rows if r.get('recommend_exclude')]
     print(f'\n{len(rec)} / {len(rows)} episodes recommended for exclusion.')
     if rec:
         print('  ' + ', '.join(rec))
     print('  (Messy = deviation of this demo\'s state→state switch conditions '
-          '(height/speed/place/crispness) from the dataset median; Novelty = '
+          '(height/speed/release-point/crispness) from the dataset median; Novelty = '
           'grasp-location rarity in cm; a messy but novel trial is kept to protect '
           'state diversity.)')
 
 
 # ── Diversity dashboard ──────────────────────────────────────────────────────────
 
-def plot_dashboard(rows, div, place_med, home_med, collection_dir, out_path,
+def plot_dashboard(rows, div, release_med, home_med, collection_dir, out_path,
                    home_grip_max=0.5, home_dev_max=0.08):
     ok = [r for r in rows if r.get('bounds') is not None]
     excl = {r['name'] for r in rows if r.get('recommend_exclude')}
@@ -438,15 +445,15 @@ def plot_dashboard(rows, div, place_med, home_med, collection_dir, out_path,
     ax.set_title('TRANSITION switch speed (tight = consistent trigger)', fontsize=9)
     ax.tick_params(labelsize=7)
 
-    # ── Row 2a: place→release switch over the FIXED tape — should cluster ──────
+    # ── Row 2a: transport→release switch over the FIXED bowl — should cluster ──
     ax = fig.add_subplot(gs[1, 0])
-    pxy = np.array([r['place_xy'] for r in ok])
+    rxy = np.array([r['release_xy'] for r in ok])
     cols = ['tomato' if r['name'] in excl else 'steelblue' for r in ok]
-    ax.scatter(pxy[:, 0], pxy[:, 1], c=cols, s=45, edgecolor='k', linewidth=0.3)
-    ax.scatter(*place_med, marker='*', s=260, color='gold',
-               edgecolor='k', zorder=5, label='median (tape)')
-    ax.set_title(f'place→release switch — tape is FIXED\n'
-                 f'scatter {pxy.std(0).mean()*1000:.0f} mm  (want TIGHT)', fontsize=9)
+    ax.scatter(rxy[:, 0], rxy[:, 1], c=cols, s=45, edgecolor='k', linewidth=0.3)
+    ax.scatter(*release_med, marker='*', s=260, color='gold',
+               edgecolor='k', zorder=5, label='median (bowl)')
+    ax.set_title(f'transport→release switch — bowl is FIXED\n'
+                 f'scatter {rxy.std(0).mean()*1000:.0f} mm  (want TIGHT)', fontsize=9)
     ax.set_xlabel('X (m)', fontsize=8); ax.set_ylabel('Y (m)', fontsize=8)
     ax.legend(fontsize=7); ax.set_aspect('equal', adjustable='datalim')
     ax.tick_params(labelsize=7)
@@ -805,17 +812,17 @@ def main():
                 p, crops.get(os.path.basename(p).replace('.hdf5', '')))) is not None]
     print(f'Loaded {len(rows)} episodes.')
 
-    rows, div, place_med, home_med = score(
+    rows, div, release_med, home_med = score(
         rows, home_grip_max=args.home_grip_max, home_dev_max=args.home_dev_max)
-    for r in rows:                       # stash for the table's place-dev column
+    for r in rows:                       # stash for the table's release-dev column
         if r.get('bounds') is not None:
-            r['_place_med'] = place_med
+            r['_release_med'] = release_med
     print_table(rows)
 
     out = args.out or os.path.join(
         args.collection,
         f'transition_inspection_{_dt.datetime.now():%Y%m%d_%H%M%S}.png')
-    plot_dashboard(rows, div, place_med, home_med, args.collection, out,
+    plot_dashboard(rows, div, release_med, home_med, args.collection, out,
                    home_grip_max=args.home_grip_max, home_dev_max=args.home_dev_max)
 
     if args.exclude is not None:

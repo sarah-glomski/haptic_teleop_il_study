@@ -41,7 +41,7 @@ from launch_rosbridge import make_rosbridge_node, start_discovery_broadcaster
 _PYTHON = '/usr/bin/python3.12'
 
 
-def generate_launch_description(robot_ip: str, orientation: bool = False,
+def generate_launch_description(robot_ip: str, orientation: bool = True,
                                 no_rosbridge: bool = False) -> LaunchDescription:
     d = os.path.dirname(os.path.abspath(__file__))
 
@@ -105,9 +105,10 @@ def main(argv=sys.argv[1:]):
     parser = argparse.ArgumentParser(description='Minimal HoloLens → Kinova teleop')
     parser.add_argument('--robot-ip', default='192.168.1.10',
                         help='Kinova Gen3 IP address')
-    parser.add_argument('--orientation', action='store_true',
-                        help='Enable hand-orientation wrist teleop (clutched delta, quaternion '
-                             'P-loop, roll/pitch/yaw clamped). Default: translation-only.')
+    parser.add_argument('--no-orientation', dest='orientation', action='store_false',
+                        help='Lock the end-effector orientation at home and teleop translation '
+                             'only. Default is hand-orientation wrist teleop (clutched delta, '
+                             'quaternion P-loop, roll/pitch/yaw clamped).')
     parser.add_argument('--no-rosbridge', action='store_true',
                         help='Skip launching rosbridge (use when it is already running, '
                              'e.g. from launch_rosbridge.py, so the HoloLens stays connected).')
@@ -128,6 +129,7 @@ def main(argv=sys.argv[1:]):
     print('=' * 60)
     print(f'  Robot IP      : {args.robot_ip}')
     print(f'  This machine  : {local_ip}')
+    print(f'  Wrist orient. : {"ON (hand-tracked, clamped)" if args.orientation else "LOCKED at home (--no-orientation)"}')
     print()
     print('  In the HoloLens app set RosConnector URL to:')
     print(f'    ws://{local_ip}:9090')

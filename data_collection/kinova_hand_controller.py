@@ -205,16 +205,18 @@ class KinovaHandController(Node):
         self.stall_move_mps  = self.declare_parameter('stall_move_mps',  _lim.stall_move_mps).value
         self._stall_since = None
 
-        # ── Orientation teleop (opt-in; default OFF = translation-only) ────────
-        # Enabled via --orientation on launch_data_collection.py / launch_teleop.py
-        # (which pass -p enable_orientation:=true). The wrist tracks the palm
-        # orientation as a CLUTCHED DELTA from the enable-time reference — same
-        # scheme as position, so it starts from the robot's current orientation
-        # with no jump. Control uses quaternion/rotation-matrix error (rotvec),
-        # NEVER raw Kortex Euler error: the Kortex ZYX decomposition has a gimbal
-        # singularity at theta_x≈±180° (the home orientation) that makes Euler
-        # components flip; rotation-matrix error is immune to representation flips.
-        self.enable_orientation   = self.declare_parameter('enable_orientation',      False).value
+        # ── Orientation teleop (default ON; --no-orientation locks the wrist) ──
+        # launch_data_collection.py / launch_teleop.py always pass this
+        # explicitly; --no-orientation is what sends false, pinning the
+        # end-effector at the home orientation for translation-only teleop.
+        # The wrist tracks the palm orientation as a CLUTCHED DELTA from the
+        # enable-time reference — same scheme as position, so it starts from the
+        # robot's current orientation with no jump. Control uses
+        # quaternion/rotation-matrix error (rotvec), NEVER raw Kortex Euler
+        # error: the Kortex ZYX decomposition has a gimbal singularity at
+        # theta_x≈±180° (the home orientation) that makes Euler components flip;
+        # rotation-matrix error is immune to representation flips.
+        self.enable_orientation   = self.declare_parameter('enable_orientation',      True).value
         # Safety clamps, applied to the target's rotation FROM HOME. The
         # rotation-from-home rotvec is split into three INDEPENDENT per-axis
         # components (base frame) and each is clamped separately:
@@ -272,7 +274,7 @@ class KinovaHandController(Node):
              f'pitch ∈ [{self.pitch_min_deg:.0f}°, {self.pitch_max_deg:.0f}°], '
              f'yaw ∈ [{self.yaw_min_deg:.0f}°, {self.yaw_max_deg:.0f}°] from home'
              if self.enable_orientation else
-             ' Orientation OFF (translation-only; --orientation to enable)'),
+             ' Orientation LOCKED at home (translation-only; --no-orientation)'),
         ]
         _W = max(len(r) for r in _rows) + 2
         self.get_logger().info(

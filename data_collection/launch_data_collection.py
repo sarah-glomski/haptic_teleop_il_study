@@ -59,7 +59,7 @@ def generate_launch_description(
     no_cameras: bool = False,
     no_piezense: bool = False,
     no_rosbridge: bool = False,
-    orientation: bool = False,
+    orientation: bool = True,
     zed_uvc: bool = False,
 ) -> LaunchDescription:
 
@@ -217,10 +217,11 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('--no-rosbridge', action='store_true',
                         help='Skip launching rosbridge (use when it is already running '
                              'so the HoloLens stays connected across pipeline restarts).')
-    parser.add_argument('--orientation', action='store_true',
-                        help='Enable hand-orientation wrist teleop in kinova_hand_controller '
-                             '(clutched delta from enable-time reference, quaternion P-loop, '
-                             'roll/pitch/yaw clamped). Default: translation-only, orientation held at home.')
+    parser.add_argument('--no-orientation', dest='orientation', action='store_false',
+                        help='Lock the end-effector orientation at home and teleop translation '
+                             'only. Default is hand-orientation wrist teleop in '
+                             'kinova_hand_controller (clutched delta from the enable-time '
+                             'reference, quaternion P-loop, roll/pitch/yaw clamped).')
     args, launch_argv = parser.parse_known_args(argv)
 
     print('=' * 60)
@@ -229,6 +230,7 @@ def main(argv=sys.argv[1:]):
     print(f'  Robot IP:       {args.robot_ip}')
     print(f'  ZED serial:     {args.zed_serial or "(auto-detect first found)"}')
     print(f'  DJI wrist cam:  /dev/video{args.dji_device}')
+    print(f'  Wrist orient.:  {"ON (hand-tracked, clamped)" if args.orientation else "LOCKED at home (--no-orientation)"}')
     print()
     print('HoloLens:')
     print('  Make sure the HoloLens app is pointed at ws://<this-machine-ip>:9090')
