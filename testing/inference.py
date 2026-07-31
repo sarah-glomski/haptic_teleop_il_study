@@ -30,6 +30,7 @@ import os
 import pathlib
 import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -126,11 +127,36 @@ OBS_HORIZON_FALLBACK = 2
 # MUST match convert_data.py (Robotiq 2F-85 stroke).
 GRIPPER_MAX_WIDTH_M = 0.085
 
+# Home reset: release, lift clear, THEN travel home. Going straight home while
+# still holding drags the object across the table; opening at home (what data
+# collection does) drops it wherever home happens to be. Lifting after the
+# release also keeps the fingers from catching the object on the way out.
+RESET_LIFT_M        = 0.03    # "a couple of cm" above wherever the release happened
+RESET_LIFT_SPEED    = 0.05    # m/s — deliberately slow, this runs next to the objects
+RESET_LIFT_TIMEOUT_S = 4.0
+
+# Gripper opens by RAMPING the position setpoint rather than jumping to 0.
+# GRIPPER_POSITION mode carries no speed field, so stepping the setpoint is the
+# only way to slow the fingers down.
+RESET_GRIPPER_OPEN_S     = 2.0    # total open time
+RESET_GRIPPER_OPEN_STEPS = 8
+
+# Speed cap for the home move. JOINT_CONSTRAINT_SPEED is rejected by this
+# firmware (ACTION_ABORT/METHOD_FAILED, verified 2026-07-27 — see the note in
+# kinova_arm.reach_home_joints), but JOINT_CONSTRAINT_DURATION is a separate
+# constraint type: it sets how long the whole trajectory should take, so a
+# LARGER number is SLOWER. Unconstrained, the firmware picks its own profile,
+# which is what made inference's reset dash home.
+RESET_HOME_DURATION_S = 5.0
+
 CAMERA_KEYS = ["camera0_rgb"]
 CAMERA_TOPICS = {"camera0_rgb": DJI_WRIST_TOPIC}
 
 # Rollout recording (opt-in via --record); episode_N.hdf5 under testing/.
 ROLLOUT_DIR_DEFAULT = os.path.join(_THIS_DIR, "rollout_data")
+
+# Live monitor (wrist cam + force): own process, own window (L toggles it).
+_LIVE_VIEWER = os.path.join(_THIS_DIR, "live_viewer.py")
 
 # Set in main() from the checkpoint's horizon (n_action_steps * dt). Actions
 # older than this are dropped by the executor rather than fired late.
@@ -296,7 +322,8 @@ class PolicyNode(Node):
     """ROS2 node: collects observations (UMI schema), tracks policy targets via P-loop."""
 
     def __init__(self, shared_obs: dict, start_time: float, model_path: str, dt: float,
-                 record: bool = False, record_dir: str = None, pred_queue=None):
+                 record: bool = False, record_dir: str = None, pred_queue=None,
+                 enable_piezense: bool = True):
         super().__init__("kinova_policy_node")
         np.set_printoptions(suppress=True, precision=4)
 
@@ -362,11 +389,38 @@ class PolicyNode(Node):
         self.pose_buffer = []                                  # (raw7, t)
         self.cam_buffers = {k: [] for k in CAMERA_KEYS}        # (img CHW float, t)
 
+        self._node_start_time = time.monotonic()
+
+        # Camera heartbeat on its OWN subscription, NOT inside
+        # synced_obs_callback. That callback only fires when the
+        # ApproximateTimeSynchronizer matches pose + gripper + image, so
+        # stamping it there measured the synced stream: when the Kortex session
+        # died on 2026-07-31 the pose/gripper topics stopped, the sync stopped,
+        # and the camera dot went red while the camera was streaming fine. A dot
+        # that blames the wrong subsystem is worse than no dot.
+        self._cam_last_seen = None
+        self.create_subscription(
+            Image, DJI_WRIST_TOPIC, self._cam_heartbeat_cb, sensor_qos)
+
+        # Resting baseline, used until the first real reading lands. The policy
+        # and the recorder both read it, so they agree: before 2026-07-31 the
+        # recorder logged this constant while update_observation fell back to
+        # ZEROS, so a rollout with the driver down fed the policy values it had
+        # never seen while the episode file showed a plausible-looking flat line.
         self._latest_piezense = np.array([111337.0, 110375.0], dtype=np.float32)
         self.piezense_buffer  = []
-        self.create_subscription(
-            PiezenseSystemArray, PIEZENSE_TOPIC, self._piezense_cb, 10
-        )
+        self._enable_piezense    = enable_piezense
+        self._piezense_last_seen = None
+        self._piezense_warned    = False
+        if self._enable_piezense:
+            self.create_subscription(
+                PiezenseSystemArray, PIEZENSE_TOPIC, self._piezense_cb, 10
+            )
+            self.create_timer(2.0, self._check_piezense_health)
+        else:
+            self.get_logger().warn(
+                "Piezense DISABLED (enable_piezense=false) — piezense0_pressures is a "
+                "trained obs key, so the policy will run on the constant baseline.")
 
         # ── Rollout recording (opt-in) ───────────────────────────────────────
         # joint_states is recorded for parity with collected demos; not used by
@@ -506,7 +560,23 @@ class PolicyNode(Node):
         msg.data = True
         self._dji_enable_pub.publish(msg)
 
+    def _cam_heartbeat_cb(self, msg: Image):
+        """Liveness only — the synced callback does the decoding."""
+        self._cam_last_seen = time.monotonic()
+
     def _piezense_cb(self, msg: PiezenseSystemArray):
+        # Retract the warning explicitly. The banner is a snapshot ("nothing yet"),
+        # not a verdict on the run — the driver's connect time varies from ~2 s to
+        # ~20 s, and once it lands the policy reads live pressure from that moment.
+        # Saying so out loud beats leaving a scary banner as the last word.
+        if self._piezense_last_seen is None:
+            self.get_logger().info(
+                "Piezense: first reading received — pressure obs are LIVE"
+                + (" (clears the warning above)" if self._piezense_warned else ""))
+        elif self._piezense_warned:
+            self.get_logger().info("Piezense: RECOVERED — pressure obs are LIVE again")
+        self._piezense_last_seen = time.monotonic()
+        self._piezense_warned    = False
         for sys_msg in msg.system:
             if sys_msg.system_id == PIEZENSE_SYSTEM_ID:
                 readings = list(sys_msg.pressure_pa)
@@ -520,6 +590,66 @@ class PolicyNode(Node):
         self.piezense_buffer.append((self._latest_piezense.copy(), now))
         if len(self.piezense_buffer) > self.raw_buffer_len:
             self.piezense_buffer.pop(0)
+
+    # ── Sensor health (same states/colours as the collector's pygame dots) ────
+    #
+    # The piezense driver takes a few seconds to come up, and nothing else in a
+    # rollout fails visibly when it doesn't: the policy keeps running on the
+    # baseline and the episode file keeps recording it. Data collection has had
+    # these dots since the collector was written; inference needs them for the
+    # same reason — you cannot tell from the console that the sensor is dead.
+
+    # The piezense driver's own connect time is highly variable — measured at
+    # 2.2 s on one run and 19.4 s on another ("[example] connecting..." retries
+    # until the device answers). A 5 s grace period cried wolf on the slow-but-
+    # healthy case, so the banner and the red dot both wait 30 s.
+    PIEZENSE_STARTUP_GRACE_S = 30.0
+    CAMERA_STARTUP_GRACE_S   = 10.0
+
+    def _check_piezense_health(self):
+        """Warn while pressure is missing — recoverable, not a verdict on the run."""
+        if self._piezense_warned:
+            return
+        now    = time.monotonic()
+        banner = '!' * 50
+        if self._piezense_last_seen is None:
+            if (now - self._node_start_time) > self.PIEZENSE_STARTUP_GRACE_S:
+                self._piezense_warned = True
+                self.get_logger().error(
+                    f"\n{banner}\n  PIEZENSE: no data on {PIEZENSE_TOPIC} YET "
+                    f"({now - self._node_start_time:.0f}s).\n"
+                    f"  Is piezense_driver running? Until it connects the policy reads\n"
+                    f"  the constant baseline instead of real pressure. This clears\n"
+                    f"  itself if the driver comes up — watch the pygame dot go green,\n"
+                    f"  and don't press S until it does.\n{banner}")
+        elif (now - self._piezense_last_seen) > 3.0:
+            # Dropping out MID-rollout is the dangerous case: the buffer is not
+            # cleared, so the policy keeps reading stale pressure that looks
+            # plausible. Nothing else surfaces this.
+            self._piezense_warned = True
+            self.get_logger().error(
+                f"\n{banner}\n  PIEZENSE STOPPED "
+                f"({now - self._piezense_last_seen:.1f}s since the last reading).\n"
+                f"  The policy is now reading STALE pressure from the buffer.\n{banner}")
+
+    def get_piezense_health(self) -> str:
+        if not self._enable_piezense:
+            return 'disabled'
+        now = time.monotonic()
+        if self._piezense_last_seen is None:
+            return ('waiting'
+                    if (now - self._node_start_time) < self.PIEZENSE_STARTUP_GRACE_S
+                    else 'dead')
+        return 'ready' if (now - self._piezense_last_seen) < 3.0 else 'dead'
+
+    def get_camera_health(self) -> str:
+        """DJI wrist camera — the policy's only image input."""
+        now = time.monotonic()
+        if self._cam_last_seen is None:
+            return ('waiting'
+                    if (now - self._node_start_time) < self.CAMERA_STARTUP_GRACE_S
+                    else 'dead')
+        return 'ready' if (now - self._cam_last_seen) < 6.0 else 'dead'
 
     def update_observation(self):
         """Pack UMI-schema observation dict into shared_obs for the GPU process.
@@ -597,7 +727,12 @@ class PolicyNode(Node):
         if self.piezense_buffer:
             pz_slice = pick_frames_by_time(self.piezense_buffer, h_pz, self.dt)
         else:
-            pz_slice = [(np.zeros(PIEZENSE_INPUT_CHANNELS, dtype=np.float32), 0.0)] * h_pz
+            # Baseline, NOT zeros. Training data is absolute pressure around
+            # 111 kPa, so a zero-filled window is far outside anything the
+            # policy saw; the baseline at least sits where an unloaded sensor
+            # sits. It also matches what the recorder writes for these frames,
+            # so a rollout episode reflects what the policy actually got.
+            pz_slice = [(self._latest_piezense.copy(), 0.0)] * h_pz
 
         obs_dict["piezense0_pressures"] = torch.from_numpy(
             np.stack([p[0] for p in pz_slice])
@@ -657,9 +792,9 @@ class PolicyNode(Node):
                 return
 
             # Full rotation error, not yaw alone: the demos are orientation-rich
-            # (recorded with --orientation) and the policy predicts a full 6D
-            # rotation, so driving only angular_z discarded most of what it
-            # learned. Clamped against home on all three axes.
+            # (orientation teleop is the collection default) and the policy
+            # predicts a full 6D rotation, so driving only angular_z discarded
+            # most of what it learned. Clamped against home on all three axes.
             target_rot = None
             if target_euler is not None:
                 target_rot, _ = self.arm.clamp_orientation(
@@ -729,6 +864,8 @@ class PolicyNode(Node):
         self.piezense_buffer.clear()
 
     def pause_policy(self):
+        # Stops the arm ONLY. The recorder is deliberately untouched, so an
+        # episode survives a pause and S resumes appending to it.
         self.get_logger().info("Paused.")
         self.paused = True
         self.shared_obs["paused"] = True
@@ -741,6 +878,14 @@ class PolicyNode(Node):
         # episode, re-captured only after a home reset, so pausing and resuming
         # mid-rollout continues to measure wrt_start from where this episode
         # actually began rather than from the pause point.
+        pz = self.get_piezense_health()
+        if pz != 'ready':
+            self.get_logger().warn(
+                f"Starting rollout with piezense {pz.upper()} — pressure obs will be "
+                f"the constant baseline. Check the pygame dot before trusting this run.")
+        if self.get_camera_health() != 'ready':
+            self.get_logger().warn(
+                f"Starting rollout with wrist camera {self.get_camera_health().upper()}.")
         self._reset_obs_buffers()
         self.get_logger().info("Resumed — observation history cleared.")
         self.paused = False
@@ -764,6 +909,20 @@ class PolicyNode(Node):
         if self._recorder is not None:
             self._recorder.discard()
 
+    def cancel_recording(self):
+        """C — end the episode WITHOUT saving. Same as D minus the write.
+
+        Distinct from pause: this closes the episode, so the next S opens a new
+        one. Pause leaves the episode open and S continues appending to it.
+        """
+        if self._recorder is None:
+            self.get_logger().info("Cancelled (not recording).")
+            return
+        had = self._recorder.is_recording
+        self._recorder.discard()
+        self.get_logger().info("Episode CANCELLED — not saved." if had
+                               else "Nothing recording to cancel.")
+
     def reset_to_home(self):
         if self.is_resetting:
             return
@@ -778,6 +937,106 @@ class PolicyNode(Node):
         self.discard_recording()             # abandon any partial rollout
         threading.Thread(target=self._do_home_reset, daemon=True).start()
 
+    def _open_gripper_slowly(self):
+        """Ramp the gripper open instead of commanding 0.0 in one jump."""
+        start = float(np.clip(self.current_gripper_cmd, 0.0, 1.0))
+        if start <= 0.01:
+            self.arm.send_gripper(0.0)          # already open; make it explicit
+            time.sleep(0.2)
+            return
+        step_dt = RESET_GRIPPER_OPEN_S / RESET_GRIPPER_OPEN_STEPS
+        for i in range(1, RESET_GRIPPER_OPEN_STEPS + 1):
+            self.arm.send_gripper(start * (1.0 - i / RESET_GRIPPER_OPEN_STEPS))
+            time.sleep(step_dt)
+
+    def _reach_home_limited(self) -> bool:
+        """Home move with a DURATION constraint so it does not dash.
+
+        inference-only: kinova_arm.reach_home_joints() sends the action with no
+        constraint at all, and that is data collection's path too — this cap
+        must not change it. If the firmware rejects the constraint (as it does
+        JOINT_CONSTRAINT_SPEED) this falls straight back to the shared
+        unconstrained reach, so R can never be broken by the attempt.
+        """
+        try:
+            action = Base_pb2.Action()
+            action.name = 'Home'
+            action.application_data = ''
+            for i, ang in enumerate(HOME_JOINTS_DEG):
+                ja = action.reach_joint_angles.joint_angles.joint_angles.add()
+                ja.joint_identifier = i
+                ja.value = ang
+            action.reach_joint_angles.constraint.type = Base_pb2.JOINT_CONSTRAINT_DURATION
+            action.reach_joint_angles.constraint.value = RESET_HOME_DURATION_S
+            self.arm.base.ExecuteAction(action)
+        except Exception as e:
+            self.get_logger().warn(
+                f"Duration-constrained home rejected by the firmware ({e}) — "
+                f"falling back to the unconstrained move.")
+            return self.arm.reach_home_joints()
+
+        # Wrap-aware arrival poll: joints 1/5 sit at ~359.6 deg, on the 0/360 seam.
+        def joint_err_deg(fb):
+            return max(min(d, 360.0 - d) for d in
+                       (abs(fb.actuators[i].position - tgt) % 360.0
+                        for i, tgt in enumerate(HOME_JOINTS_DEG)))
+
+        deadline = time.monotonic() + max(30.0, RESET_HOME_DURATION_S * 3)
+        while time.monotonic() < deadline:
+            try:
+                if joint_err_deg(self.arm.refresh_feedback()) < 2.0:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return False
+
+    def _joint_and_tcp(self):
+        """(joint angles deg, TCP xyz) for reset instrumentation, or (None, None)."""
+        try:
+            fb = self.arm.refresh_feedback()
+            return ([fb.actuators[i].position for i in range(7)],
+                    self.arm.tcp_position(fb))
+        except Exception:
+            return None, None
+
+    def _lift_clear(self):
+        """Raise the TCP RESET_LIFT_M straight up, clamped to the workspace ceiling.
+
+        Closed-loop on measured z rather than open-loop timing: the twist
+        watchdog and the arm's own acceleration profile make a fixed sleep
+        land somewhere different every time. Runs BEFORE twists_suppressed is
+        set, since it is itself a twist.
+        """
+        try:
+            z0     = float(self.arm.tcp_position(self.arm.refresh_feedback())[2])
+            ceiling = self.arm.limits.z[1] - self.arm.limits.hard_margin_m
+            z_target = min(z0 + RESET_LIFT_M, ceiling)
+            if z_target - z0 < 0.002:
+                self.get_logger().info(
+                    f"Lift skipped — already at the workspace ceiling (z={z0:.3f} m)")
+                return
+
+            deadline = time.monotonic() + RESET_LIFT_TIMEOUT_S
+            while time.monotonic() < deadline:
+                z = float(self.arm.tcp_position(self.arm.refresh_feedback())[2])
+                if z >= z_target:
+                    break
+                self.arm.send_twist(np.array([0.0, 0.0, RESET_LIFT_SPEED]),
+                                    np.zeros(3), base_frame=True)
+                time.sleep(1.0 / 30.0)
+            else:
+                self.get_logger().warn("Lift timed out — continuing to home anyway")
+
+            self._send_zero_twist()
+            time.sleep(0.3)          # let the watchdog settle before the reach action
+            z_end = float(self.arm.tcp_position(self.arm.refresh_feedback())[2])
+            self.get_logger().info(f"Lifted clear: z {z0:.3f} -> {z_end:.3f} m")
+        except Exception as e:
+            # A failed lift must not block the reset — going home matters more.
+            if self.arm.fault.classify(e) != "fault":
+                self.get_logger().warn(f"Lift failed ({e}) — continuing to home")
+
     def _do_home_reset(self):
         """Return to the SAME joint-space home data collection uses.
 
@@ -791,15 +1050,54 @@ class PolicyNode(Node):
             self._send_zero_twist()
             time.sleep(1.0)
 
-            # Own the router while the reach action runs: a twist here would
-            # cancel the in-flight action and race its RPCs.
-            self.arm.twists_suppressed = True
-            if not self.arm.reach_home_joints():
-                self.get_logger().warn("Home reset timed out")
+            # 1. Release FIRST, while still parked over wherever the rollout
+            #    ended. Opening at home instead (data collection's order) drops
+            #    whatever is held onto whatever is under home.
+            self._open_gripper_slowly()      # ramps to 0 = fully open
 
-            self.arm.send_gripper(0.0)      # open
-            time.sleep(1.0)
-            self.get_logger().info("Reset complete. Press S to start.")
+            # 2. Lift clear of the object before any lateral travel.
+            self._lift_clear()
+
+            # 3. Only now go home. Own the router while the reach action runs:
+            #    a twist here would cancel the in-flight action and race its RPCs.
+            self.arm.twists_suppressed = True
+
+            # Instrumented so the reach can be COMPARED against data collection's
+            # rather than argued about. The ExecuteAction payload, joint targets,
+            # tolerance (2 deg), timeout (30 s) and poll interval are identical in
+            # both stacks, so any real difference in speed or path has to come
+            # from somewhere else — most likely the pose the reach STARTS from,
+            # which these numbers capture. Run R from a comparable pose in each
+            # stack and compare the printed duration and start error.
+            j0, xyz0 = self._joint_and_tcp()
+            t0 = time.monotonic()
+            reached  = self._reach_home_limited()
+            dt_reach = time.monotonic() - t0
+            j1, xyz1 = self._joint_and_tcp()
+
+            if j0 is not None:
+                err0 = max(min(d, 360.0 - d) for d in
+                           (abs(a - b) % 360.0 for a, b in zip(j0, HOME_JOINTS_DEG)))
+                self.get_logger().info(
+                    f"HOME REACH: {dt_reach:.2f}s | start joint err {err0:.1f} deg | "
+                    f"TCP {np.round(xyz0, 3)} -> {np.round(xyz1, 3)}")
+                self.get_logger().info(
+                    f"HOME REACH start joints: {[round(a, 1) for a in j0]}")
+            else:
+                self.get_logger().info(f"HOME REACH: {dt_reach:.2f}s (feedback unavailable)")
+
+            if reached:
+                self.get_logger().info("Reset complete. Press S to start.")
+            else:
+                # The shared reach_home_joints() returns False silently, so the
+                # warning has to live here.
+                self.get_logger().warn(
+                    "Home reset did NOT reach home within the timeout — arm is not "
+                    "at the demo start posture. Fix before pressing S.")
+                try:
+                    self.arm.base.StopAction()   # don't leave the action in flight
+                except Exception:
+                    pass
         except Exception as e:
             if self.arm.fault.classify(e) != "fault":
                 self.get_logger().error(f"Reset error: {e}")
@@ -932,8 +1230,11 @@ def inference_loop(model_path, shared_obs, action_queue,
 def monitor_keys(policy_node: PolicyNode, shared_obs: dict):
     try:
         pygame.init()
-        screen = pygame.display.set_mode((340, 210))
+        PANEL_W, PANEL_H = 340, 275
+        screen = pygame.display.set_mode((PANEL_W, PANEL_H))
         pygame.display.set_caption("Kinova Policy Control (UMI)")
+
+        live_proc = None       # live_viewer.py subprocess, toggled by F
         clock = pygame.time.Clock()
         font       = pygame.font.SysFont("monospace", 18)
         font_small = pygame.font.SysFont("monospace", 14)
@@ -946,11 +1247,21 @@ def monitor_keys(policy_node: PolicyNode, shared_obs: dict):
                 if event.type == pygame.QUIT:
                     policy_node.pause_policy()
                     policy_node.discard_recording()
+                    if live_proc is not None and live_proc.poll() is None:
+                        live_proc.terminate()
                     os._exit(0)
                 if event.type == pygame.KEYDOWN:
+                    # D / C both END the episode (next S opens a new one);
+                    # P only stops the arm — RolloutRecorder.start() is
+                    # idempotent, so resuming after P continues the SAME episode.
                     if event.key == pygame.K_d:
                         policy_node.pause_policy()
                         policy_node.save_recording()
+                    elif event.key == pygame.K_c:
+                        policy_node.pause_policy()
+                        policy_node.cancel_recording()
+                    elif event.key == pygame.K_p:
+                        policy_node.pause_policy()
                     elif event.key == pygame.K_s:
                         policy_node.resume_policy()
                     elif event.key == pygame.K_r:
@@ -958,8 +1269,19 @@ def monitor_keys(policy_node: PolicyNode, shared_obs: dict):
                     elif event.key == pygame.K_q:
                         policy_node.pause_policy()
                         policy_node.discard_recording()
+                        if live_proc is not None and live_proc.poll() is None:
+                            live_proc.terminate()
                         time.sleep(0.2)
                         os._exit(0)
+                    elif event.key == pygame.K_l:
+                        # Own process, own window — see live_viewer.py's header
+                        # for why it is not drawn in here.
+                        if live_proc is not None and live_proc.poll() is None:
+                            live_proc.terminate()
+                            live_proc = None
+                        else:
+                            live_proc = subprocess.Popen(
+                                [sys.executable, _LIVE_VIEWER])
 
             paused = shared_obs.get("paused", True)
             screen.fill(COLOR_PAUSED if paused else COLOR_RUNNING)
@@ -970,13 +1292,44 @@ def monitor_keys(policy_node: PolicyNode, shared_obs: dict):
 
             keys_info = [
                 ("S", "Start / Resume"),
-                ("D", "Done  / Pause"),
+                ("P", "Pause (keep episode)"),
+                ("D", "Done  -> SAVE episode"),
+                ("C", "Cancel -> discard"),
                 ("R", "Reset to home"),
+                ("L", "Live view window"),
                 ("Q", "Quit"),
             ]
             for i, (key, desc) in enumerate(keys_info):
                 line = font_small.render(f"  {key}  -  {desc}", True, (200, 200, 200))
-                screen.blit(line, (30, 65 + i * 30))
+                screen.blit(line, (30, 62 + i * 22))
+
+            # ── Sensor health dots ───────────────────────────────────────────
+            # Same states and colours as the collector's GUI, so a green
+            # piezense dot means the same thing on both sides of the pipeline.
+            # Check it BEFORE pressing S: the driver takes a few seconds to
+            # come up and nothing else in a rollout shows that it hasn't.
+            health_colors = {
+                'ready':    ( 80, 200,  80),
+                'waiting':  (255, 200,  50),
+                'dead':     (220,  50,  50),
+                'disabled': ( 80,  80,  80),
+            }
+            health_items = [
+                ('piezense', policy_node.get_piezense_health()),
+                ('wrist_cam', policy_node.get_camera_health()),
+            ]
+            # Flow chips left-to-right on measured widths (as in the collector),
+            # so a wider label can't overlap its neighbour.
+            row_left, row_right, row_y = 20, PANEL_W - 20, 238
+            chips = [(font_small.render(label, True, (200, 200, 200)), status)
+                     for label, status in health_items]
+            chips_w = sum(16 + surf.get_width() for surf, _ in chips)
+            gap = max(6, (row_right - row_left - chips_w) // max(1, len(chips) - 1))
+            cx = row_left
+            for surf, status in chips:
+                pygame.draw.circle(screen, health_colors[status], (cx + 6, row_y + 6), 6)
+                screen.blit(surf, (cx + 16, row_y))
+                cx += 16 + surf.get_width() + gap
 
             pygame.display.flip()
             clock.tick(10)
@@ -1006,6 +1359,8 @@ def main():
     parser.add_argument("--latency-offset-s", type=float, default=0.0,
                         help="System latency to compensate (seconds)")
     parser.add_argument("--no-pygame",       action="store_true",      help="Disable pygame window")
+    parser.add_argument("--no-piezense",     action="store_true",
+                        help="Skip the piezense subscription (pressure obs stay at baseline)")
     parser.add_argument("--record",          action="store_true",
                         help="Record rollouts to episode_N.hdf5 (S start, D save, R/Q discard)")
     parser.add_argument("--record-dir",      type=str, default=ROLLOUT_DIR_DEFAULT,
@@ -1068,7 +1423,8 @@ def main():
     inf_proc.start()
 
     node = PolicyNode(shared_obs, start_time, args.model, args.dt,
-                      record=args.record, record_dir=args.record_dir, pred_queue=pred_queue)
+                      record=args.record, record_dir=args.record_dir, pred_queue=pred_queue,
+                      enable_piezense=not args.no_piezense)
 
     def action_executor():
         pending = []

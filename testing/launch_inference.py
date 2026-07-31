@@ -52,6 +52,7 @@ def generate_launch_description(
     no_pygame: bool = False,
     record: bool = False,
     record_dir: str = None,
+    no_piezense: bool = False,
 ) -> LaunchDescription:
 
     inference_cmd = [
@@ -67,6 +68,8 @@ def generate_launch_description(
         inference_cmd.append("--record")
         if record_dir:
             inference_cmd += ["--record-dir", record_dir]
+    if no_piezense:
+        inference_cmd.append("--no-piezense")
 
     return LaunchDescription([
 
@@ -81,6 +84,17 @@ def generate_launch_description(
             name="dji_wrist_camera",
             output="screen",
         ),
+
+        # ── Piezense pressure sensor controller ────────────────────────────
+        # piezense0_pressures is a trained obs key, so the policy needs this
+        # driver for the same reason data collection does. It was missing here
+        # until 2026-07-31: every rollout ran with the pressure channel frozen
+        # at its baseline, which the episode files recorded as a flat line.
+        *([ExecuteProcess(
+            cmd=['ros2', 'launch', 'piezense_ros', 'ar_teleop_piezense_launch.py'],
+            name='piezense_driver',
+            output='screen',
+        )] if not no_piezense else []),
 
         # ── Kinova Gen3 state publisher ────────────────────────────────────
         ExecuteProcess(
@@ -126,6 +140,8 @@ def main(argv=sys.argv[1:]):
                              "(S start, D save, R/Q discard)")
     parser.add_argument("--record-dir",      type=str, default=None,
                         help="Directory for rollout episodes (default: testing/rollout_data)")
+    parser.add_argument("--no-piezense",     action="store_true",
+                        help="Skip the piezense driver and disable piezense obs.")
     args, launch_argv = parser.parse_known_args(argv)
 
     if args.latest:
@@ -148,6 +164,7 @@ def main(argv=sys.argv[1:]):
     print("  DJI device:      auto-detect by USB id" if args.dji_device < 0
           else f"  DJI device:      /dev/video{args.dji_device}")
     print("  dt / action steps / diffusion steps: from checkpoint config")
+    print(f"  Piezense:        {'DISABLED (baseline obs)' if args.no_piezense else 'driver launched'}")
     if args.latency_offset_s:
         print(f"  Latency offset:  {args.latency_offset_s*1000:.0f} ms")
     print()
@@ -169,6 +186,7 @@ def main(argv=sys.argv[1:]):
         no_pygame=args.no_pygame,
         record=args.record,
         record_dir=args.record_dir,
+        no_piezense=args.no_piezense,
     ))
     return ls.run()
 
