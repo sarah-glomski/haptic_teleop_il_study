@@ -1,0 +1,67 @@
+# Grape plucking — annotation spec.
+#
+# Read by data_collection/annotations.py. The collector renders its prompt from
+# this file, so adding a question is a config change, not a code change.
+#
+# HOTKEY RULES
+#   - one key per choice, unique across every field in this file
+#   - r s d c p u q are the collector's own keys and are refused
+#   - t opens the free-text note and is refused
+#   Both are checked at load; a clash raises rather than silently shadowing a
+#   robot control.
+#
+# WHEN TO ASK
+#   when: collect  (default) — asked at the keyboard the moment the episode is
+#     saved. Reserve this for what disappears if nobody writes it down now:
+#     things only the operator saw, and judgements needing the physical grape
+#     in hand. Every field here costs collection tempo, so keep the list short.
+#   when: review — carried in the schema, left blank at collection, graded later
+#     with the footage on screen. Nothing reads these yet; the review tool comes
+#     after this first pass.
+
+name: grape_pluck
+display: Grape plucking
+
+annotations:
+
+  - field: success
+    ask: "Did the grape come off the vine?"
+    type: enum
+    choices:
+      - {value: "yes",    key: "y"}
+      - {value: "no",     key: "n"}
+      - {value: "unsure", key: "i"}
+
+  # Asked at collection because the operator is holding the actual grape, which
+  # is better evidence than any camera. If it ever starts slowing the session
+  # down, move it by adding `when: review` — the column keeps its meaning and
+  # old rows stay valid.
+  - field: grape_damage
+    ask: "How damaged is the grape?"
+    rule: "skin marked but sealed = scuff · any juice = split"
+    type: enum
+    choices:
+      - {value: none,    key: "0"}
+      - {value: scuff,   key: "1"}
+      - {value: split,   key: "2"}
+      - {value: crushed, key: "3"}
+      - {value: unsure,  key: "9"}
+
+  # ── Adding a field looks like this ────────────────────────────────────────
+  # Uncomment to start collecting it. Existing rows keep their old columns and
+  # simply have no value for the new one, which reads correctly as "not asked".
+  #
+  # - field: stem_state
+  #   ask: "What happened to the stem?"
+  #   type: enum
+  #   choices:
+  #     - {value: clean,    key: "4"}
+  #     - {value: torn,     key: "5"}
+  #     - {value: attached, key: "6"}
+  #
+  # Graded later against the recording rather than at the keyboard:
+  #
+  # - field: n_attempts
+  #   when: review
+  #   ask: "How many grasp attempts?"
+  #   type: int

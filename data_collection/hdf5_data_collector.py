@@ -70,6 +70,9 @@ from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Bool, Float32, Float32MultiArray, String
 from piezense_interfaces.msg import PiezenseSystemArray
 
+from annotations import (STATUS_ANNOTATED, STATUS_SKIPPED, AnnotationPrompt,
+                         AnnotationStore, TaskSpec)
+
 
 # ── Camera topic configuration ─────────────────────────────────────────────────
 CAMERA_STREAMS = {
@@ -267,7 +270,136 @@ class HDF5DataCollector(Node):
         self._save_dir   = os.path.join(os.getcwd(), 'demo_data')
         self.demo_count  = self._scan_existing_episodes()
 
+        # ── Per-episode annotation ────────────────────────────────────────────
+        # Fires on D, right after the HDF5 lands, and writes annotations.csv
+        # next to the episodes. Set task:='' to turn it off entirely. A broken
+        # or missing task spec logs and disables annotation rather than taking
+        # a collection session down with it — losing the notes is bad, losing
+        # the session is worse.
+        self._ep_health = {}
+        self._first_frame_t = None
+        self._last_frame_t = None
+
+        self._operator = self.declare_parameter(
+            'operator', os.environ.get('USER', '')).value
+        task_name = self.declare_parameter('task', 'grape_pluck').value
+        self._store = None
+        self._prompt = None
+        if task_name:
+            try:
+                spec = TaskSpec.load(task_name)
+                self._store = AnnotationStore(self._save_dir, spec, self.get_logger())
+                self._prompt = AnnotationPrompt(spec)
+                self.get_logger().info(
+                    f"Annotation ON — task '{spec.display}', operator "
+                    f"'{self._operator or 'unset'}' → {self._save_dir}/annotations.csv")
+            except Exception as e:
+                self.get_logger().error(
+                    f'Annotation DISABLED — could not load task "{task_name}": {e}')
+        else:
+            self.get_logger().info('Annotation disabled (task:="")')
+
         self.get_logger().info('HDF5 Data Collector initialized')
+
+    # ── Annotation prompt plumbing (state lives in annotations.py) ────────────
+    @property
+    def annotation_active(self) -> bool:
+        return self._prompt is not None and self._prompt.active
+
+    @property
+    def annotation_typing(self) -> bool:
+        return self._prompt is not None and self._prompt.capturing_text
+
+    def annotation_key(self, event) -> str:
+        return self._prompt.handle_key(event)
+
+    def annotation_draw(self, screen, font, small, w, h):
+        self._prompt.draw(screen, font, small, w, h)
+
+    def annotation_finish(self, verdict: str):
+        """Close the prompt, writing whatever was answered. 'skip' still writes
+        a row — status=unreviewed is a state you can filter for, a missing row
+        is a silent gap."""
+        if not self.annotation_active:
+            return
+        status = STATUS_ANNOTATED if verdict == 'save' else STATUS_SKIPPED
+        if self._store is not None:
+            self._store.append(self._prompt.row(status))
+        self._prompt.close()
+
+    def _health_snapshot(self) -> dict:
+        """Every sensor's state right now, one flat dict."""
+        h = dict(self.get_camera_health())
+        h['piezense'] = self.get_piezense_health()
+        h['hololens'] = self.get_hololens_health()
+        h['qr'] = self.get_qr_health()
+        return h
+
+    def _reset_episode_health(self):
+        self._ep_health = {k: {'ready': False, 'first_bad': None, 'off': False}
+                           for k in self._health_snapshot()}
+        self._first_frame_t = None
+        self._last_frame_t = None
+
+    def recording_span_s(self) -> float:
+        """Seconds from the first landed frame to the last — the real length of
+        the run, excluding the walk to the keyboard before D."""
+        if self._first_frame_t is None or self._last_frame_t is None:
+            return 0.0
+        return self._last_frame_t - self._first_frame_t
+
+    def _sample_episode_health(self, frame_t: float):
+        """Record sensor health for ONE recorded frame. Called from the synced
+        callback, so the health window is exactly the frames — no more, no less.
+
+        Two windows this deliberately is not:
+
+        A single reading at D describes the teardown. It called episode_0
+        'hololens=dead' — and worse, a sensor that dropped mid-episode and
+        recovered before D would have read 'ready', hiding the gap entirely.
+
+        S-to-D is wrong the other way, because it includes the operator's
+        normal end-of-run routine: disarm, take the headset off, walk to the
+        keyboard, press D. The headset going away there is procedure, not a
+        fault, and flagging it trains you to ignore the column. Frames stop the
+        moment the arm is disarmed — robot_action/pose is one of the five
+        synced streams and the controller only publishes it while arm_enabled —
+        so tying health to frames lands on exactly the right window. Sampling
+        here rather than on a timer avoids a tail after the last frame, which
+        would re-flag the headset if it came off promptly after disarming.
+        """
+        t = frame_t - self._first_frame_t
+        for name, state in self._health_snapshot().items():
+            rec = self._ep_health.setdefault(
+                name, {'ready': False, 'first_bad': None, 'off': False})
+            if state == 'disabled':
+                rec['off'] = True
+            elif state == 'ready':
+                rec['ready'] = True
+            elif rec['ready'] and rec['first_bad'] is None:
+                # Was healthy, then stopped — record when, once.
+                rec['first_bad'] = t
+
+    def _sensor_summary(self) -> str:
+        """Per-sensor verdict for the episode just recorded.
+
+        off        disabled by flag
+        ok         ready for the whole episode
+        drop@Ns    was ready, then stopped N seconds in
+        never      never came up at all
+        """
+        parts = []
+        for name, rec in self._ep_health.items():
+            if rec['off']:
+                v = 'off'
+            elif not rec['ready']:
+                v = 'never'
+            elif rec['first_bad'] is not None:
+                v = f"drop@{rec['first_bad']:.1f}s"
+            else:
+                v = 'ok'
+            parts.append(f'{name}={v}')
+        return ' '.join(parts)
 
     # ── Buffer management ─────────────────────────────────────────────────────
     def _reset_buffers(self):
@@ -395,6 +527,15 @@ class HDF5DataCollector(Node):
     ):
         if not self.is_collecting or self.is_paused:
             return
+
+        # Bounds of the window where frames actually landed. Everything the
+        # annotation row reports about the episode is measured against this,
+        # not against S-to-D — see _sample_episode_health().
+        now_t = time.monotonic()
+        if self._first_frame_t is None:
+            self._first_frame_t = now_t
+        self._last_frame_t = now_t
+        self._sample_episode_health(now_t)
 
         with self._lock:
             self._buf_action_pose.append(_pose_to_vec7(action_pose_msg))
@@ -524,6 +665,7 @@ class HDF5DataCollector(Node):
             self.is_collecting = True
             self.is_paused     = False
             self.episode_start = self.get_clock().now()
+            self._reset_episode_health()   # after episode_start — the tracker times off it
             if self._enable_dji:
                 self._dji_cam_active = True
                 self._cam_drop_warned['dji_wrist'] = False  # re-arm warning for this episode
@@ -537,6 +679,10 @@ class HDF5DataCollector(Node):
     def end_collection(self):
         if self.is_collecting:
             self.is_collecting = False
+            # Snapshot sensor health BEFORE the DJI is switched off below.
+            # Taken after, the wrist camera always reads 'idle' and the column
+            # describes the teardown instead of the episode.
+            sensors = self._sensor_summary()
             if self._enable_dji:
                 self._dji_cam_active = False
                 self._dji_enable_pub.publish(Bool(data=False))
@@ -544,9 +690,29 @@ class HDF5DataCollector(Node):
             dur = (self.get_clock().now() - self.episode_start).nanoseconds / 1e9
             n   = len(self._buf_action_pose)
             self.get_logger().info(
-                f'Episode {self.demo_count} | {n} frames | {dur:.1f}s | {n/dur:.1f} Hz'
+                f'Episode {self.demo_count} | {n} frames | {dur:.1f}s | '
+                f'{n / dur if dur > 0 else 0:.1f} Hz'
             )
+            episode_name = f'episode_{self.demo_count}'
             self.demo_count += 1
+
+            # Annotate only what actually got written — _save_episode() bails
+            # out on an empty buffer, and a row for a file that does not exist
+            # is worse than no row.
+            if n and self._prompt is not None:
+                # Measured over the frames, not over S-to-D: the operator
+                # disarms, removes the headset and walks to the keyboard before
+                # pressing D, and counting that made a clean 8.8 s demo look
+                # like a 93 s run recorded at 2.8 Hz.
+                span = self.recording_span_s()
+                self._prompt.open({
+                    'episode':    episode_name,
+                    'operator':   self._operator,
+                    'num_frames': n,
+                    'duration_s': f'{span:.1f}' if span > 0 else '',
+                    'rate_hz':    f'{(n - 1) / span:.1f}' if span > 0 and n > 1 else '',
+                    'sensors':    sensors,
+                })
 
     def cancel_collection(self):
         """End recording WITHOUT saving. Discards the buffer and does not
@@ -725,8 +891,25 @@ def run_pygame(node: HDF5DataCollector):
     while rclpy.ok():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                node.annotation_finish('save')
                 return
             elif event.type == pygame.KEYDOWN:
+                # While the annotation prompt is up it gets first refusal on
+                # every key. The three robot controls still punch through
+                # (saving whatever was answered) so the prompt can never stand
+                # between the operator and the arm — except while a note is
+                # being typed, where 'r' is a letter, not a reset.
+                if node.annotation_active:
+                    verdict = node.annotation_key(event)
+                    if verdict:
+                        node.annotation_finish(verdict)
+                        continue
+                    if (node.annotation_typing or
+                            event.key not in (pygame.K_r, pygame.K_s, pygame.K_q)):
+                        continue
+                    node.annotation_finish('save')
+                    # fall through to the handler below
+
                 if   event.key == pygame.K_r:      node.reset_robot()
                 elif event.key == pygame.K_s:      node.start_collection()
                 elif event.key == pygame.K_d:      node.end_collection()
@@ -735,6 +918,12 @@ def run_pygame(node: HDF5DataCollector):
                 elif event.key == pygame.K_u:      node.unpause_collection()
                 elif event.key in (pygame.K_q, pygame.K_ESCAPE):
                     return
+
+        if node.annotation_active:
+            node.annotation_draw(screen, font, small_font, GUI_W, GUI_H)
+            pygame.display.flip()
+            clock.tick(30)
+            continue
 
         screen.fill((40, 44, 52))
 
