@@ -85,6 +85,13 @@ PIEZENSE_SYSTEM_ID      = 0
 PIEZENSE_INPUT_CHANNELS = 2
 PIEZENSE_INPUT_CHAN_IDS = [2, 3]   # channel indices within the system
 
+# The driver retries "[example] connecting..." until the device answers, and
+# that takes ~20 s from a cold launch (measured 2.2 s and 19.4 s on two runs the
+# same day). A 5 s grace painted the dot RED during a perfectly normal boot,
+# which trains you to ignore a red dot — the opposite of what it is for. Amber
+# 'waiting' holds for the whole boot window; red means it really did not come up.
+PIEZENSE_STARTUP_GRACE_S = 30.0
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _pose_to_vec7(msg: PoseStamped) -> list:
@@ -309,7 +316,11 @@ class HDF5DataCollector(Node):
                 break
 
     def _check_piezense_health(self):
-        if self._piezense_last_seen is None and self.is_collecting and not self._piezense_warned:
+        # Same grace as the dot: during the driver's ~20 s boot there is nothing
+        # wrong to report, and warning then would just be noise at every launch.
+        if (self._piezense_last_seen is None and self.is_collecting
+                and not self._piezense_warned
+                and (time.monotonic() - self._node_start_time) > PIEZENSE_STARTUP_GRACE_S):
             self._piezense_warned = True
             self.get_logger().warn(
                 'Piezense: no data on piezense/data — is piezense_driver running?'
@@ -499,7 +510,9 @@ class HDF5DataCollector(Node):
             return 'disabled'
         now = time.monotonic()
         if self._piezense_last_seen is None:
-            return 'waiting' if (now - self._node_start_time) < 5.0 else 'dead'
+            return ('waiting'
+                    if (now - self._node_start_time) < PIEZENSE_STARTUP_GRACE_S
+                    else 'dead')
         return 'ready' if (now - self._piezense_last_seen) < 3.0 else 'dead'
 
 
