@@ -60,6 +60,8 @@ CORE_TAIL = ['notes', 'num_frames', 'duration_s', 'rate_hz',
 
 STATUS_ANNOTATED = 'keep'
 STATUS_SKIPPED = 'unreviewed'
+STATUS_DELETED = 'deleted'        # row kept, episode_N.hdf5 no longer on disk
+STATUS_SUPERSEDED = 'superseded'  # an earlier row for a reused episode number
 
 
 # ── Task spec ──────────────────────────────────────────────────────────────────
@@ -174,9 +176,74 @@ class AnnotationStore:
         except Exception:
             return set()
 
+    def read_rows(self) -> list:
+        if not os.path.isfile(self._csv):
+            return []
+        with open(self._csv, newline='') as fh:
+            return list(csv.DictReader(fh))
+
+    def _rewrite(self, rows: list):
+        """Rewrite the whole csv atomically. Only for status corrections —
+        normal recording appends."""
+        tmp = self._csv + '.tmp'
+        with open(tmp, 'w', newline='') as fh:
+            w = csv.DictWriter(fh, fieldnames=self.columns, extrasaction='ignore')
+            w.writeheader()
+            for r in rows:
+                w.writerow({c: r.get(c, '') for c in self.columns})
+        os.replace(tmp, self._csv)
+
+    def orphan_rows(self) -> list:
+        """Rows whose episode_N.hdf5 is no longer on disk.
+
+        Deleting a bad episode by hand is the obvious thing to do and nothing
+        here can see it happen, so the row outlives the file. Worse, the
+        collector numbers the next run max(existing)+1 — delete the LAST
+        episode and the next recording reuses its number, landing a second row
+        with the same id. Surfacing both is the point of this.
+        """
+        return [r for r in self.read_rows()
+                if r.get('status') != STATUS_DELETED
+                and not os.path.isfile(os.path.join(self._dir, r['episode'] + '.hdf5'))]
+
+    def reconcile(self) -> list:
+        """Mark rows whose file is gone as deleted. Returns those episodes.
+
+        The row is kept, not removed: 'we recorded this and threw it away' is
+        a result, and a silently shrinking record is worse than an annotated
+        one. Re-running is safe.
+        """
+        gone = [r['episode'] for r in self.orphan_rows()]
+        if gone:
+            rows = self.read_rows()
+            for r in rows:
+                if r['episode'] in gone:
+                    r['status'] = STATUS_DELETED
+            self._rewrite(rows)
+            self._export_xlsx()
+        return gone
+
     def append(self, row: dict):
         """Append one episode. Writes the csv first — that is the record."""
         row = dict(row)
+
+        # An id can come round again after a hand-deleted episode. Keep the old
+        # row as history but mark it, so exactly one row per episode is current
+        # and a stale reading can never masquerade as the live one.
+        episode = row.get('episode')
+        prior = [r for r in self.read_rows()
+                 if r['episode'] == episode and r.get('status') != STATUS_SUPERSEDED]
+        if prior:
+            rows = self.read_rows()
+            for r in rows:
+                if r['episode'] == episode:
+                    r['status'] = STATUS_SUPERSEDED
+            self._rewrite(rows)
+            self._warn(
+                f'{episode} already had {len(prior)} row(s) — the file was '
+                f'probably deleted and the number reused. Older row(s) marked '
+                f'{STATUS_SUPERSEDED}; the new one is current.')
+
         row.setdefault('recorded_at', datetime.now().isoformat(timespec='seconds'))
         row.setdefault('task', self._spec.name)
         row.setdefault('git_sha', self.git_sha)
@@ -401,3 +468,50 @@ class AnnotationPrompt:
         screen.blit(small.render(
             'ENTER save   ·   ESC skip (marks unreviewed)   ·   R / S / Q also exit',
             True, self.C_DIM), (pad, height - 26))
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description='Inspect or reconcile a collection\'s annotations.')
+    ap.add_argument('collection', help='folder holding episode_*.hdf5')
+    ap.add_argument('--task', default='grape_pluck', help='task spec name')
+    ap.add_argument('--reconcile', action='store_true',
+                    help='mark rows whose episode file has been deleted')
+    ap.add_argument('--export', action='store_true',
+                    help='regenerate annotations.xlsx from the csv')
+    args = ap.parse_args()
+
+    store = AnnotationStore(args.collection, TaskSpec.load(args.task))
+    rows = store.read_rows()
+    if not rows:
+        print(f'No annotations.csv in {args.collection}')
+        return
+
+    if args.reconcile:
+        gone = store.reconcile()
+        print(f'Marked {len(gone)} row(s) {STATUS_DELETED}: {", ".join(gone)}'
+              if gone else 'Nothing to reconcile — every row has its file.')
+    elif args.export:
+        store._export_xlsx()
+        print(f'Wrote {os.path.join(args.collection, "annotations.xlsx")}')
+
+    rows = store.read_rows()
+    print(f'\n{len(rows)} row(s) in {args.collection}')
+    for r in rows:
+        on_disk = os.path.isfile(
+            os.path.join(args.collection, r['episode'] + '.hdf5'))
+        flag = '' if on_disk else '   [no file]'
+        print(f"  {r['episode']:12s} {r.get('status',''):11s} "
+              f"{r.get('num_frames',''):>5s}f  {r.get('rate_hz',''):>5s}Hz  "
+              f"{r.get('notes','')[:32]}{flag}")
+    orphans = store.orphan_rows()
+    if orphans:
+        print(f'\n{len(orphans)} row(s) reference a missing episode. '
+              f'Run with --reconcile to mark them.')
+
+
+if __name__ == '__main__':
+    main()

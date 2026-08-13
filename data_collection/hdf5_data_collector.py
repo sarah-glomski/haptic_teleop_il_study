@@ -293,6 +293,17 @@ class HDF5DataCollector(Node):
                 self.get_logger().info(
                     f"Annotation ON — task '{spec.display}', operator "
                     f"'{self._operator or 'unset'}' → {self._save_dir}/annotations.csv")
+                # Deleting a bad episode by hand is the obvious thing to do and
+                # nothing here can see it happen. Say so at startup, because the
+                # collector numbers the next run max(existing)+1 — delete the
+                # LAST episode and its number comes round again.
+                orphans = self._store.orphan_rows()
+                if orphans:
+                    self.get_logger().warn(
+                        f"{len(orphans)} annotation row(s) reference a deleted "
+                        f"episode ({', '.join(r['episode'] for r in orphans)}). "
+                        f"Mark them with:  python3.12 annotations.py "
+                        f"{self._save_dir} --reconcile")
             except Exception as e:
                 self.get_logger().error(
                     f'Annotation DISABLED — could not load task "{task_name}": {e}')
