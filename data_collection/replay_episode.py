@@ -2,214 +2,254 @@
 """
 Replay a recorded episode on the Kinova Gen3.
 
+Drives the arm through `action/pose` + `action/gripper` from an episode HDF5,
+using the SAME control layer teleop and policy rollout use — kinova_arm — so
+the home pose, workspace box, speed caps, orientation clamps, fault latch and
+stall guard are whatever those two are running with today.
+
+WHAT THIS USED TO DO, AND WHY IT MATTERED
+    This script carried its own private copies of all of that, and they had
+    gone stale:
+
+        home          Cartesian (0.350, 0.000, 0.120)   ~22 cm from the real
+                                                         joint-space home, and
+                                                         IK-ambiguous on a 7-DOF
+                                                         arm so the elbow could
+                                                         settle anywhere
+        workspace     x 0.25-0.45                        collection had long
+                                                         since moved to 0.70
+        fault latch   none                               a fault would leave it
+                                                         chasing a target
+        stall guard   none                               a stall would build an
+                                                         offset, then dash
+        orientation   ignored                            demos are orientation-
+                                                         rich; replay flattened
+                                                         them to position only
+
+    Measured on episode_0 (2026-08-13): 227 of 227 commanded frames sat outside
+    that x ceiling, so a replay would have jammed against a wall for the whole
+    run while appearing to work.
+
+REACHABILITY IS CHECKED BEFORE ANYTHING MOVES
+    An episode recorded in a workspace wider than the current one cannot be
+    replayed faithfully — the clip is silent and the arm simply does something
+    else. Frames outside the box are counted up front and the replay refuses to
+    start unless you pass --allow-clipping.
+
 Usage:
-  python3.12 replay_episode.py demo_data/episode_9.hdf5
-  python3.12 replay_episode.py demo_data/episode_9.hdf5 --robot-ip 192.168.1.10
+    python3.12 replay_episode.py demo_data/episode_0.hdf5
+    python3.12 replay_episode.py demo_data/episode_0.hdf5 --rate 10
+    python3.12 replay_episode.py demo_data/episode_0.hdf5 --no-orientation
+    python3.12 replay_episode.py demo_data/episode_0.hdf5 --dry-run
 
 Controls during replay (terminal):
-  q + ENTER  — abort replay early
+    q + ENTER   abort and stop the arm
 """
 
 import argparse
+import math
+import sys
 import threading
 import time
 
 import h5py
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
-from kortex_api.TCPTransport import TCPTransport
-from kortex_api.RouterClient import RouterClient
-from kortex_api.SessionManager import SessionManager
-from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
-from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
-from kortex_api.autogen.messages import Session_pb2, Base_pb2
+from kinova_arm import ArmLimits, KinovaArm
 
-CONTROL_HZ  = 30.0
-WATCHDOG_MS = 200
-HOME_POS    = (0.35, 0.0, 0.12)
-HOME_ANGLES = (-180.0, 0.0, 90.0)
-WS_BOUNDS   = dict(x=(0.25, 0.45), y=(-0.35, 0.35), z=(0.025, 0.25))
-MARGIN      = 0.005
+# Matches teleop and testing/inference.py. The home POSITION is not defined
+# here — reset drives to kinova_arm.HOME_JOINTS_DEG in joint space, the same
+# posture data collection returns to.
+HOME_TX, HOME_TY, HOME_TZ = -180.0, 0.0, 90.0
 
 
-class KinovaConn:
-    def __init__(self, ip: str, username: str = 'admin', password: str = 'admin'):
-        self._transport = TCPTransport()
-        self._router = RouterClient(self._transport, lambda ex: print(f'[WARN] kortex: {ex}'))
-        self._transport.connect(ip, 10000)
+# ── Episode ────────────────────────────────────────────────────────────────────
 
-        info = Session_pb2.CreateSessionInfo()
-        info.username = username
-        info.password = password
-        info.session_inactivity_timeout    = 60000
-        info.connection_inactivity_timeout = 2000
-        self._session = SessionManager(self._router)
-        self._session.CreateSession(info)
-
-        self.base   = BaseClient(self._router)
-        self.cyclic = BaseCyclicClient(self._router)
-        print(f'Connected to Kinova Gen3 at {ip}')
-
-    def disconnect(self):
-        try:
-            self._session.CloseSession()
-            self._transport.disconnect()
-        except Exception:
-            pass
-
-    def __enter__(self):  return self
-    def __exit__(self, *_): self.disconnect()
+def load_episode(path: str):
+    """(pos (T,3), quat (T,4) xyzw, grip (T,), recorded_hz)."""
+    with h5py.File(path, 'r') as f:
+        pose = f['action/pose'][()].astype(np.float64)      # [xyz, qxyzw]
+        grip = f['action/gripper'][()].astype(np.float64)
+        hz = float(f.attrs.get('collection_rate_hz', 30) or 30)
+    return pose[:, :3], pose[:, 3:7], grip, hz
 
 
-def _get_tcp(conn: KinovaConn) -> np.ndarray:
-    fb = conn.cyclic.RefreshFeedback()
-    return np.array([fb.base.tool_pose_x, fb.base.tool_pose_y, fb.base.tool_pose_z])
+def report_reachability(pos: np.ndarray, limits: ArmLimits) -> int:
+    """Print how much of the episode falls outside the workspace. Returns the
+    number of frames that would be clipped."""
+    m = limits.hard_margin_m
+    bounds = {'x': limits.x, 'y': limits.y, 'z': limits.z}
+    outside = np.zeros(len(pos), dtype=bool)
+
+    print('\nReachability against the current workspace:')
+    for i, ax in enumerate('xyz'):
+        lo, hi = bounds[ax][0] + m, bounds[ax][1] - m
+        bad = (pos[:, i] < lo) | (pos[:, i] > hi)
+        outside |= bad
+        flag = '' if not bad.any() else f'   <-- {bad.sum()} frame(s) clipped'
+        print(f'  {ax}  episode {pos[:, i].min():+.3f} .. {pos[:, i].max():+.3f}'
+              f'   box [{lo:+.3f}, {hi:+.3f}]{flag}')
+    return int(outside.sum())
 
 
-def _send_twist(conn: KinovaConn, vel: np.ndarray):
-    cmd = Base_pb2.TwistCommand()
-    cmd.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_MIXED
-    cmd.duration        = WATCHDOG_MS
-    cmd.twist.linear_x  = float(vel[0])
-    cmd.twist.linear_y  = float(vel[1])
-    cmd.twist.linear_z  = float(vel[2])
-    conn.base.SendTwistCommand(cmd)
+# ── Replay ─────────────────────────────────────────────────────────────────────
 
+def replay(arm: KinovaArm, pos, quat, grip, hz: float, orientation: bool):
+    home_rot = arm.limits.home_rotation(HOME_TX, HOME_TY, HOME_TZ)
+    dt = 1.0 / hz
+    aborted = threading.Event()
 
-def _send_gripper(conn: KinovaConn, value: float):
-    gc = Base_pb2.GripperCommand()
-    gc.mode = Base_pb2.GRIPPER_POSITION
-    f = gc.gripper.finger.add()
-    f.finger_identifier = 1
-    f.value = float(np.clip(value, 0.0, 1.0))
-    conn.base.SendGripperCommand(gc)
-
-
-def _clip_workspace(pos: np.ndarray) -> np.ndarray:
-    return np.array([
-        np.clip(pos[0], WS_BOUNDS['x'][0] + MARGIN, WS_BOUNDS['x'][1] - MARGIN),
-        np.clip(pos[1], WS_BOUNDS['y'][0] + MARGIN, WS_BOUNDS['y'][1] - MARGIN),
-        np.clip(pos[2], WS_BOUNDS['z'][0] + MARGIN, WS_BOUNDS['z'][1] - MARGIN),
-    ])
-
-
-def reset_to_home(conn: KinovaConn):
-    print('Moving to home position …')
-    action = Base_pb2.Action()
-    action.name = 'ReplayHome'
-    spd = Base_pb2.CartesianSpeed()
-    spd.translation = 0.08
-    spd.orientation = 12.0
-    action.reach_pose.constraint.speed.CopyFrom(spd)
-    pose = action.reach_pose.target_pose
-    pose.x, pose.y, pose.z                   = HOME_POS
-    pose.theta_x, pose.theta_y, pose.theta_z = HOME_ANGLES
-
-    done = threading.Event()
-    def _cb(notif):
-        if notif.action_event in (Base_pb2.ACTION_END, Base_pb2.ACTION_ABORT):
-            done.set()
-
-    conn.base.OnNotificationActionTopic(_cb, Base_pb2.NotificationOptions())
-    conn.base.ExecuteAction(action)
-    if not done.wait(timeout=30.0):
-        conn.base.StopAction()
-        raise RuntimeError('Home reset timed out')
-
-    _send_gripper(conn, 0.0)
-    time.sleep(0.5)
-    print('At home, gripper open.')
-
-
-def replay(
-    conn: KinovaConn,
-    action_pos: np.ndarray,
-    action_gripper: np.ndarray,
-    p_gain: float = 2.0,
-    vel_alpha: float = 0.4,
-    max_speed: float = 0.50,
-):
-    mode = Base_pb2.ServoingModeInformation()
-    mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
-    conn.base.SetServoingMode(mode)
-    time.sleep(0.2)
-
-    dt = 1.0 / CONTROL_HZ
-    smoothed_vel = np.zeros(3)
-    aborted = False
-
-    abort_event = threading.Event()
     def _listen():
-        while not abort_event.is_set():
+        while not aborted.is_set():
             try:
                 if input().strip().lower() == 'q':
-                    nonlocal aborted
-                    aborted = True
-                    abort_event.set()
-                    print('Replay aborted.')
+                    aborted.set()
+                    print('Aborting …')
             except EOFError:
-                break
+                return
     threading.Thread(target=_listen, daemon=True).start()
 
-    print(f'Replaying {len(action_pos)} frames @ {CONTROL_HZ:.0f} Hz.')
-    print("  'q' + ENTER = abort\n")
+    print(f'\nReplaying {len(pos)} frames @ {hz:.1f} Hz '
+          f'({len(pos) / hz:.1f} s).   q + ENTER aborts.\n')
 
-    for tgt, grip in zip(action_pos, action_gripper):
-        if aborted:
+    arm.reset_velocity_state()
+    for i, (p, q, g) in enumerate(zip(pos, quat, grip)):
+        if aborted.is_set():
+            break
+        if arm.fault.latched:
+            print('Robot faulted — replay stopped. Clear it in the Kinova web '
+                  'app and restart.')
             break
 
-        tick_start = time.monotonic()
-        obs = _get_tcp(conn)
+        tick = time.monotonic()
+        try:
+            fb = arm.refresh_feedback()
+            cur_pos = arm.tcp_position(fb)
+            cur_rot = arm.tcp_rotation(fb)
 
-        tgt_clipped = _clip_workspace(tgt)
-        err         = tgt_clipped - obs
-        raw_vel     = p_gain * err
-        spd         = float(np.linalg.norm(raw_vel))
-        if spd > max_speed:
-            raw_vel *= max_speed / spd
-        smoothed_vel = vel_alpha * raw_vel + (1.0 - vel_alpha) * smoothed_vel
+            # Feed the stall guard every tick — it is the only way to notice
+            # the arm has stopped without being told.
+            arm.stall.update_velocity(cur_pos)
 
-        _send_twist(conn, smoothed_vel)
-        _send_gripper(conn, grip)
+            target = arm.clip_to_workspace(p)
+            vel = arm.linear_velocity(cur_pos, target)
 
-        elapsed = time.monotonic() - tick_start
-        if elapsed < dt:
-            time.sleep(dt - elapsed)
+            gap = float(np.linalg.norm(target - cur_pos))
+            if arm.stall.check(vel, gap):
+                arm.send_zero_twist()
+                print('Stalled — replay stopped rather than chasing the backlog.')
+                break
 
-    abort_event.set()
-    _send_twist(conn, np.zeros(3))
-    print('Replay complete.')
+            ang = np.zeros(3)
+            if orientation:
+                tgt_rot, _ = arm.clamp_orientation(R.from_quat(q), home_rot)
+                ang = arm.angular_velocity(cur_rot, tgt_rot)
 
+            arm.send_twist(vel, ang, base_frame=True)
+            arm.send_gripper(g)
+
+        except Exception as e:
+            kind = arm.fault.classify(e)
+            if kind == 'fault':
+                continue                 # latched; the check above ends the run
+            if kind == 'transient':
+                continue                 # next tick retries
+            print(f'Replay error: {e}')
+            arm.send_zero_twist()
+            break
+
+        if i and i % int(max(hz, 1)) == 0:
+            print(f'  {i}/{len(pos)}  ({i / hz:.1f} s)')
+
+        slack = dt - (time.monotonic() - tick)
+        if slack > 0:
+            time.sleep(slack)
+
+    aborted.set()
+    arm.send_zero_twist()
+    print('\nReplay finished.')
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Replay a recorded episode on the Kinova Gen3')
-    parser.add_argument('episode',      help='Path to episode_N.hdf5')
-    parser.add_argument('--robot-ip',   default='192.168.1.10')
-    parser.add_argument('--p-gain',     type=float, default=2.0)
-    parser.add_argument('--vel-alpha',  type=float, default=0.4)
-    parser.add_argument('--max-speed',  type=float, default=0.50, metavar='M/S')
-    parser.add_argument('--skip-reset', action='store_true', help='Skip home reset')
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(
+        description='Replay a recorded episode on the Kinova Gen3')
+    ap.add_argument('episode', help='path to episode_N.hdf5')
+    ap.add_argument('--robot-ip', default='192.168.1.10')
+    ap.add_argument('--rate', type=float, default=None,
+                    help='replay rate in Hz (default: the file\'s '
+                         'collection_rate_hz attribute)')
+    ap.add_argument('--no-orientation', dest='orientation', action='store_false',
+                    help='position + gripper only, leaving the wrist where it '
+                         'is. Default tracks the recorded orientation, which is '
+                         'what the demos contain.')
+    ap.add_argument('--skip-home', action='store_true',
+                    help='start from the current pose instead of homing first')
+    ap.add_argument('--allow-clipping', action='store_true',
+                    help='replay even though some frames fall outside the '
+                         'workspace and will be silently clipped')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='report the episode and its reachability, touch nothing')
+    args = ap.parse_args()
 
-    with h5py.File(args.episode, 'r') as f:
-        T   = int(f.attrs.get('num_frames', 0) or f['action/pose'].shape[0])
-        hz  = float(f.attrs.get('collection_rate_hz', 30))
-        action_pos     = f['action/pose'][:, :3].astype(np.float64)
-        action_gripper = f['action/gripper'][()].astype(np.float64)
+    pos, quat, grip, rec_hz = load_episode(args.episode)
+    hz = args.rate or rec_hz
+    limits = ArmLimits()
 
-    print(f'Loaded {T} frames @ {hz:.0f} Hz  ({T/hz:.1f} s)  ←  {args.episode}')
+    print(f'{args.episode}')
+    print(f'  {len(pos)} frames, recorded at {rec_hz:.0f} Hz '
+          f'({len(pos) / rec_hz:.1f} s)')
+    if args.rate:
+        print(f'  replaying at {hz:.1f} Hz ({len(pos) / hz:.1f} s) — overridden')
+    print(f'  gripper {grip.min():.2f} .. {grip.max():.2f}')
+    print(f'  orientation tracking: {"ON" if args.orientation else "OFF"}')
 
-    with KinovaConn(args.robot_ip) as conn:
-        if not args.skip_reset:
-            reset_to_home(conn)
+    clipped = report_reachability(pos, limits)
+    if clipped:
+        pct = 100.0 * clipped / len(pos)
+        print(f'\n  {clipped}/{len(pos)} frames ({pct:.0f}%) fall outside the '
+              f'workspace and would be clipped.')
+        print('  The arm would not follow the recorded path. This usually means '
+              'the episode\n  was recorded under different workspace bounds than '
+              'the ones in kinova_arm.py.')
+        if not args.allow_clipping and not args.dry_run:
+            print('\nRefusing to replay. Pass --allow-clipping to override.')
+            sys.exit(1)
+    else:
+        print('\n  Entire episode is inside the workspace.')
 
-        print('Press ENTER to start replay.')
-        input()
+    if args.dry_run:
+        print('\n--dry-run: nothing was moved.')
+        return
 
-        replay(conn, action_pos, action_gripper,
-               p_gain=args.p_gain,
-               vel_alpha=args.vel_alpha,
-               max_speed=args.max_speed)
+    arm = KinovaArm(robot_ip=args.robot_ip,
+                    recovery_hint='restart the replay')
+    arm.connect()
+    arm.setup_servoing()
+    try:
+        if not args.skip_home:
+            print('\nHoming (joint space, the posture collection returns to) …')
+            arm.twists_suppressed = True      # the reach action owns the router
+            try:
+                reached = arm.reach_home_joints()
+            finally:
+                arm.twists_suppressed = False
+            if not reached:
+                print('Did not reach home within the timeout — not replaying.')
+                return
+            arm.send_gripper(0.0)
+            time.sleep(1.0)
+            arm.setup_servoing()
+            print('At home, gripper open.')
+
+        input('\nPress ENTER to start the replay (Ctrl-C to bail) … ')
+        replay(arm, pos, quat, grip, hz, args.orientation)
+    except KeyboardInterrupt:
+        print('\nInterrupted.')
+    finally:
+        arm.disconnect()
 
 
 if __name__ == '__main__':
