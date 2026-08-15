@@ -23,6 +23,12 @@ _PYTHON = sys.executable
 
 _THIS_DIR         = os.path.dirname(os.path.abspath(__file__))
 _DATA_COLLECT_DIR = os.path.join(_THIS_DIR, "..", "data_collection")
+
+# Shared with the collection launchers — same driver, same leaked BLE link.
+# inference.py already reaches into data_collection/ for kinova_arm.
+if os.path.abspath(_DATA_COLLECT_DIR) not in sys.path:
+    sys.path.insert(0, os.path.abspath(_DATA_COLLECT_DIR))
+from piezense_ble import release_stale_piezense_ble  # noqa: E402
 _KINOVA_STATE_PUB = os.path.join(_DATA_COLLECT_DIR, "kinova_state_publisher.py")
 _DJI_CAMERA_NODE  = os.path.join(_DATA_COLLECT_DIR, "dji_camera_node.py")
 _INFERENCE_SCRIPT = os.path.join(_THIS_DIR, "inference.py")
@@ -176,6 +182,14 @@ def main(argv=sys.argv[1:]):
     if args.record:
         print("  (recording: S starts an episode, D saves it, R/Q discard it)")
     print("=" * 60)
+
+    # The collector and teleop start the same BLE driver, and a Ctrl-C in any
+    # of them leaves the link held with no owner. Inference then finds the
+    # sensor not advertising and sits on "[example] connecting..." — which is
+    # what happened on 2026-08-14, inheriting the link data collection left
+    # behind the day before.
+    if not args.no_piezense:
+        release_stale_piezense_ble()
 
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(generate_launch_description(

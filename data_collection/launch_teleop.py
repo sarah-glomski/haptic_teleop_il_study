@@ -36,6 +36,7 @@ from launch import LaunchDescription, LaunchService
 from launch.actions import ExecuteProcess
 
 from launch_rosbridge import make_rosbridge_node, start_discovery_broadcaster
+from piezense_ble import release_stale_piezense_ble
 
 
 _PYTHON = '/usr/bin/python3.12'
@@ -139,6 +140,11 @@ def main(argv=sys.argv[1:]):
     print()
     print('  Ctrl-C stops all nodes and halts the robot.')
     print('=' * 60)
+
+    # A driver killed with Ctrl-C leaves its Bluetooth link behind, and the
+    # sensor stops advertising while it is held — so the next launch, in any
+    # stack, spins on "[example] connecting..." forever.
+    release_stale_piezense_ble()
 
     # Strip conda/miniforge from PATH so that executables with `#!/usr/bin/env python3`
     # (e.g. rosbridge_websocket) resolve to the system Python 3.12, not conda's 3.13.

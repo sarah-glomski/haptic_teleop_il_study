@@ -35,7 +35,6 @@ Keyboard controls (in the pygame window):
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 
@@ -44,66 +43,13 @@ from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
 
 from launch_rosbridge import make_rosbridge_node, start_discovery_broadcaster
+from piezense_ble import release_stale_piezense_ble
 
 
 _PYTHON = '/usr/bin/python3.12'
 
 
 ZED_SERIAL = '17875187'
-
-# BLE name the piezense driver connects to, set on its side in ar_teleop.py as
-# addSystem("PiezoLeader1", 4). Matched by NAME, never by address: the sensor
-# advertises a random BLE address that changes when it reboots.
-PIEZENSE_BLE_NAME = 'PiezoLeader1'
-
-# bluetoothctl interleaves coloured [NEW]/[CHG]/[DEL] event lines with the list
-# it was asked for, so its output needs stripping before it can be parsed.
-_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
-
-
-def release_stale_piezense_ble(name: str = PIEZENSE_BLE_NAME) -> None:
-    """Drop a BLE link to the piezense that no driver process owns any more.
-
-    The driver's own ar_teleop.py wraps its main loop in `except Exception`,
-    and KeyboardInterrupt is a BaseException — so Ctrl-C skips its disconnect()
-    and BlueZ keeps the link open after the process is gone. A connected BLE
-    peripheral stops advertising, so the next launch scans, finds nothing, and
-    spins on "[example] connecting..." indefinitely with no clue why. Observed
-    2026-08-13: 3761 retries against a sensor that was powered on and two feet
-    away, still held by the previous session's abandoned link.
-
-    Cleared here rather than upstream: piezense_ros is a shared package and
-    this is our launcher's mess to clean, exactly like the pkill sweep above.
-    Must run AFTER that sweep — a driver that is still alive is a legitimate
-    owner of the link and must not have it pulled out from under it.
-
-    Never fatal. A missing or wedged bluetoothctl leaves the link alone and the
-    session proceeds; the worst case is the behaviour we already had.
-    """
-    try:
-        out = subprocess.run(['bluetoothctl', 'devices', 'Connected'],
-                             capture_output=True, text=True, timeout=6).stdout
-    except (FileNotFoundError, OSError, subprocess.SubprocessError):
-        return
-
-    for raw in out.splitlines():
-        line = _ANSI_RE.sub('', raw).strip()
-        if not line.startswith('Device '):
-            continue                       # an event line, not a list entry
-        parts = line.split(maxsplit=2)     # 'Device', <mac>, <name>
-        if len(parts) != 3 or parts[2].strip() != name:
-            continue
-        mac = parts[1]
-        try:
-            subprocess.run(['bluetoothctl', 'disconnect', mac],
-                           capture_output=True, text=True, timeout=10)
-            print(f'Released stale Bluetooth link to {name} ({mac}) — it was '
-                  f'connected with no driver running')
-        except (OSError, subprocess.SubprocessError):
-            print(f'Could not release the Bluetooth link to {name} ({mac}). '
-                  f'If the driver sits on "[example] connecting...", run:\n'
-                  f'    bluetoothctl disconnect {mac}')
-
 
 def generate_launch_description(
     robot_ip: str = '192.168.1.10',
