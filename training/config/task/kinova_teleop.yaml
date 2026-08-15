@@ -9,12 +9,57 @@
 
 name: kinova_teleop
 
-camera_obs_latency: 0 #0.125
-robot_obs_latency: 0.0001
-gripper_obs_latency: 0.02
-piezense_obs_latency: 0.0001
-dataset_frequeny: 0 #0, 59.94
-obs_down_sample_steps: 3 # 3, 1
+# TIMING. Upstream UMI compensates for per-signal sensor latency by deriving
+# latency_steps from these four values times dataset_frequeny. That is a UMI
+# rig concern, not ours, and it has always been inert here — dataset_frequeny
+# was 0, so every product was 0. Now that dataset_frequeny is real those
+# expressions would come alive (gripper would pick up a stray -0.2 step), so
+# the keys are removed and every latency_steps below is a literal 0 instead.
+# Nothing in this repo or in umi_dataset.py reads them.
+# camera_obs_latency: 0
+# robot_obs_latency: 0
+# gripper_obs_latency: 0
+# piezense_obs_latency: 0
+
+# The rate the episodes were ACTUALLY recorded at, and the single most
+# consequential number in this file — testing/inference.py reads it straight
+# out of the checkpoint and sets its action period to
+# obs_down_sample_steps / dataset_frequeny.
+#
+# It was 0, which made inference fall back to a hardcoded SOURCE_RATE_HZ=30
+# while the data was really ~8-14 Hz, so every rollout replayed the demos
+# roughly 3x too fast and fed the policy observations spaced ~3x tighter than
+# it was trained on. Nothing errored; it was simply wrong.
+#
+# MEASURED, not guessed: the mean of the per-episode rate_hz recorded in
+# Task1Collection5/annotations.csv (2026-08-14, 15 episodes, 4969 frames over
+# 425.3 s). The distribution is tight and all three averages agree:
+#
+#     mean of 15            11.66 Hz
+#     mean of the 14 kept   11.67 Hz
+#     frame-weighted        11.68 Hz
+#     median 11.80   stdev 0.51   range 10.6 - 12.4
+#
+# Those rates come from the annotation layer, which times the window in which
+# frames actually landed. Collections 1-4 predate it and carry no timestamps,
+# so their rate is unmeasurable — but the spread here is small enough that
+# 11.66 is a reasonable stand-in for the merged set. Revisit if a future
+# collection's annotations disagree.
+#
+# It does not need to be exact — it needs to be the SAME here and at rollout,
+# which is what was broken. Treat it as the rollout-speed knob: if playback
+# looks fast, lower it; if sluggish, raise it. It IS baked into the checkpoint,
+# so changing it means retraining.
+dataset_frequeny: 11.66
+
+# 1 = train on consecutive frames, no downsampling.
+# Was 3. Note this shortens every horizon below by 3x in real time, since the
+# horizons count SAMPLED frames. At 11.66 Hz:
+#     low_dim  8 frames = 0.69 s   (was 24 frames = 2.06 s)
+#     img      2 frames = 0.17 s   (was  6 frames = 0.51 s)
+#     action  16 frames = 1.37 s   (was 48 frames = 4.12 s)
+# Raise the horizons if the policy needs that context back.
+obs_down_sample_steps: 1
 
 low_dim_obs_horizon: 8
 img_obs_horizon: 2
@@ -34,7 +79,7 @@ shape_meta: &shape_meta
     robot0_eef_pos:
       shape: [3]
       horizon: ${task.low_dim_obs_horizon} # int
-      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      latency_steps: 0 # float
       down_sample_steps: ${task.obs_down_sample_steps} # float
       type: low_dim
       ignore_by_policy: ${task.ignore_proprioception}
@@ -42,7 +87,7 @@ shape_meta: &shape_meta
       raw_shape: [3]
       shape: [6]
       horizon: ${task.low_dim_obs_horizon} # int
-      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      latency_steps: 0 # float
       down_sample_steps: ${task.obs_down_sample_steps} # float
       type: low_dim
       rotation_rep: rotation_6d
@@ -50,7 +95,7 @@ shape_meta: &shape_meta
     robot0_gripper_width:
       shape: [1]
       horizon: ${task.low_dim_obs_horizon} # int
-      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.gripper_obs_latency}) * ${task.dataset_frequeny}'} # float
+      latency_steps: 0 # float
       down_sample_steps: ${task.obs_down_sample_steps} # float
       type: low_dim
       ignore_by_policy: ${task.ignore_proprioception}
@@ -58,14 +103,14 @@ shape_meta: &shape_meta
       raw_shape: [3]
       shape: [6]
       horizon: ${task.low_dim_obs_horizon} # int
-      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      latency_steps: 0 # float
       down_sample_steps: ${task.obs_down_sample_steps} # float
       type: low_dim
       ignore_by_policy: ${task.ignore_proprioception}
     piezense0_pressures:
       shape: [2]
       horizon: ${task.low_dim_obs_horizon} # int
-      latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.piezense_obs_latency}) * ${task.dataset_frequeny}'} # float
+      latency_steps: 0 # float
       down_sample_steps: ${task.obs_down_sample_steps} # float
       type: low_dim
       ignore_by_policy: ${task.ignore_proprioception}
