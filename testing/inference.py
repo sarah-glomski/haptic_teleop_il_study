@@ -1403,9 +1403,9 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Model:           {args.model}")
-    print(f"dt:              {args.dt}s  ({1/args.dt:.0f} Hz)   [from ckpt: "
-          f"down_sample {run_cfg['down_sample_steps']} / {run_cfg['source_rate_hz']:.0f} Hz]")
-    print(f"Obs horizons:    read from checkpoint shape_meta (frames {args.dt}s apart)")
+    print(f"dt:              {args.dt:.4f}s  ({1/args.dt:.1f} Hz)   [from ckpt: "
+          f"down_sample {run_cfg['down_sample_steps']} / {run_cfg['source_rate_hz']:.1f} Hz]")
+    print(f"Obs horizons:    read from checkpoint shape_meta (frames {args.dt:.4f}s apart)")
     print(f"Num Action steps:{args.n_action_steps}   [from ckpt]")
     print(f"Diffusion steps: {args.diffusion_steps}   [from ckpt]")
     print(f"Max linear speed:{ARM_LIMITS.max_linear_speed_mps} m/s   "
