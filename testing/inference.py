@@ -1343,19 +1343,25 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Diffusion Policy Inference (UMI pipeline) — Kinova Gen3")
     parser.add_argument("--model",           type=str, required=True,  help="Path to UMI-pipeline .ckpt")
-    # dt / n-action-steps / diffusion-steps are now READ FROM THE CHECKPOINT
-    # (see load_run_config). They were flags whose defaults merely happened to
-    # match the training config, so retraining with a different
+    # dt / n-action-steps / diffusion-steps default to the CHECKPOINT (see
+    # load_run_config). They used to be plain flags whose defaults merely
+    # happened to match the training config, so retraining with a different
     # obs_down_sample_steps or n_action_steps silently desynced inference with
-    # no error. Uncomment to override a trained value deliberately — and print
-    # loudly when you do, because a mismatch here is invisible in the rollout.
-    # parser.add_argument("--dt",              type=float, default=None,
-    #                     help="Override action step period (s); default = "
-    #                          "obs_down_sample_steps / source_rate from the ckpt")
-    # parser.add_argument("--n-action-steps",  type=int,   default=None,
-    #                     help="Override actions executed per inference cycle")
-    # parser.add_argument("--diffusion-steps", type=int,   default=None,
-    #                     help="Override DDIM inference steps")
+    # no error at all. Defaulting to None keeps that safety: you get the
+    # trained value unless you say otherwise, and saying otherwise prints a
+    # loud banner, because a timing mismatch is invisible in a rollout — the
+    # arm just moves at the wrong speed and looks like a bad policy.
+    timing = parser.add_mutually_exclusive_group()
+    timing.add_argument("--dt",              type=float, default=None,
+                        help="Override the action step period in SECONDS. "
+                             "Default: obs_down_sample_steps / dataset_frequeny "
+                             "from the checkpoint.")
+    timing.add_argument("--hz",              type=float, default=None,
+                        help="Same override expressed as a RATE (dt = 1/hz).")
+    parser.add_argument("--n-action-steps",  type=int,   default=None,
+                        help="Override actions executed per inference cycle")
+    parser.add_argument("--diffusion-steps", type=int,   default=None,
+                        help="Override DDIM inference steps (latency vs quality)")
     parser.add_argument("--latency-offset-s", type=float, default=0.0,
                         help="System latency to compensate (seconds)")
     parser.add_argument("--no-pygame",       action="store_true",      help="Disable pygame window")
@@ -1367,12 +1373,42 @@ def main():
                         help=f"Directory for rollout episodes (default: {ROLLOUT_DIR_DEFAULT})")
     args = parser.parse_args()
 
-    # Timing/sampling come from the checkpoint that is about to be run, so they
-    # cannot disagree with how the policy was trained.
+    # Timing/sampling come from the checkpoint that is about to be run, so by
+    # default they cannot disagree with how the policy was trained.
     run_cfg = load_run_config(args.model)
-    args.dt = run_cfg["dt"]
-    args.n_action_steps = run_cfg["n_action_steps"]
-    args.diffusion_steps = run_cfg["diffusion_steps"]
+    ckpt_dt = run_cfg["dt"]
+
+    overrides = []
+    if args.hz is not None:
+        args.dt = 1.0 / args.hz
+        overrides.append(("dt", f"{ckpt_dt:.4f}s ({1/ckpt_dt:.1f} Hz)",
+                          f"{args.dt:.4f}s ({args.hz:.1f} Hz)  [--hz]"))
+    elif args.dt is not None:
+        overrides.append(("dt", f"{ckpt_dt:.4f}s ({1/ckpt_dt:.1f} Hz)",
+                          f"{args.dt:.4f}s ({1/args.dt:.1f} Hz)  [--dt]"))
+    else:
+        args.dt = ckpt_dt
+
+    if args.n_action_steps is None:
+        args.n_action_steps = run_cfg["n_action_steps"]
+    else:
+        overrides.append(("n_action_steps", str(run_cfg["n_action_steps"]),
+                          f"{args.n_action_steps}  [--n-action-steps]"))
+
+    if args.diffusion_steps is None:
+        args.diffusion_steps = run_cfg["diffusion_steps"]
+    else:
+        overrides.append(("diffusion_steps", str(run_cfg["diffusion_steps"]),
+                          f"{args.diffusion_steps}  [--diffusion-steps]"))
+
+    if overrides:
+        bar = "!" * 68
+        print(f"\n{bar}\n  OVERRIDING WHAT THIS CHECKPOINT WAS TRAINED WITH")
+        for name, was, now in overrides:
+            print(f"    {name:16s} ckpt {was:24s} ->  {now}")
+        print("  The policy was trained at the ckpt values. A timing mismatch does")
+        print("  not error — the arm simply moves at the wrong speed.")
+        print(f"{bar}\n")
 
     # An action older than one full predicted horizon is obsolete — a newer
     # prediction has superseded it. Backstop against any source of backlog, not
