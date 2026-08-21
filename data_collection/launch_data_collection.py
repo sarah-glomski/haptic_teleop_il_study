@@ -61,6 +61,8 @@ def generate_launch_description(
     no_rosbridge: bool = False,
     orientation: bool = True,
     zed_uvc: bool = False,
+    task: str = 'grape_pluck',
+    operator: str = '',
 ) -> LaunchDescription:
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -128,6 +130,8 @@ def generate_launch_description(
                 '-p', f'enable_zed:={str(not (no_zed or no_cameras)).lower()}',
                 '-p', f'enable_dji:={str(not no_cameras).lower()}',
                 '-p', f'enable_piezense:={str(not no_piezense).lower()}',
+                '-p', f'task:={task}',
+                *(['-p', f'operator:={operator}'] if operator else []),
             ],
             name='hdf5_data_collector',
             output='screen',
@@ -217,6 +221,15 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('--no-rosbridge', action='store_true',
                         help='Skip launching rosbridge (use when it is already running '
                              'so the HoloLens stays connected across pipeline restarts).')
+    parser.add_argument('--task', default='grape_pluck',
+                        help='Annotation task spec from tasks/<name>.yaml '
+                             '(grape_pluck, block_sort, ...). Sets which questions '
+                             'the collector asks on D and which task new rows carry. '
+                             'The collector refuses to record if demo_data/ still '
+                             'holds another task\'s un-moved collection.')
+    parser.add_argument('--operator', default='',
+                        help='Recorded in the operator column of annotations.csv '
+                             '(default: the $USER of this machine).')
     parser.add_argument('--no-orientation', dest='orientation', action='store_false',
                         help='Lock the end-effector orientation at home and teleop translation '
                              'only. Default is hand-orientation wrist teleop in '
@@ -231,6 +244,7 @@ def main(argv=sys.argv[1:]):
     print(f'  ZED serial:     {args.zed_serial or "(auto-detect first found)"}')
     print(f'  DJI wrist cam:  /dev/video{args.dji_device}')
     print(f'  Wrist orient.:  {"ON (hand-tracked, clamped)" if args.orientation else "LOCKED at home (--no-orientation)"}')
+    print(f'  Task:           {args.task}' + (f'   Operator: {args.operator}' if args.operator else ''))
     print()
     print('HoloLens:')
     print('  Make sure the HoloLens app is pointed at ws://<this-machine-ip>:9090')
@@ -292,6 +306,8 @@ def main(argv=sys.argv[1:]):
         no_rosbridge=args.no_rosbridge,
         orientation=args.orientation,
         zed_uvc=args.zed_uvc,
+        task=args.task,
+        operator=args.operator,
     )
     ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)

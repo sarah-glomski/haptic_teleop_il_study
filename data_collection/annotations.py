@@ -37,6 +37,7 @@ prompt can never stand between the operator and the robot controls.
 """
 
 import csv
+import glob
 import os
 import subprocess
 from datetime import datetime
@@ -192,6 +193,43 @@ class AnnotationStore:
             for r in rows:
                 w.writerow({c: r.get(c, '') for c in self.columns})
         os.replace(tmp, self._csv)
+
+    def staging_conflicts(self) -> list:
+        """Reasons this folder must NOT receive episodes for the current task.
+
+        The collection workflow stages episodes flat in demo_data/ and moves
+        them into a TaskNCollectionM folder afterwards. Two tasks staged into
+        the same folder interleave their episode numbering and share one csv —
+        cross-task contamination that no downstream step can undo. This check
+        exists so the collector can refuse to start instead.
+
+        Returns human-readable problems (empty list = clean):
+          - the csv holds rows from a different task -> the previous task's
+            collection was never moved out;
+          - episode files exist that no csv row accounts for -> either a
+            half-moved collection or pre-annotation recordings; their task is
+            unknowable, so they may not share a folder with new data.
+        """
+        problems = []
+        rows = [r for r in self.read_rows() if r.get('status') != STATUS_DELETED]
+        foreign = sorted({r.get('task', '') for r in rows
+                          if r.get('task') and r.get('task') != self._spec.name})
+        if foreign:
+            problems.append(
+                f"annotations.csv already holds rows from task(s) "
+                f"{', '.join(foreign)} — a previous collection was not moved "
+                f"out of {self._dir}")
+        known = {r['episode'] for r in self.read_rows()}
+        stray = sorted(
+            os.path.basename(p)[:-len('.hdf5')]
+            for p in glob.glob(os.path.join(self._dir, 'episode_*.hdf5'))
+            if os.path.basename(p)[:-len('.hdf5')] not in known)
+        if stray:
+            shown = ', '.join(stray[:4]) + (' …' if len(stray) > 4 else '')
+            problems.append(
+                f"{len(stray)} episode file(s) in {self._dir} have no "
+                f"annotation row, so their task is unknown: {shown}")
+        return problems
 
     def orphan_rows(self) -> list:
         """Rows whose episode_N.hdf5 is no longer on disk.
@@ -477,14 +515,42 @@ def main():
     ap = argparse.ArgumentParser(
         description='Inspect or reconcile a collection\'s annotations.')
     ap.add_argument('collection', help='folder holding episode_*.hdf5')
-    ap.add_argument('--task', default='grape_pluck', help='task spec name')
+    ap.add_argument('--task', default=None,
+                    help='task spec name (default: read it from the csv itself)')
     ap.add_argument('--reconcile', action='store_true',
                     help='mark rows whose episode file has been deleted')
     ap.add_argument('--export', action='store_true',
                     help='regenerate annotations.xlsx from the csv')
     args = ap.parse_args()
 
+    # The task decides the column set, and reconcile/export REWRITE the csv
+    # with that column set (extras dropped). Defaulting to one task silently
+    # destroyed another task's columns on 2026-08-21 — a block_sort csv
+    # reconciled under the grape spec lost condition/block/placed on all 115
+    # rows. The rows carry their task; trust them, not a default.
+    if args.task is None:
+        csv_path = os.path.join(args.collection, 'annotations.csv')
+        tasks = set()
+        if os.path.isfile(csv_path):
+            with open(csv_path, newline='') as fh:
+                tasks = {r.get('task', '') for r in csv.DictReader(fh)} - {''}
+        if len(tasks) == 1:
+            args.task = tasks.pop()
+            print(f'Task (from csv): {args.task}')
+        elif not tasks:
+            ap.error(f'no annotations.csv in {args.collection} to read the '
+                     f'task from — pass --task explicitly')
+        else:
+            ap.error(f'csv holds rows from multiple tasks {sorted(tasks)} — '
+                     f'pass --task explicitly')
+
     store = AnnotationStore(args.collection, TaskSpec.load(args.task))
+    if store.staging_conflicts() and (args.reconcile or args.export):
+        foreign = [p for p in store.staging_conflicts() if 'rows from task' in p]
+        if foreign:
+            ap.error(foreign[0] + ' — refusing to rewrite it under '
+                     f"'{args.task}' columns (that would drop the other "
+                     f"task's fields)")
     rows = store.read_rows()
     if not rows:
         print(f'No annotations.csv in {args.collection}')

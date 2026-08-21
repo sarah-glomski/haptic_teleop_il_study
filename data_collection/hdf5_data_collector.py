@@ -304,6 +304,37 @@ class HDF5DataCollector(Node):
                         f"episode ({', '.join(r['episode'] for r in orphans)}). "
                         f"Mark them with:  python3.12 annotations.py "
                         f"{self._save_dir} --reconcile")
+
+                # ── Cross-task contamination guard ────────────────────────
+                # Episodes stage flat in demo_data/ and are moved into a
+                # TaskNCollectionM folder afterwards. If the previous task's
+                # collection is still sitting there, recording continues its
+                # episode numbering and appends to its csv — grape episodes
+                # inside a block collection (or vice versa) that nothing
+                # downstream can untangle. Refusing to start is the only
+                # moment this is cheap to fix, so it is a hard stop, not a
+                # warning. SystemExit deliberately escapes the except below:
+                # "annotation disabled, collection continues" would be the
+                # contamination happening silently.
+                conflicts = self._store.staging_conflicts()
+                if conflicts:
+                    allow = self.declare_parameter(
+                        'allow_mixed_staging', False).value
+                    for c in conflicts:
+                        (self.get_logger().warn if allow
+                         else self.get_logger().fatal)(c)
+                    if allow:
+                        self.get_logger().warn(
+                            'allow_mixed_staging:=true — recording into a '
+                            'mixed folder anyway, on your head be it')
+                    else:
+                        self.get_logger().fatal(
+                            f"REFUSING to record task '{spec.name}' into "
+                            f"{self._save_dir}. Move the previous collection "
+                            f"(episode_*.hdf5 + annotations.csv/.xlsx) into "
+                            f"its TaskNCollectionM folder first, or relaunch "
+                            f"with -p allow_mixed_staging:=true to override.")
+                        raise SystemExit(2)
             except Exception as e:
                 self.get_logger().error(
                     f'Annotation DISABLED — could not load task "{task_name}": {e}')
@@ -414,6 +445,7 @@ class HDF5DataCollector(Node):
 
     # ── Buffer management ─────────────────────────────────────────────────────
     def _reset_buffers(self):
+        self._buf_timestamp        = []   # seconds since first frame (monotonic clock)
         self._buf_action_pose      = []
         self._buf_action_gripper   = []
         self._buf_obs_pose         = []
@@ -545,10 +577,18 @@ class HDF5DataCollector(Node):
         now_t = time.monotonic()
         if self._first_frame_t is None:
             self._first_frame_t = now_t
+            self._episode_start_unix = time.time()
         self._last_frame_t = now_t
         self._sample_episode_health(now_t)
 
         with self._lock:
+            # Per-frame time so the real (irregular) sampling is recoverable
+            # from the file itself — collection_rate_hz is nominal, not
+            # measured, and the sync rate rides the slowest input. Same key
+            # and convention as rollouts (rollout_recorder.py):
+            # observation/timestamp, seconds since the episode's first frame.
+            # Pauses stay in the clock, so they appear as visible gaps.
+            self._buf_timestamp.append(now_t - self._first_frame_t)
             self._buf_action_pose.append(_pose_to_vec7(action_pose_msg))
             self._buf_action_gripper.append(float(action_gripper_msg.data))
             self._buf_obs_pose.append(_pose_to_vec7(obs_pose_msg))
@@ -782,6 +822,7 @@ class HDF5DataCollector(Node):
                 self.get_logger().warn('No data to save')
                 return
 
+            timestamp       = np.array(self._buf_timestamp,       dtype=np.float32)
             action_pose     = np.array(self._buf_action_pose,     dtype=np.float32)
             action_gripper  = np.array(self._buf_action_gripper,  dtype=np.float32)
             obs_pose        = np.array(self._buf_obs_pose,        dtype=np.float32)
@@ -815,6 +856,11 @@ class HDF5DataCollector(Node):
             obs.create_dataset('pose',         data=obs_pose)
             obs.create_dataset('gripper',      data=obs_gripper)
             obs.create_dataset('joint_states', data=joint_states)
+            # Seconds since the first frame, one per frame — the ground truth
+            # for this episode's actual (irregular) sampling. Same key and
+            # convention as rollout files. Added 2026-08-20; older episodes
+            # do not have it.
+            obs.create_dataset('timestamp',    data=timestamp)
 
             hl = f.create_group('hololens')
             hl.create_dataset('palm_pose',   data=holo_palm)
@@ -842,7 +888,16 @@ class HDF5DataCollector(Node):
                     imgs.create_dataset('dji_wrist', data=dji_wrist, compression='lzf')
 
             f.attrs['num_frames']         = len(action_pose)
+            # Nominal, kept at 30 because the inspect/replay/merge tools read
+            # it as an int playback hint and merge warns when sources
+            # disagree. The measured truth lives in observation/timestamp and
+            # in the two attrs below.
             f.attrs['collection_rate_hz'] = 30
+            if len(timestamp) > 1 and float(timestamp[-1]) > 0:
+                f.attrs['measured_rate_hz'] = round(
+                    (len(timestamp) - 1) / float(timestamp[-1]), 3)
+            f.attrs['episode_start_unix'] = getattr(
+                self, '_episode_start_unix', 0.0)
             f.attrs['episode_index']      = self.demo_count
 
         self.get_logger().info(f'Saved {filename}  ({len(action_pose)} frames)')

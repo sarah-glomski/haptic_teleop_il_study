@@ -1,0 +1,63 @@
+# Task 2: weight classification by touch — annotation spec.
+#
+# Three visually identical blocks of different weight. Three target shapes:
+# blue TRIANGLE = lightest, black CIRCLE = middle, orange SQUARE = heaviest.
+# One block is presented per episode; the operator places it on the shape
+# matching its weight, teleoperating with haptic (piezense) feedback.
+#
+# CONDITIONS — the study's key variable, so it is asked on EVERY episode even
+# when a whole session runs one condition. One keypress buys a per-row record
+# that no folder mix-up can corrupt:
+#   known  (k) — the operator was told which block this is. Placement is
+#                ground truth by construction; correct rate must be 100%.
+#   blind  (b) — the operator was NOT told and classified by feel. Placement
+#                is the operator's GUESS; wrong guesses are results, never
+#                discard them. "Train on correct-only vs train on all" is a
+#                planned ablation and needs both recorded.
+#
+# CORRECTNESS is not asked — it is derived, so it can never disagree with the
+# fields it comes from:   correct  <=>  placed == block's shape
+# with the key mapping chosen to make that trivial: weight key + 3 = shape key
+#   block 1 light   <-> placed 4 triangle
+#   block 2 middle  <-> placed 5 circle
+#   block 3 heavy   <-> placed 6 square
+#
+# HOTKEY RULES (same as grape_pluck): one key per choice, unique across the
+# file; r s d c p u q and t are the collector's own and are refused at load.
+
+name: block_sort
+display: Block weight sorting
+
+annotations:
+
+  # First question on purpose: the condition is the row's reason to exist.
+  - field: condition
+    ask: "Did you know the block's weight? (k known / b blind)"
+    type: enum
+    choices:
+      - {value: known, key: "k"}
+      - {value: blind, key: "b"}
+
+  # Ground truth. In `known` sessions the operator has it directly. In `blind`
+  # sessions it is still recorded at the keyboard AFTER the episode ends —
+  # check the block's hidden label once the arm is disarmed, never before the
+  # placement is made.
+  - field: block
+    ask: "Which block was it really? (1 light / 2 middle / 3 heavy)"
+    type: enum
+    choices:
+      - {value: light,  key: "1"}
+      - {value: middle, key: "2"}
+      - {value: heavy,  key: "3"}
+
+  # Where the block actually ended up — the operator's answer to the task.
+  # 0 covers episodes that ended without a placement; those are mechanical
+  # failures, distinct from wrong classifications.
+  - field: placed
+    ask: "Placed on which shape? (4 triangle / 5 circle / 6 square / 0 none)"
+    type: enum
+    choices:
+      - {value: triangle, key: "4"}
+      - {value: circle,   key: "5"}
+      - {value: square,   key: "6"}
+      - {value: none,     key: "0"}
