@@ -120,6 +120,19 @@ def generate_launch_description(
             cmd=['ros2', 'launch', 'piezense_ros', 'ar_teleop_piezense_launch.py'],
             name='piezense_driver',
             output='screen',
+        ),
+        # The driver fires the device configuration the instant BLE connects;
+        # if the device is not ready those writes are lost and ch2/3 (the
+        # recorded gripper pads) stay in actuator mode, resting at ~117 kPa
+        # instead of 110 and regulating every grasp away. This watcher
+        # re-sends the same configuration over the driver's topics whenever
+        # it sees that state, and re-checks after every BLE reconnect. See
+        # piezense_reconfig.py. Episodes 0-61 of Task2Collection1 were
+        # recorded that way before anyone noticed.
+        ExecuteProcess(
+            cmd=[_PYTHON, script('piezense_reconfig.py'), '--watch'],
+            name='piezense_reconfig',
+            output='screen',
         )] if not no_piezense else []),
 
         # ── 7. HDF5 data collector (pygame UI runs here) ──────────────────────
@@ -264,6 +277,7 @@ def main(argv=sys.argv[1:]):
         ('dji_camera_node',            'dji_camera_node'),
         ('zed_uvc_node',               'zed_uvc_node'),
         ('wrist_cam_relay',            'wrist_cam_relay'),
+        ('piezense_reconfig',          'piezense_reconfig'),
     ]
     if not args.no_piezense:
         stale_patterns.append(('ar_teleop_piezense_launch', 'piezense_launch'))
