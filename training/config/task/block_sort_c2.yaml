@@ -1,0 +1,148 @@
+# Task config. Copied from the real UMI repo's
+# diffusion_policy/config/task/kinova_teleop.yaml (charm-lab/HapticTeleopIL),
+# with pose_repr set to abs (not relative).
+#
+# Data comes from training/convert_data.py (HDF5 -> ReplayBuffer .zarr.zip).
+# Gripper: stored as physical width in meters, width = 0.085 * (1 - kortex_norm)
+# (Robotiq 2F-85; constant lives in convert_data.py + inference.py —
+# validated round-trip against raw HDF5, err < 1e-8).
+
+name: block_sort_c2
+
+# TIMING. Upstream UMI compensates for per-signal sensor latency by deriving
+# latency_steps from these four values times dataset_frequeny. That is a UMI
+# rig concern, not ours, and it has always been inert here — dataset_frequeny
+# was 0, so every product was 0. Now that dataset_frequeny is real those
+# expressions would come alive (gripper would pick up a stray -0.2 step), so
+# the keys are removed and every latency_steps below is a literal 0 instead.
+# Nothing in this repo or in umi_dataset.py reads them.
+# camera_obs_latency: 0
+# robot_obs_latency: 0
+# gripper_obs_latency: 0
+# piezense_obs_latency: 0
+
+# The rate the episodes were ACTUALLY recorded at, and the single most
+# consequential number in this file — testing/inference.py reads it straight
+# out of the checkpoint and sets its action period to
+# obs_down_sample_steps / dataset_frequeny.
+#
+# It was 0, which made inference fall back to a hardcoded SOURCE_RATE_HZ=30
+# while the data was really ~8-14 Hz, so every rollout replayed the demos
+# roughly 3x too fast and fed the policy observations spaced ~3x tighter than
+# it was trained on. Nothing errored; it was simply wrong.
+#
+# MEASURED from per-frame observation/timestamp over Task2Collection2
+# (2026-08-22, 150 episodes: 61 new healthy-sensor light/middle recordings +
+# 89 healthy-sensor episodes copied from Task2Collection1). ACTIVE rate with
+# pause gaps (dt > 0.5 s) excluded:
+#
+#     frame-weighted active    12.56 Hz
+#     per-episode mean         12.56 Hz
+#     median 12.88   stdev 0.79
+#
+# Collection2 exists because Collection1's episodes 0-61 (all 50 lights + 11
+# middles) were recorded with the piezense in the wrong mode (see
+# data_collection/piezense_reconfig.py); every episode here is on the healthy
+# sensor. Otherwise identical to block_sort.yaml.
+# It does not need to be exact — it needs to be the SAME here and at rollout,
+# which is what was broken. Treat it as the rollout-speed knob: if playback
+# looks fast, lower it; if sluggish, raise it. It IS baked into the checkpoint,
+# so changing it means retraining.
+dataset_frequeny: 12.56
+
+# 1 = train on consecutive frames, no downsampling.
+# Was 3. Note this shortens every horizon below by 3x in real time, since the
+# horizons count SAMPLED frames. At 11.66 Hz:
+#     low_dim  8 frames = 0.69 s   (was 24 frames = 2.06 s)
+#     img      2 frames = 0.17 s   (was  6 frames = 0.51 s)
+#     action  16 frames = 1.37 s   (was 48 frames = 4.12 s)
+# Raise the horizons if the policy needs that context back.
+obs_down_sample_steps: 1
+
+low_dim_obs_horizon: 8
+img_obs_horizon: 2
+action_horizon: 16
+ignore_proprioception: False
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    camera0_rgb:
+      shape: [3, 224, 224]
+      horizon: ${task.img_obs_horizon} # int
+      latency_steps: 0 # float
+      down_sample_steps: ${task.obs_down_sample_steps} # int
+      type: rgb
+      ignore_by_policy: False
+    robot0_eef_pos:
+      shape: [3]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: 0 # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_eef_rot_axis_angle:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: 0 # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      rotation_rep: rotation_6d
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_gripper_width:
+      shape: [1]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: 0 # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    robot0_eef_rot_axis_angle_wrt_start:
+      raw_shape: [3]
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: 0 # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+    piezense0_pressures:
+      shape: [2]
+      horizon: ${task.low_dim_obs_horizon} # int
+      latency_steps: 0 # float
+      down_sample_steps: ${task.obs_down_sample_steps} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+  action:
+    shape: [10]
+    horizon: ${task.action_horizon}
+    latency_steps: 0 # float
+    down_sample_steps: ${task.obs_down_sample_steps} # int
+    rotation_rep: rotation_6d
+
+task_name: &task_name block_sort_c2
+
+# Co-located with the source HDF5 episodes. Relative to training/ (where train.py
+# is launched from); override per run with task.dataset_path=...
+dataset_path: ../data_collection/demo_data/Task2Collection2/block_sort_c2_umi.zarr.zip
+
+pose_repr: &pose_repr
+  obs_pose_repr: abs   # was: relative — using abs for the first-pass migration
+  action_pose_repr: abs # was: relative — isolates "does the UMI pipeline itself
+                        # help" from "does relative pose help" as two separate
+                        # later experiments (see lab notes net assessment)
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.umi_dataset.UmiDataset
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  cache_dir: null
+  pose_repr: *pose_repr
+  action_padding: False
+  temporally_independent_normalization: False
+  repeat_frame_prob: 0.0
+  max_duration: null
+  seed: 42
+  val_ratio: 0.05
