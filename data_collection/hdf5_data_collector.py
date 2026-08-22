@@ -153,6 +153,7 @@ class HDF5DataCollector(Node):
         # dropout never stalls the synchronizer or blocks data collection.
         self._latest_zed_frame = None
         self._latest_dji_frame = None
+        self._dji_watchdog = None   # one-shot no-frames-after-S abort timer
         if self._enable_zed:
             self.create_subscription(
                 Image, CAMERA_STREAMS['zed_isometric'],
@@ -725,7 +726,37 @@ class HDF5DataCollector(Node):
                 # stale image that looks live.
                 self._latest_dji_frame = None
                 self._dji_enable_pub.publish(Bool(data=True))
+                # One-shot watchdog. The camera only streams after the enable
+                # above, so freshness cannot be checked AT S — instead, if no
+                # frame has landed 3 s in, the camera hardware is off (it
+                # auto-powers-off during breaks; episodes 114/115/140/141 were
+                # recorded footage-less that way, found only at audit time).
+                # Abort the episode at the keyboard instead.
+                if self._dji_watchdog is not None:
+                    self._dji_watchdog.cancel()
+                self._dji_watchdog = self.create_timer(3.0, self._dji_watchdog_cb)
             self.get_logger().info(f'Started recording episode {self.demo_count}')
+
+    def _dji_watchdog_cb(self):
+        # One-shot: always disarm first, whatever the outcome.
+        if self._dji_watchdog is not None:
+            self._dji_watchdog.cancel()
+            self._dji_watchdog = None
+        if not (self.is_collecting and self._enable_dji and self._dji_cam_active):
+            return                      # episode already ended some other way
+        if self._latest_dji_frame is not None:
+            return                      # camera is streaming — all good
+        with self._lock:
+            self._reset_buffers()
+        self.is_collecting = False
+        self._dji_cam_active = False
+        self._dji_enable_pub.publish(Bool(data=False))
+        self.get_logger().error(
+            '\n' + '!' * 50 +
+            f'\n  EPISODE {self.demo_count} ABORTED — the wrist camera produced'
+            f'\n  no frames within 3 s of S. Turn the DJI back on (it auto-'
+            f'\n  powers-off during breaks), wait for its preview, press S again.'
+            '\n' + '!' * 50)
 
     def end_collection(self):
         if self.is_collecting:

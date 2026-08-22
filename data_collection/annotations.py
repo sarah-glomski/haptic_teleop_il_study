@@ -402,6 +402,14 @@ class AnnotationPrompt:
 
     def row(self, status: str) -> dict:
         row = dict(self.meta)
+        # A "saved" prompt with zero questions answered is not an annotation.
+        # It happens when R/S punches through before any answer key lands —
+        # six times during the 2026-08-21 session — and the row then wore
+        # status keep while carrying no labels, indistinguishable at a glance
+        # from a graded episode. Land it as unreviewed instead, so the gap is
+        # visible in the sheet and fillable later.
+        if status == STATUS_ANNOTATED and self._spec.fields and not self.answers:
+            status = STATUS_SKIPPED
         row['status'] = status
         row['notes'] = self.notes.strip()
         for f in self._spec.fields:
