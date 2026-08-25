@@ -49,12 +49,14 @@ from rclpy.node import Node
 from piezense_interfaces.msg import PiezenseConfig, PiezenseSetpoint, PiezenseSystemArray
 
 SENSE_CHANNELS = (2, 3)           # the gripper pads the collector records
+ACTUATOR_CHANNELS = (0, 1)        # what the operator feels; driven BY the sense channels
+FORWARD_EXPR = '((x-110000)*4+110000)'   # launcher_ar_teleop_piezense.py's mapping
 SETPOINT_PA = 110000
 WRONG_MODE_MIN_KPA = 113.0        # resting floor above this ...
 WRONG_MODE_MAX_KPA = 123.0        # ... and below this = wrong mode
 WINDOW_S = 4.0                    # resting-floor window
 RECONNECT_GAP_S = 5.0             # data silence this long = BLE reconnect
-SEND_COOLDOWN_S = 20.0
+SEND_COOLDOWN_S = 30.0   # the send itself now takes ~8 s (settling waits)
 MAX_SENDS_PER_LINK = 8
 
 
@@ -63,8 +65,24 @@ def _publishers(node):
             node.create_publisher(PiezenseSetpoint, 'piezense/setpoint', 10))
 
 
-def send_configuration(cfg_pub, sp_pub, log=print):
-    """Same sequence, same order, same values as ar_teleop.py on connect."""
+def send_configuration(cfg_pub, sp_pub, log=print, forwarding=True):
+    """Replay piezense_ros's own connect sequence, INCLUDING its waits.
+
+    The timing is not decoration. ar_teleop.py sleeps 1 s after the ch0/ch1 PID
+    block and 5 s after the setpoints before it applies
+    set_sense_correction_value / set_sense_mode to ch2 and ch3, because that
+    correction calibrates against a settled reading. Sending the same values
+    back-to-back leaves the sensor in the right mode with the wrong gain: on
+    2026-08-25 a rushed version of this function (0.15 s between every send)
+    restored a healthy 109 kPa baseline but left the sense channels ~26% down,
+    which the operator felt through the haptic actuators and which showed up
+    in the recorded demos. Keep the sleeps.
+
+    Forwarding is re-established afterwards because it is what makes the rig
+    haptic: launcher_ar_teleop_piezense.py maps sensor ch2 -> actuator ch0 and
+    ch3 -> actuator ch1 through ((x-110000)*4+110000). Re-sending modes without
+    re-sending forwarding risks a configured sensor driving nothing.
+    """
     def C(ch, name, val):
         m = PiezenseConfig(); m.function = 'sendConfig'
         m.parameters = f'0,{ch},{name},{val}'
@@ -75,22 +93,38 @@ def send_configuration(cfg_pub, sp_pub, log=print):
         m.pressure_pa = int(pa)
         sp_pub.publish(m); time.sleep(0.15)
 
+    def F(sense_ch, act_ch):
+        m = PiezenseConfig(); m.function = 'addForwarding'
+        m.parameters = f'0,{sense_ch},0,{act_ch},{FORWARD_EXPR}'
+        cfg_pub.publish(m); time.sleep(0.3)
+
     for ch in range(4):
         C(ch, 'set_act_mode', 1)
-    for ch in (0, 1):
+    for ch in ACTUATOR_CHANNELS:
         C(ch, 'set_pid_Pvalues_p', 0.8); C(ch, 'set_pid_Pvalues_i', 0.15)
         C(ch, 'set_pid_Pvalues_d', 0.0); C(ch, 'set_pid_Vvalues_p', 4.0)
         C(ch, 'set_pid_Vvalues_i', 0.3); C(ch, 'set_pid_Vvalues_d', 0.0)
+    log('  settling 1 s before setpoints (as ar_teleop.py does) …')
+    time.sleep(1.0)
     for ch in range(4):
         S(ch, SETPOINT_PA)
+    log('  settling 5 s before the sense calibration — this wait IS the '
+        'calibration condition, do not shorten it …')
+    time.sleep(5.0)
     for ch in SENSE_CHANNELS:
         C(ch, 'set_sense_correction_value', 15)
     for ch in SENSE_CHANNELS:
         C(ch, 'set_pid_Pvalues_p', 5.0)
     for ch in SENSE_CHANNELS:
         C(ch, 'set_sense_mode', 1)
-    log('Piezense configuration sent (act_mode x4, PID ch0/1, setpoints '
-        f'{SETPOINT_PA/1000:.0f} kPa x4, ch{SENSE_CHANNELS} sense mode)')
+    if forwarding:
+        time.sleep(0.5)
+        for sense_ch, act_ch in zip(SENSE_CHANNELS, ACTUATOR_CHANNELS):
+            F(sense_ch, act_ch)
+        log(f'  forwarding re-established: sense ch{SENSE_CHANNELS} -> '
+            f'actuator ch{ACTUATOR_CHANNELS} via {FORWARD_EXPR}')
+    log('Piezense configuration sent (act modes, PID, setpoints, sense '
+        'calibration, forwarding)')
 
 
 class PiezenseWatch(Node):
@@ -145,8 +179,8 @@ class PiezenseWatch(Node):
         if not self._primed:
             self._primed = True
             self.get_logger().info(
-                'priming the piezense configuration for this link '
-                '(unconditional — a partial apply is invisible in the baseline)')
+                'priming the piezense configuration for this link (~8 s, '
+                'includes the settling waits the sense calibration needs)')
             send_configuration(self._cfg, self._sp, log=self.get_logger().info)
             self._last_send_t = now
             self._samples.clear()
