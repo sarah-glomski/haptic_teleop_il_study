@@ -124,11 +124,17 @@ def generate_launch_description(
         # The driver fires the device configuration the instant BLE connects;
         # if the device is not ready those writes are lost and ch2/3 (the
         # recorded gripper pads) stay in actuator mode, resting at ~117 kPa
-        # instead of 110 and regulating every grasp away. This watcher
-        # re-sends the same configuration over the driver's topics whenever
-        # it sees that state, and re-checks after every BLE reconnect. See
-        # piezense_reconfig.py. Episodes 0-61 of Task2Collection1 were
-        # recorded that way before anyone noticed.
+        # instead of 110 and regulating every grasp away. Episodes 0-61 of
+        # Task2Collection1 were recorded that way before anyone noticed.
+        #
+        # This watcher only DETECTS that state and says so loudly. It does not
+        # repair it: config sent over /piezense/config is cast to float by the
+        # driver, so integer parameters reach the firmware as
+        # "set_sense_correction_value:15.0" instead of ":15", which leaves the
+        # sense channels miscalibrated (~25% low) while the baseline looks
+        # healthy — a silent version of the same fault. The repair is to
+        # restart this driver, which re-runs ar_teleop.py's own native
+        # configuration. See piezense_reconfig.py.
         ExecuteProcess(
             cmd=[_PYTHON, script('piezense_reconfig.py'), '--watch'],
             name='piezense_reconfig',
