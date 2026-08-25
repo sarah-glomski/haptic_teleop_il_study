@@ -38,7 +38,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def episode_sensitivity(path):
-    """(sensitivity, baseline_kPa, mean_closure) for one episode, or None."""
+    """(sensitivity, baseline_kPa, mean_closure, peak_kPa, grip_cycles) or None.
+
+    Two measures, because the obvious one is confounded:
+
+      sensitivity  mean grip pressure per unit closure. Comparable only
+                   BETWEEN SIMILAR GRIP BEHAVIOUR. The blind block episodes
+                   grip and release ~7 times an episode while the known ones
+                   grip once, so most of their closed time is light
+                   exploratory contact and the mean reads 22% low with a
+                   perfectly healthy sensor.
+      peak         highest pressure reached while closed. Nearly behaviour
+                   independent — the blind and known block sets peak at 18.6
+                   and 18.3 kPa — so this is the number to judge the hardware
+                   on. grip_cycles is reported alongside so a behaviour
+                   difference is visible rather than inferred.
+
+    Neither controls for the OBJECT. A riper grape deforms more and transmits
+    less pressure at the same closure, so compare grape sessions with that in
+    mind and use a rigid block to test the sensor itself.
+    """
     with h5py.File(path) as f:
         if 'piezense' not in f:
             return None
@@ -49,7 +68,9 @@ def episode_sensitivity(path):
     closed = g > 0.5
     if not closed.any() or g[closed].mean() <= 0:
         return None
-    return float((m[closed] - base).mean() / g[closed].mean()), base, float(g[closed].mean())
+    cycles = int(((~closed[:-1]) & closed[1:]).sum())
+    return (float((m[closed] - base).mean() / g[closed].mean()), base,
+            float(g[closed].mean()), float((m[closed] - base).max()), cycles)
 
 
 def folder_stats(d):
@@ -78,37 +99,46 @@ def main():
     if not ref:
         print(f'No reference episodes found in {a.ref}'); return 2
 
-    rs = np.array([r[1] for r in ref]); ts = np.array([r[1] for r in tgt])
-    rb = np.array([r[2] for r in ref]); tb = np.array([r[2] for r in tgt])
-    rc = np.array([r[3] for r in ref]); tc = np.array([r[3] for r in tgt])
+    col = lambda rows, i: np.array([r[i] for r in rows])
+    rs, ts = col(ref, 1), col(tgt, 1)
+    rb, tb = col(ref, 2), col(tgt, 2)
+    rc, tc = col(ref, 3), col(tgt, 3)
+    rp, tp = col(ref, 4), col(tgt, 4)
+    ry, ty = col(ref, 5), col(tgt, 5)
 
     print(f'reference {a.ref}: n={len(ref)}')
-    print(f'  sensitivity {rs.mean():.2f} +- {rs.std():.2f} kPa per unit closure'
-          f'   baseline {rb.mean():.2f}   closure {rc.mean():.3f}')
+    print(f'  PEAK {rp.mean():6.2f} +- {rp.std():.2f} kPa   mean/closure {rs.mean():.2f}'
+          f'   baseline {rb.mean():.2f}   closure {rc.mean():.3f}   grip cycles {ry.mean():.1f}')
     print(f'\n{a.target}: n={len(tgt)}')
-    print(f'  sensitivity {ts.mean():.2f} +- {ts.std():.2f} kPa per unit closure'
-          f'   baseline {tb.mean():.2f}   closure {tc.mean():.3f}')
-    for name, s, b, c in tgt:
-        print(f'    {name:12s} {s:5.2f}   baseline {b:6.2f}   closure {c:.3f}')
+    print(f'  PEAK {tp.mean():6.2f} +- {tp.std():.2f} kPa   mean/closure {ts.mean():.2f}'
+          f'   baseline {tb.mean():.2f}   closure {tc.mean():.3f}   grip cycles {ty.mean():.1f}')
+    for name, sv, b, c, pk, cy in tgt:
+        print(f'    {name:12s} peak {pk:6.2f}   mean/closure {sv:5.2f}   '
+              f'baseline {b:6.2f}   closure {c:.3f}   cycles {cy}')
 
-    drop = 100 * (rs.mean() - ts.mean()) / rs.mean()
+    if abs(ty.mean() - ry.mean()) > 1.0:
+        print(f'\nNOTE: grip behaviour differs ({ty.mean():.1f} vs {ry.mean():.1f} '
+              f'grip cycles per episode) — judge by PEAK, not mean/closure.')
+    drop = 100 * (rp.mean() - tp.mean()) / rp.mean()
     print()
     if tb.mean() > 113:
         print(f'WRONG MODE: baseline {tb.mean():.1f} kPa (want ~109). Run '
               f'piezense_reconfig.py and re-record.')
         return 1
     if abs(drop) < 10:
-        print(f'NORMAL: sensitivity within {abs(drop):.0f}% of the reference '
-              f'(sessions normally agree to a few percent).')
+        print(f'NORMAL: peak pressure within {abs(drop):.0f}% of the reference.')
         return 0
-    print(f'{"LOW" if drop > 0 else "HIGH"}: sensitivity {abs(drop):.0f}% '
+    print(f'{"LOW" if drop > 0 else "HIGH"}: peak pressure {abs(drop):.0f}% '
           f'{"below" if drop > 0 else "above"} the reference, at comparable gripper '
           f'closure ({tc.mean():.3f} vs {rc.mean():.3f}).')
-    print('  The baseline is healthy, so this is not the actuator-mode fault.')
-    print('  Most likely a partial config apply — relaunch (the reconfig watcher '
-          'now primes the full config per BLE link) and re-measure.')
-    print('  If it stays low after a clean relaunch, look at the hardware: pad '
-          'seating on the fingers, tubing seated at both ends, air supply level.')
+    print('  Baseline is healthy, so this is NOT the actuator-mode fault.')
+    print('  Before suspecting the sensor, rule out the object: a softer or riper '
+          'specimen transmits less pressure at the same closure. Grip a RIGID '
+          'block and compare against a block collection — that isolates the '
+          'hardware from the specimen.')
+    print('  If a block also reads low: relaunch (a fresh driver runs upstream\'s '
+          'own config sequence), then check pad seating, tubing at both ends, '
+          'and air supply level.')
     return 1
 
 
