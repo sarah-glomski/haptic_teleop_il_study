@@ -18,9 +18,19 @@ This script does not touch the piezense package. It talks to the running
 driver exactly the way ar_teleop.py does, from outside.
 
     python3.12 piezense_reconfig.py            # one-shot: re-send the config now
-    python3.12 piezense_reconfig.py --watch    # node: check on data, fix, re-check
-                                               # after every BLE reconnect
+    python3.12 piezense_reconfig.py --watch    # node: send the config once per BLE
+                                               # link, then keep watching for the
+                                               # wrong-mode baseline
                                                # (launch_data_collection starts this)
+
+WHY IT SENDS UNCONDITIONALLY. The baseline test below catches only the total
+failure. A partial apply — sense mode on, but set_sense_correction_value or the
+ch2/3 P gain missing — rests at a healthy ~109 kPa and still reports pressure,
+just ~25% too little. That is invisible live and only shows up when the
+recorded demos are compared against earlier sessions (2026-08-25: 5.04 kPa per
+unit gripper closure against 6.85 and 6.82 in the two prior sessions, at
+identical closure). Sending the whole config once per link is idempotent and
+removes the failure mode instead of trying to detect it.
 
 DETECTING THE WRONG MODE without knowing whether the operator is gripping:
 use the MIN of ch2/3 over a few seconds (their resting floor) with both bounds:
@@ -90,6 +100,7 @@ class PiezenseWatch(Node):
         self.create_subscription(PiezenseSystemArray, 'piezense/data',
                                  self._data_cb, 10)
         self._samples = []            # (t, min over sense channels, kPa)
+        self._primed = False          # unconditional config send done for this link
         self._last_data_t = None
         self._last_send_t = None
         self._sends_this_link = 0
@@ -107,6 +118,7 @@ class PiezenseWatch(Node):
             self._samples.clear()
             self._sends_this_link = 0
             self._link_ok_logged = False
+            self._primed = False        # re-prime: a new link starts unconfigured
         self._last_data_t = now
         for s in msg.system:
             p = list(s.pressure_pa)
@@ -120,6 +132,25 @@ class PiezenseWatch(Node):
         if not self._samples:
             return
         now = time.monotonic()
+
+        # Send the whole configuration ONCE per link, whatever the baseline
+        # says. The baseline test below only catches the total failure (ch2/3
+        # left in actuator mode, resting ~117); a PARTIAL apply — sense mode on
+        # but set_sense_correction_value / the ch2/3 P gain missing — leaves the
+        # baseline at a healthy ~109 while the sensitivity is down by a quarter.
+        # That is invisible here and only shows up in the recorded data: on
+        # 2026-08-25 five grape demos read 5.04 kPa per unit of gripper closure
+        # where the two previous sessions both read 6.8, at identical closure.
+        # Re-sending is idempotent, so do it rather than try to detect it.
+        if not self._primed:
+            self._primed = True
+            self.get_logger().info(
+                'priming the piezense configuration for this link '
+                '(unconditional — a partial apply is invisible in the baseline)')
+            send_configuration(self._cfg, self._sp, log=self.get_logger().info)
+            self._last_send_t = now
+            self._samples.clear()
+            return
         if self._samples[-1][0] - self._samples[0][0] < WINDOW_S - 0.5:
             return                                # window not full yet
         floor = min(v for _, v in self._samples)
