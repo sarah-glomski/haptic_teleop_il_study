@@ -111,17 +111,14 @@ def recompute(collections):
     return 0
 
 
-def reference_release_view(collections=GRAPE_COLLECTIONS):
-    """Median wrist-camera image over every episode's release frame.
+def release_frames(collections=GRAPE_COLLECTIONS):
+    """(image HWC RGB, position, quaternion) at every episode's release frame.
 
     One frame per episode, taken at the same event the bowl position came from
-    (the last closed->open gripper transition). The pixelwise median across
-    episodes keeps what was the same every time — bowl, table, background —
-    and washes out what was not (the grape, the operator's hand). That is the
-    view the wrist camera SHOULD have now if the bowl is back where it was.
+    (the last closed->open gripper transition).
     """
     import h5py
-    frames = []
+    out = []
     for coll in collections:
         d = coll if os.path.isdir(coll) else os.path.join(
             os.path.dirname(os.path.abspath(__file__)), 'demo_data', coll)
@@ -136,12 +133,44 @@ def reference_release_view(collections=GRAPE_COLLECTIONS):
                 if not opens:
                     continue
                 i = min(opens[-1], f['images/dji_wrist'].shape[0] - 1)
-                frames.append(f['images/dji_wrist'][i])        # CHW uint8, RGB
+                img = np.ascontiguousarray(f['images/dji_wrist'][i].transpose(1, 2, 0))
+                pose = f['observation/pose'][i]
+                out.append((os.path.basename(p)[:-5], img, pose[:3], pose[3:7]))
+    return out
+
+
+def reference_release_view(collections=GRAPE_COLLECTIONS, current_pos=None,
+                           frames=None):
+    """The demo release view to compare against, plus the median for context.
+
+    Returns (exemplar, exemplar_label, median, n, exemplar_position).
+
+    The PIXELWISE MEDIAN over all episodes is deliberately not the primary
+    reference. It is not an average — at each pixel it selects the middle value
+    of the 39 samples — but the release poses differ by 16 mm and 2.6 deg
+    (mean; 37 mm / 5.9 deg worst), and with the wrist camera ~5 cm from the
+    bowl that is tens of pixels of parallax, so at any pixel near an edge the
+    39 samples straddle bowl and table and the selected value flips partway
+    through the transition. The result has soft edges. It still shows where the
+    bowl consistently sat, which is what it is for.
+
+    The EXEMPLAR is a single real frame — the episode whose release pose is
+    closest to `current_pos` (the pose the arm is parked at now), or to the
+    median pose when that is unknown. Same viewpoint, nothing combined across
+    episodes, so what differs between it and the live view is the bowl rather
+    than the pose.
+    """
+    frames = frames or release_frames(collections)
     if not frames:
-        return None, 0
-    stack = np.stack(frames).astype(np.uint8)                  # (N, 3, H, W)
-    med = np.median(stack, axis=0).astype(np.uint8)
-    return np.ascontiguousarray(med.transpose(1, 2, 0)), len(frames)   # HWC
+        return None, None, None, 0, None
+    P = np.array([f[2] for f in frames])
+    ref_pos = np.asarray(current_pos, float) if current_pos is not None else np.median(P, axis=0)
+    i = int(np.argmin(np.linalg.norm(P - ref_pos, axis=1)))
+    med = np.median(np.stack([f[1] for f in frames]).astype(np.float32), axis=0).astype(np.uint8)
+    d_mm = float(np.linalg.norm(P[i] - ref_pos)) * 1000
+    label = (f'{frames[i][0]} — closest release pose '
+             f'({d_mm:.0f} mm from ' + ('the arm now' if current_pos is not None else 'the median') + ')')
+    return frames[i][1], label, med, len(frames), frames[i][2]
 
 
 def live_wrist_frame(timeout_s=25.0):
@@ -218,47 +247,230 @@ def live_wrist_frame(timeout_s=25.0):
     return img, 'live'
 
 
-def compare_views(out_path=None, timeout_s=25.0):
-    """Side-by-side: the demos' release view vs the wrist camera right now.
+def bowl_centroid(img):
+    """(centroid_uv, area_px) of the bowl, or (None, 0).
 
-    Each run writes a timestamped png into data_collection/grape_bowl_checks/
-    so successive checks (nudge the bowl, look again) can be compared instead
-    of overwriting one another.
+    The bowl is the only strongly blue thing in front of a wooden table, so
+    blue-minus-red separates it without any colour-space tuning.
+    """
+    import cv2
+    d = img[:, :, 2].astype(np.int16) - img[:, :, 0].astype(np.int16)
+    thr = max(10, int(np.percentile(d, 90)))
+    mask = cv2.morphologyEx((d >= thr).astype(np.uint8), cv2.MORPH_OPEN,
+                            np.ones((5, 5), np.uint8))
+    n, _, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
+    if n <= 1:
+        return None, 0
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    area = int(stats[i, cv2.CC_STAT_AREA])
+    if area < 500:
+        return None, area
+    return np.asarray(cent[i], dtype=float), area
+
+
+def calibrate_px_per_mm(frames=None):
+    """Image jacobian M: pixels of apparent motion per mm of CAMERA motion.
+
+    Fitted from the demos themselves — across the release frames the bowl is
+    static and the wrist camera is not, so regressing the bowl's pixel centroid
+    on the TCP position gives the mapping directly, with no camera intrinsics
+    or hand-eye calibration needed. Outliers (a mis-segmented frame, an odd
+    wrist angle) are trimmed on residual.
+
+    Returns (M 2x2, n_used, loo_mm) where loo_mm is the leave-one-out position
+    error in millimetres — the honest resolution of any number derived from M.
+    """
+    frames = frames or release_frames()
+    C, T = [], []
+    for _, img, pos, _ in frames:
+        c, a = bowl_centroid(img)
+        if c is not None:
+            C.append(c); T.append(np.asarray(pos, float) * 1000.0)
+    if len(C) < 8:
+        return None, len(C), None
+    C = np.array(C); T = np.array(T)
+
+    def fit(idx):
+        A = np.hstack([T[idx], np.ones((len(idx), 1))])
+        sol, *_ = np.linalg.lstsq(A, C[idx], rcond=None)
+        return sol
+
+    keep = np.arange(len(C))
+    for _ in range(3):
+        sol = fit(keep)
+        res = np.linalg.norm(C - (np.hstack([T, np.ones((len(T), 1))]) @ sol), axis=1)
+        med = np.median(res[keep])
+        mad = 1.4826 * np.median(np.abs(res[keep] - med))
+        keep = np.where(res <= max(med + 3 * mad, 3.0))[0]
+        if len(keep) < 8:
+            keep = np.arange(len(C)); break
+    sol = fit(keep)
+    M = sol[:2, :].T
+    if abs(np.linalg.det(M)) < 1e-6:
+        return None, len(keep), None
+    errs = []
+    for i in keep:
+        tr = np.array([k for k in keep if k != i])
+        si = fit(tr); Mi = si[:2, :].T
+        if abs(np.linalg.det(Mi)) < 1e-6:
+            continue
+        errs.append(np.linalg.norm(np.linalg.inv(Mi) @ (C[i] - np.hstack([T[i], 1]) @ si)))
+    return M, len(keep), (float(np.median(errs)) if errs else None)
+
+
+def bowl_wander_mm(frames=None, M=None):
+    """How much the bowl itself moved BETWEEN demos, in millimetres.
+
+    The bowl was not bolted down: it gets nudged by the gripper, by grapes
+    landing, by the operator. So there is no single correct position, only the
+    spread the bowl actually occupied — which is the right tolerance for a
+    replacement. Measured by removing the known camera motion from each frame's
+    pixel centroid, leaving the bowl's own position up to a constant.
+
+    Returns (median_mm, p90_mm, max_mm, n) relative to the bowl's median spot.
+    This is an UPPER bound: it also contains segmentation and model error
+    (see calibrate_px_per_mm's leave-one-out figure).
+    """
+    frames = frames or release_frames()
+    if M is None:
+        M, _, _ = calibrate_px_per_mm(frames)
+    if M is None:
+        return None
+    Minv = np.linalg.inv(M)
+    pts = []
+    for _, img, pos, _ in frames:
+        c, _a = bowl_centroid(img)
+        if c is not None:
+            pts.append(np.asarray(pos[:2], float) * 1000.0 - Minv @ c)
+    if len(pts) < 5:
+        return None
+    P = np.array(pts) - np.median(np.array(pts), axis=0)
+    d = np.linalg.norm(P, axis=1)
+    return float(np.median(d)), float(np.percentile(d, 90)), float(d.max()), len(P)
+
+
+def bowl_offset_mm(demo_img, demo_pos, live_img, live_pos, M):
+    """How far the bowl has moved since the demos, in base-frame millimetres.
+
+    The bowl's apparent pixel shift mixes two causes — the bowl moved, and the
+    camera is not parked in exactly the demo pose. Both are known:
+
+        d_px = M @ d_camera  -  M @ d_bowl        (a bowl moving +x looks the
+                                                   same as the camera moving -x)
+    so
+        d_bowl = d_camera - inv(M) @ d_px
+
+    Returns (dxdy_mm, area_ratio, detail) or (None, None, reason).
+    """
+    cd, ad = bowl_centroid(demo_img)
+    cl, al = bowl_centroid(live_img)
+    if cd is None:
+        return None, None, 'no bowl found in the demo frame'
+    if cl is None:
+        return None, None, ('no bowl found in the live view — is it in frame? '
+                            '(this is what an empty table looks like)')
+    d_px = cl - cd
+    d_cam = (np.asarray(live_pos, float) - np.asarray(demo_pos, float))[:2] * 1000.0
+    d_bowl = d_cam - np.linalg.inv(M) @ d_px
+    return d_bowl, (al / ad if ad else None), {'demo_uv': cd, 'live_uv': cl,
+                                               'd_px': d_px, 'd_cam_mm': d_cam}
+
+
+def compare_views(out_path=None, timeout_s=25.0, current_pos=None):
+    """The demos' release view vs the wrist camera right now.
+
+    Four panels: the closest-pose demo frame (sharp, the one to judge by), the
+    pixelwise median over all releases (soft-edged by construction — see
+    reference_release_view — but shows where the bowl consistently sat), the
+    live view, and a 50/50 blend of exemplar and live. Each run writes a
+    timestamped png into data_collection/grape_bowl_checks/ so successive
+    checks can be compared instead of overwriting one another.
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
     print('\nBuilding the reference view from the grape demos …')
-    ref, n = reference_release_view()
-    if ref is None:
+    frames_cache = release_frames()
+    ex, ex_label, med, n, ex_pos = reference_release_view(
+        current_pos=current_pos, frames=frames_cache)
+    if ex is None:
         print('  no wrist footage found in the grape collections — cannot compare.')
         return 1
-    print(f'  median of {n} release frames')
+    print(f'  {n} release frames; exemplar = {ex_label}')
     print('Grabbing the live wrist view …')
     live, note = live_wrist_frame(timeout_s=timeout_s)
     if live is None:
         print(f'  {note}')
         return 1
 
-    # Match the live frame to the reference geometry for an honest overlay.
     live_r = live
-    if live.shape[:2] != ref.shape[:2]:
+    if live.shape[:2] != ex.shape[:2]:
         import cv2
-        live_r = cv2.resize(live, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_AREA)
+        live_r = cv2.resize(live, (ex.shape[1], ex.shape[0]), interpolation=cv2.INTER_AREA)
+    blend = (0.5 * ex.astype(float) + 0.5 * live_r.astype(float)).astype(np.uint8)
 
-    fig, axes = plt.subplots(1, 3, figsize=(13, 5.3), dpi=120)
+    # ---- measure, rather than leaving it to the eye ----
+    verdict, detail = '', None
+    M, n_cal, loo = calibrate_px_per_mm(frames_cache)
+    wander = bowl_wander_mm(frames_cache, M) if M is not None else None
+    if M is not None and current_pos is not None:
+        off, area_ratio, detail = bowl_offset_mm(ex, ex_pos, live_r, current_pos, M)
+        if off is None:
+            verdict = str(detail)
+            detail = None
+        else:
+            dist = float(np.linalg.norm(off))
+            tol = wander[1] if wander else 10.0
+            inside = dist <= tol
+            print(f'\nBowl offset vs the demos: '
+                  f'{dist:.0f} mm  (base X {off[0]:+.0f} mm, Y {off[1]:+.0f} mm)')
+            if wander:
+                print(f'  the bowl itself moved {wander[0]:.0f} mm (median) to '
+                      f'{wander[1]:.0f} mm (p90) between demos, worst {wander[2]:.0f} mm')
+            print(f'  method resolution ~{loo:.0f} mm '
+                  f'(leave-one-out over {n_cal} calibration frames)')
+            if area_ratio:
+                print(f'  apparent bowl size vs demo: {area_ratio*100:.0f}% '
+                      f'({"closer/larger" if area_ratio > 1.15 else "further/smaller" if area_ratio < 0.87 else "same"})')
+            if inside:
+                verdict = (f'WITHIN the demos own range: {dist:.0f} mm off, and the bowl '
+                           f'moved up to {tol:.0f} mm between demos anyway. Nothing to fix.')
+            else:
+                verdict = (f'{dist:.0f} mm off — outside the {tol:.0f} mm the bowl varied '
+                           f'by during the demos. Nudge base X {-off[0]:+.0f} mm, '
+                           f'Y {-off[1]:+.0f} mm.')
+            print('  ' + verdict)
+    elif M is None:
+        verdict = 'could not calibrate pixels to mm from the demos — visual check only'
+        print('\n' + verdict)
+    else:
+        verdict = 'no arm pose available (--compare-only) — visual check only'
+        print('\n' + verdict)
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 5.0), dpi=120)
     fig.patch.set_facecolor('white')
-    for ax, img, title in (
-            (axes[0], ref, f'DEMOS — median of {n} release frames\n(Collections 5+6)'),
-            (axes[1], live_r, f'NOW — live wrist camera\n({live.shape[1]}x{live.shape[0]} '
-                              f'shown at {ref.shape[1]}x{ref.shape[0]})'),
-            (axes[2], (0.5 * ref.astype(float) + 0.5 * live_r.astype(float)).astype(np.uint8),
-             'BLEND 50/50\nghosting = the bowl has moved')):
-        ax.imshow(img); ax.set_title(title, fontsize=9); ax.axis('off')
-    fig.suptitle('Wrist view at grape release: demos vs now — the bowl should sit in the same place',
+    panels = (
+        (ex, f'DEMO — single frame, same pose\n{ex_label}'),
+        (med, f'DEMO — pixelwise median across {n} releases\n'
+                   f'(soft edges: release poses vary 16 mm / 2.6 deg)'),
+        (live_r, 'NOW — live wrist camera'),
+        (blend, 'BLEND of panel 1 + 3\nblue + = demo bowl, red + = now'),
+    )
+    for ax, (img, title) in zip(axes, panels):
+        ax.imshow(img); ax.set_title(title, fontsize=8.5); ax.axis('off')
+    if detail is not None:
+        for ax, uv in ((axes[0], detail['demo_uv']), (axes[2], detail['live_uv'])):
+            ax.plot(uv[0], uv[1], '+', color='#e11d48', ms=14, mew=2)
+        axes[3].plot(*detail['demo_uv'], '+', color='#2563eb', ms=14, mew=2)
+        axes[3].plot(*detail['live_uv'], '+', color='#e11d48', ms=14, mew=2)
+    if verdict:
+        fig.text(0.5, 0.015, verdict, ha='center', fontsize=9.5,
+                 bbox=dict(boxstyle='round', fc='#f1f5f9', ec='#cbd5e1'))
+    fig.suptitle('Wrist view at grape release: demos vs now — judge by panels 1, 3 and 4',
                  fontsize=11, y=0.99)
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.tight_layout(rect=[0, 0.06, 1, 0.92])
+
     if out_path is None:
         d = os.path.join(os.path.dirname(os.path.abspath(__file__)), CHECK_DIR)
         os.makedirs(d, exist_ok=True)
@@ -272,8 +484,8 @@ def compare_views(out_path=None, timeout_s=25.0):
     print(f'\nWrote {out_path}')
     subprocess.run(['xdg-open', out_path],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print('If the bowl sits in the same spot in both panels (and the blend shows '
-          'one bowl, not two), the placement matches the demos.')
+    print('Panel 1 vs panel 3 is the comparison; in panel 4 one crisp bowl means '
+          'the placement matches, two offset bowls show which way to nudge it.')
     return 0
 
 
@@ -430,7 +642,11 @@ def main():
             input()
         except EOFError:
             print('  (no terminal input; comparing now)')
-        return compare_views(out_path=a.out)
+        try:
+            parked = arm.tcp_position(arm.refresh_feedback())
+        except Exception:
+            parked = None
+        return compare_views(out_path=a.out, current_pos=parked)
     finally:
         try:
             arm.send_zero_twist()
