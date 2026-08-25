@@ -31,10 +31,18 @@ z ~ 0.03 and DROP_Z is about 5 cm above it. --clearance parks at PLACE_Z
 instead, high enough to slide the bowl underneath without touching the
 gripper; that number is a chosen clearance, not a measurement.
 
-    python3.12 goto_bowl.py                 # home, then park AT the release height
+    python3.12 goto_bowl.py                 # home, park at the release height, then
+                                            #   after ENTER show the view comparison
+    python3.12 goto_bowl.py --compare-only  # just the view comparison, no motion
     python3.12 goto_bowl.py --clearance     # park high instead, to slide the bowl under
     python3.12 goto_bowl.py --dry-run       # print target vs current, move nothing
     python3.12 goto_bowl.py --no-home       # skip homing (arm already clear)
+    python3.12 goto_bowl.py --no-compare    # park only
+
+The last stage answers "is the bowl actually back where it was?" by putting
+the median wrist-camera frame at release across all the grape demos next to
+the live wrist view, plus a 50/50 blend — one bowl in the blend means the
+placement matches, two means it moved.
 
 q + ENTER aborts at any point; the workspace box, stall guard and fault latch
 in kinova_arm apply exactly as they do during teleop and replay.
@@ -44,6 +52,7 @@ import argparse
 import glob
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -59,6 +68,10 @@ DROP_Z = 0.081            # measured: gripper height at release, INSIDE the bowl
 PLACE_Z = 0.200           # chosen, not measured: clearance to slide the bowl under
                           # (demos never went above 0.190; ceiling is 0.250)
 SOURCE = 'Task1Collection5 + Task1Collection6, 39 final-release points, 2026-08-25'
+
+GRAPE_COLLECTIONS = ('Task1Collection5', 'Task1Collection6')
+WRIST_TOPIC = '/dji_wrist/dji_wrist/color/image_raw'
+ENABLE_TOPIC = '/dji_camera/enable'
 
 REACH_TOL_M = 0.005       # "arrived" when this close
 REACH_TIMEOUT_S = 45.0
@@ -94,6 +107,160 @@ def recompute(collections):
     print(f'  spread from median: mean {dist.mean()*1000:.0f} mm, worst {dist.max()*1000:.0f} mm')
     print(f'\n    BOWL_XY = ({med[0]:.3f}, {med[1]:.3f})')
     print(f'    DROP_Z = {med[2]:.3f}')
+    return 0
+
+
+def reference_release_view(collections=GRAPE_COLLECTIONS):
+    """Median wrist-camera image over every episode's release frame.
+
+    One frame per episode, taken at the same event the bowl position came from
+    (the last closed->open gripper transition). The pixelwise median across
+    episodes keeps what was the same every time — bowl, table, background —
+    and washes out what was not (the grape, the operator's hand). That is the
+    view the wrist camera SHOULD have now if the bowl is back where it was.
+    """
+    import h5py
+    frames = []
+    for coll in collections:
+        d = coll if os.path.isdir(coll) else os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'demo_data', coll)
+        for p in sorted(glob.glob(os.path.join(d, 'episode_*.hdf5')),
+                        key=lambda p: int(re.search(r'_(\d+)', p).group(1))):
+            with h5py.File(p) as f:
+                if 'images' not in f or 'dji_wrist' not in f['images']:
+                    continue
+                g = f['observation/gripper'][:]
+                closed = g > 0.5
+                opens = [i for i in range(1, len(g)) if closed[i - 1] and not closed[i]]
+                if not opens:
+                    continue
+                i = min(opens[-1], f['images/dji_wrist'].shape[0] - 1)
+                frames.append(f['images/dji_wrist'][i])        # CHW uint8, RGB
+    if not frames:
+        return None, 0
+    stack = np.stack(frames).astype(np.uint8)                  # (N, 3, H, W)
+    med = np.median(stack, axis=0).astype(np.uint8)
+    return np.ascontiguousarray(med.transpose(1, 2, 0)), len(frames)   # HWC
+
+
+def live_wrist_frame(timeout_s=25.0):
+    """Grab one frame from the wrist camera, starting its node if needed.
+
+    The DJI node boots idle and only opens the device when something publishes
+    True on /dji_camera/enable (that is how the collector arms it per episode),
+    so this both starts the node when absent and sends the enable.
+    Returns (HWC RGB uint8, note) or (None, reason).
+    """
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+    from sensor_msgs.msg import Image
+    from std_msgs.msg import Bool
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    started = None
+    if subprocess.run(['pgrep', '-f', 'dji_camera_node.py'],
+                      capture_output=True).returncode != 0:
+        print('  starting the DJI camera node …')
+        started = subprocess.Popen(
+            ['/usr/bin/python3.12', os.path.join(here, 'dji_camera_node.py'),
+             '--ros-args', '-r', f'/wrist_cam/image_raw:={WRIST_TOPIC}'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        time.sleep(4.0)
+
+    rclpy.init()
+    node = Node('goto_bowl_wrist_peek')
+    got = {}
+
+    sensor_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                            history=HistoryPolicy.KEEP_LAST, depth=1)
+
+    def cb(msg):
+        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
+        if msg.encoding in ('bgr8', 'bgr24'):
+            arr = arr[:, :, ::-1]
+        got['img'] = np.ascontiguousarray(arr)                 # HWC RGB
+
+    node.create_subscription(Image, WRIST_TOPIC, cb, sensor_qos)
+    enable_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                            history=HistoryPolicy.KEEP_LAST, depth=1,
+                            durability=DurabilityPolicy.TRANSIENT_LOCAL)
+    pub = node.create_publisher(Bool, ENABLE_TOPIC, enable_qos)
+
+    t0 = time.monotonic()
+    last_enable = 0.0
+    try:
+        while time.monotonic() - t0 < timeout_s and 'img' not in got:
+            if time.monotonic() - last_enable > 1.0:
+                pub.publish(Bool(data=True)); last_enable = time.monotonic()
+            rclpy.spin_once(node, timeout_sec=0.2)
+        img = got.get('img')
+    finally:
+        # Leave the camera as we found it: the collector expects to own the enable.
+        try:
+            pub.publish(Bool(data=False)); rclpy.spin_once(node, timeout_sec=0.2)
+        except Exception:
+            pass
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        if started is not None:
+            started.terminate()
+            try:
+                started.wait(timeout=5)
+            except Exception:
+                started.kill()
+    if img is None:
+        return None, (f'no frame on {WRIST_TOPIC} within {timeout_s:.0f}s — is the '
+                      f'DJI powered on? (it auto-powers-off when idle)')
+    return img, 'live'
+
+
+def compare_views(out_path=None, timeout_s=25.0):
+    """Side-by-side: the demos' release view vs the wrist camera right now."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    print('\nBuilding the reference view from the grape demos …')
+    ref, n = reference_release_view()
+    if ref is None:
+        print('  no wrist footage found in the grape collections — cannot compare.')
+        return 1
+    print(f'  median of {n} release frames')
+    print('Grabbing the live wrist view …')
+    live, note = live_wrist_frame(timeout_s=timeout_s)
+    if live is None:
+        print(f'  {note}')
+        return 1
+
+    # Match the live frame to the reference geometry for an honest overlay.
+    live_r = live
+    if live.shape[:2] != ref.shape[:2]:
+        import cv2
+        live_r = cv2.resize(live, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_AREA)
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 5.3), dpi=120)
+    fig.patch.set_facecolor('white')
+    for ax, img, title in (
+            (axes[0], ref, f'DEMOS — median of {n} release frames\n(Collections 5+6)'),
+            (axes[1], live_r, f'NOW — live wrist camera\n({live.shape[1]}x{live.shape[0]} '
+                              f'shown at {ref.shape[1]}x{ref.shape[0]})'),
+            (axes[2], (0.5 * ref.astype(float) + 0.5 * live_r.astype(float)).astype(np.uint8),
+             'BLEND 50/50\nghosting = the bowl has moved')):
+        ax.imshow(img); ax.set_title(title, fontsize=9); ax.axis('off')
+    fig.suptitle('Wrist view at grape release: demos vs now — the bowl should sit in the same place',
+                 fontsize=11, y=0.99)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    out_path = out_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'bowl_view_check.png')
+    fig.savefig(out_path, bbox_inches='tight')
+    print(f'\nWrote {out_path}')
+    subprocess.run(['xdg-open', out_path],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print('If the bowl sits in the same spot in both panels (and the blend shows '
+          'one bowl, not two), the placement matches the demos.')
     return 0
 
 
@@ -166,10 +333,16 @@ def main():
                     help='(default behaviour; kept so older notes still work)')
     ap.add_argument('--recompute', nargs='+', metavar='COLLECTION',
                     help='re-derive the bowl point from grape collections and exit')
+    ap.add_argument('--compare-only', action='store_true',
+                    help='skip all robot motion; just show the wrist-view comparison')
+    ap.add_argument('--no-compare', action='store_true',
+                    help='park only, skip the wrist-view comparison at the end')
     a = ap.parse_args()
 
     if a.recompute:
         return recompute(a.recompute)
+    if a.compare_only:
+        return compare_views()
 
     z = PLACE_Z if a.clearance else DROP_Z
     target = np.array([BOWL_XY[0], BOWL_XY[1], z])
@@ -228,12 +401,20 @@ def main():
         print('\nParked. The gripper is where it sat when grapes were released — '
               'centre the bowl around it.' if not a.clearance else
               '\nParked clear of the table — slide the bowl underneath the gripper.')
-        print('Press ENTER when the bowl is in place (the arm holds position).')
+        if a.no_compare:
+            print('Press ENTER when done (the arm holds position).')
+            try:
+                input()
+            except EOFError:
+                pass
+            return 0
+        print('Press ENTER once the bowl is placed — then the wrist view is '
+              'compared against the demos.')
         try:
             input()
         except EOFError:
-            pass
-        return 0
+            print('  (no terminal input; comparing now)')
+        return compare_views()
     finally:
         try:
             arm.send_zero_twist()
