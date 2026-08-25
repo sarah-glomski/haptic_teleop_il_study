@@ -18,16 +18,23 @@ CURRENT rig, so they are what BOWL_XY uses. If the bowl moves, re-run
     python3.12 goto_bowl.py --recompute <collection> [<collection> ...]
 and paste the printed values here.
 
-The release point is where the gripper was when the grape dropped, i.e. ABOVE
-the bowl's rim, so it is the bowl's centre in x,y but NOT a height to drive to
-blind. By default the arm parks at PLACE_Z (well clear of the table) so the
-bowl slides underneath; --at-drop-height goes to the recorded release z
-instead, which is only useful for checking the number against the real bowl.
+In these collections the operator LOWERED the grape into the bowl before
+opening the gripper (confirmed by the operator 2026-08-25), so the release
+point is inside the bowl, not above it — which is also why z fell ~7 cm
+between C4 and C5 while x,y held. That makes DROP_Z the height to park at
+when positioning the bowl: put the gripper there and centre the bowl around
+it. It is the default here.
 
-    python3.12 goto_bowl.py                 # home, then park above the bowl spot
+For scale: the first-grasp height (gripper closing on a grape) is
+0.035 +- 0.009 and the workspace floor is 0.025, so the table sits near
+z ~ 0.03 and DROP_Z is about 5 cm above it. --clearance parks at PLACE_Z
+instead, high enough to slide the bowl underneath without touching the
+gripper; that number is a chosen clearance, not a measurement.
+
+    python3.12 goto_bowl.py                 # home, then park AT the release height
+    python3.12 goto_bowl.py --clearance     # park high instead, to slide the bowl under
     python3.12 goto_bowl.py --dry-run       # print target vs current, move nothing
     python3.12 goto_bowl.py --no-home       # skip homing (arm already clear)
-    python3.12 goto_bowl.py --at-drop-height
 
 q + ENTER aborts at any point; the workspace box, stall guard and fault latch
 in kinova_arm apply exactly as they do during teleop and replay.
@@ -48,8 +55,9 @@ from kinova_arm import ArmLimits, KinovaArm, HOME_JOINTS_DEG   # noqa: E402
 
 # Median of the 39 final-release points in Task1Collection5 + Task1Collection6.
 BOWL_XY = (0.547, -0.247)
-DROP_Z = 0.081            # recorded release height (gripper open, grape falls)
-PLACE_Z = 0.200           # park height: clear of the table so the bowl fits under
+DROP_Z = 0.081            # measured: gripper height at release, INSIDE the bowl
+PLACE_Z = 0.200           # chosen, not measured: clearance to slide the bowl under
+                          # (demos never went above 0.190; ceiling is 0.250)
 SOURCE = 'Task1Collection5 + Task1Collection6, 39 final-release points, 2026-08-25'
 
 REACH_TOL_M = 0.005       # "arrived" when this close
@@ -151,9 +159,11 @@ def main():
                     help='print the target and the current TCP, move nothing')
     ap.add_argument('--no-home', action='store_true',
                     help='skip the joint-space home move before travelling')
+    ap.add_argument('--clearance', action='store_true',
+                    help=f'park at {PLACE_Z} m (chosen clearance) instead of the '
+                         f'measured {DROP_Z} m release height, to slide the bowl under')
     ap.add_argument('--at-drop-height', action='store_true',
-                    help=f'park at the recorded release height ({DROP_Z} m) '
-                         f'instead of the {PLACE_Z} m placing height')
+                    help='(default behaviour; kept so older notes still work)')
     ap.add_argument('--recompute', nargs='+', metavar='COLLECTION',
                     help='re-derive the bowl point from grape collections and exit')
     a = ap.parse_args()
@@ -161,15 +171,17 @@ def main():
     if a.recompute:
         return recompute(a.recompute)
 
-    z = DROP_Z if a.at_drop_height else PLACE_Z
+    z = PLACE_Z if a.clearance else DROP_Z
     target = np.array([BOWL_XY[0], BOWL_XY[1], z])
     print('=' * 62)
     print('Grape-task bowl position')
     print('=' * 62)
     print(f'  source:  {SOURCE}')
     print(f'  bowl xy: ({BOWL_XY[0]:.3f}, {BOWL_XY[1]:.3f}) m   base frame')
-    print(f'  park z:  {z:.3f} m' + ('  (recorded drop height)' if a.at_drop_height
-                                     else '  (clear of the table; --at-drop-height for 0.081)'))
+    print(f'  park z:  {z:.3f} m' + ('  (chosen clearance, ~17 cm above the table)'
+                                     if a.clearance else
+                                     '  (MEASURED release height — gripper sat here '
+                                     'inside the bowl; --clearance for 0.200)'))
     print('=' * 62)
 
     limits = ArmLimits()
@@ -213,8 +225,9 @@ def main():
         if not servo_to(arm, target, aborted, 'Travelling to the bowl spot'):
             return 4
         arm.send_zero_twist()
-        print('\nParked. The gripper is centred over where the bowl was — '
-              'place the bowl directly under it.')
+        print('\nParked. The gripper is where it sat when grapes were released — '
+              'centre the bowl around it.' if not a.clearance else
+              '\nParked clear of the table — slide the bowl underneath the gripper.')
         print('Press ENTER when the bowl is in place (the arm holds position).')
         try:
             input()
