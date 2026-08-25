@@ -562,6 +562,9 @@ def main():
                     help='skip all robot motion; just show the wrist-view comparison')
     ap.add_argument('--no-compare', action='store_true',
                     help='park only, skip the wrist-view comparison at the end')
+    ap.add_argument('--no-arm', action='store_true',
+                    help='with --compare-only, do not connect to the arm at all '
+                         '(no offset numbers, visual comparison only)')
     ap.add_argument('--out', metavar='PNG', default=None,
                     help=f'write the comparison here instead of a timestamped '
                          f'file in {CHECK_DIR}/')
@@ -570,7 +573,24 @@ def main():
     if a.recompute:
         return recompute(a.recompute)
     if a.compare_only:
-        return compare_views(out_path=a.out)
+        # Read the parked TCP (no motion, no servoing) so the offset can be
+        # measured rather than eyeballed — the nudge-and-recheck loop needs
+        # the numbers, and the arm is already sitting at the bowl pose.
+        parked = None
+        if not a.no_arm:
+            try:
+                probe = KinovaArm(robot_ip=a.robot_ip, limits=ArmLimits())
+                probe.connect()
+                try:
+                    parked = probe.tcp_position(probe.refresh_feedback())
+                    print(f'Arm parked at [{parked[0]:.3f}, {parked[1]:.3f}, '
+                          f'{parked[2]:.3f}] (read only, nothing moved)')
+                finally:
+                    probe.disconnect()
+            except Exception as e:
+                print(f'Could not read the arm pose ({e}) — visual check only. '
+                      f'--no-arm skips this.')
+        return compare_views(out_path=a.out, current_pos=parked)
 
     z = PLACE_Z if a.clearance else DROP_Z
     target = np.array([BOWL_XY[0], BOWL_XY[1], z])
