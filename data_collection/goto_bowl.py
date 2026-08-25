@@ -72,6 +72,7 @@ SOURCE = 'Task1Collection5 + Task1Collection6, 39 final-release points, 2026-08-
 GRAPE_COLLECTIONS = ('Task1Collection5', 'Task1Collection6')
 WRIST_TOPIC = '/dji_wrist/dji_wrist/color/image_raw'
 ENABLE_TOPIC = '/dji_camera/enable'
+CHECK_DIR = 'grape_bowl_checks'   # timestamped placement checks land here
 
 REACH_TOL_M = 0.005       # "arrived" when this close
 REACH_TIMEOUT_S = 45.0
@@ -218,7 +219,12 @@ def live_wrist_frame(timeout_s=25.0):
 
 
 def compare_views(out_path=None, timeout_s=25.0):
-    """Side-by-side: the demos' release view vs the wrist camera right now."""
+    """Side-by-side: the demos' release view vs the wrist camera right now.
+
+    Each run writes a timestamped png into data_collection/grape_bowl_checks/
+    so successive checks (nudge the bowl, look again) can be compared instead
+    of overwriting one another.
+    """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -253,8 +259,15 @@ def compare_views(out_path=None, timeout_s=25.0):
     fig.suptitle('Wrist view at grape release: demos vs now — the bowl should sit in the same place',
                  fontsize=11, y=0.99)
     fig.tight_layout(rect=[0, 0, 1, 0.93])
-    out_path = out_path or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), 'bowl_view_check.png')
+    if out_path is None:
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), CHECK_DIR)
+        os.makedirs(d, exist_ok=True)
+        out_path = os.path.join(
+            d, f'bowl_view_check_{time.strftime("%Y%m%d_%H%M%S")}.png')
+    else:
+        parent = os.path.dirname(os.path.abspath(out_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
     fig.savefig(out_path, bbox_inches='tight')
     print(f'\nWrote {out_path}')
     subprocess.run(['xdg-open', out_path],
@@ -337,12 +350,15 @@ def main():
                     help='skip all robot motion; just show the wrist-view comparison')
     ap.add_argument('--no-compare', action='store_true',
                     help='park only, skip the wrist-view comparison at the end')
+    ap.add_argument('--out', metavar='PNG', default=None,
+                    help=f'write the comparison here instead of a timestamped '
+                         f'file in {CHECK_DIR}/')
     a = ap.parse_args()
 
     if a.recompute:
         return recompute(a.recompute)
     if a.compare_only:
-        return compare_views()
+        return compare_views(out_path=a.out)
 
     z = PLACE_Z if a.clearance else DROP_Z
     target = np.array([BOWL_XY[0], BOWL_XY[1], z])
@@ -414,7 +430,7 @@ def main():
             input()
         except EOFError:
             print('  (no terminal input; comparing now)')
-        return compare_views()
+        return compare_views(out_path=a.out)
     finally:
         try:
             arm.send_zero_twist()
