@@ -1,44 +1,56 @@
 #!/usr/bin/env python3
-"""Keep the Piezense in the configuration data collection needs.
+"""Watch the Piezense configuration state — and do NOT try to repair it.
 
-THE PROBLEM (found 2026-08-22): piezense_ros/ar_teleop.py fires the device
-configuration over BLE the instant the link opens — actuator mode + 110 kPa
-setpoint on all four channels, and SENSE mode (+ correction 15, P=5) on
-channels 2/3, the gripper pads this study records. If the device is not ready
-for those first writes they are silently lost: ch2/3 stay in actuator mode,
-their PID loop regulates every grasp back out, and they rest at ~117 kPa
-instead of the 110 kPa setpoint. That is what "the piezense isn't working"
-looks like — a +4 kPa blip that decays under a held grip instead of a +17-20
-kPa step that holds. It poisoned episodes 0-61 of Task2Collection1 and a fresh
-relaunch after a reboot reproduced it; power-cycling and re-plugging the air
-did nothing. Re-sending the same configuration over the driver's own
-/piezense/config + /piezense/setpoint topics fixed it within a second.
+READ THIS BEFORE USING THE ONE-SHOT MODE. It is kept for diagnosis only.
 
-This script does not touch the piezense package. It talks to the running
-driver exactly the way ar_teleop.py does, from outside.
+The fault it was written for is real: piezense_ros/ar_teleop.py sends the
+device configuration the instant BLE connects, and if the device is not ready
+those writes are lost. Channels 2/3 (the gripper pads this study records) stay
+in actuator mode, rest at ~117 kPa instead of the 110 kPa setpoint, and their
+PID loop regulates every grasp away.
 
-    python3.12 piezense_reconfig.py            # one-shot: re-send the config now
-    python3.12 piezense_reconfig.py --watch    # node: send the config once per BLE
-                                               # link, then keep watching for the
-                                               # wrong-mode baseline
-                                               # (launch_data_collection starts this)
+But this script CANNOT correctly repair it, because of how the values travel:
 
-WHY IT SENDS UNCONDITIONALLY. The baseline test below catches only the total
-failure. A partial apply — sense mode on, but set_sense_correction_value or the
-ch2/3 P gain missing — rests at a healthy ~109 kPa and still reports pressure,
-just ~25% too little. That is invisible live and only shows up when the
-recorded demos are compared against earlier sessions (2026-08-25: 5.04 kPa per
-unit gripper closure against 6.85 and 6.82 in the two prior sessions, at
-identical closure). Sending the whole config once per link is idempotent and
-removes the failure mode instead of trying to detect it.
+    piezense/__init__.py  sendConfig  ->  message = f"{key}:{value}"
+    piezense_driver.py    config_callback  ->  config_value = float(paramList[3])
 
-DETECTING THE WRONG MODE without knowing whether the operator is gripping:
-use the MIN of ch2/3 over a few seconds (their resting floor) with both bounds:
+Everything sent over /piezense/config is cast to float before it is formatted
+into the string the firmware parses. So:
+
+    ar_teleop.py native      "set_act_mode:1"    "set_sense_correction_value:15"
+    anything via this topic  "set_act_mode:1.0"  "set_sense_correction_value:15.0"
+
+Every integer-valued parameter arrives in a different form than upstream sends.
+On 2026-08-25 that produced a sensor which looked healthy — resting at 109 kPa,
+correct response shape — while reading ~25% low, felt by the operator through
+the haptic actuators (the launcher forwards sense ch2/ch3 into actuator ch0/ch1
+via ((x-110000)*4+110000), so the feedback IS the sensor reading, x4) and
+visible in the recorded demos as peak grip pressure of 10.05 kPa where two
+earlier sessions read 12.50 and 13.60 at identical gripper closure.
+
+The float cast is in the piezense package, which this study does not modify, so
+there is no way to send an integer through this topic. THE FIX FOR A WRONG-MODE
+PIEZENSE IS TO RESTART THE DRIVER — a fresh ar_teleop.py run sends the correct
+types natively, with its own 1 s and 5 s settling waits.
+
+    python3.12 piezense_reconfig.py --watch    # detect + alert (what the
+                                               #   collection launch runs)
+    python3.12 piezense_reconfig.py            # one-shot send: DIAGNOSTIC ONLY,
+                                               #   leaves the sense channels
+                                               #   miscalibrated
+    ... --watch --send-anyway                  # send on detection anyway
+
+Detecting the wrong mode uses the ch2/3 resting floor over a few seconds, with
+both bounds so a held healthy grip cannot fake it:
     healthy at rest   min ~109-111
     healthy gripping  min ~125-131   (above the upper bound -> not flagged)
-    wrong mode        min ~114-121   (rest 116-119, grip blips decay back)
-so 113 < min < 123 means "wrong mode", and a held healthy grip cannot fake it.
+    wrong mode        min ~114-121
+so 113 < min < 123 means "wrong mode".
+
+To tell whether recorded episodes are affected, use piezense_sensitivity.py —
+peak grip pressure against a reference collection.
 """
+
 
 import sys
 import time
@@ -128,8 +140,9 @@ def send_configuration(cfg_pub, sp_pub, log=print, forwarding=True):
 
 
 class PiezenseWatch(Node):
-    def __init__(self):
+    def __init__(self, may_send=False):
         super().__init__('piezense_reconfig_watch')
+        self._may_send = may_send
         self._cfg, self._sp = _publishers(self)
         self.create_subscription(PiezenseSystemArray, 'piezense/data',
                                  self._data_cb, 10)
@@ -140,8 +153,12 @@ class PiezenseWatch(Node):
         self._sends_this_link = 0
         self._link_ok_logged = False
         self.create_timer(1.0, self._tick)
-        self.get_logger().info('watching piezense/data — will re-send the '
-                               'configuration if ch2/3 rest in the wrong mode')
+        self.get_logger().info(
+            'watching piezense/data — will ALERT if ch2/3 rest in the wrong '
+            'mode. It will not reconfigure: config sent over the ROS topic is '
+            'float-typed and miscalibrates the sense channels (see docstring). '
+            'The fix is to restart the driver.'
+            + ('  [--send-anyway: will send regardless]' if self._may_send else ''))
 
     def _data_cb(self, msg):
         now = time.monotonic()
@@ -167,24 +184,6 @@ class PiezenseWatch(Node):
             return
         now = time.monotonic()
 
-        # Send the whole configuration ONCE per link, whatever the baseline
-        # says. The baseline test below only catches the total failure (ch2/3
-        # left in actuator mode, resting ~117); a PARTIAL apply — sense mode on
-        # but set_sense_correction_value / the ch2/3 P gain missing — leaves the
-        # baseline at a healthy ~109 while the sensitivity is down by a quarter.
-        # That is invisible here and only shows up in the recorded data: on
-        # 2026-08-25 five grape demos read 5.04 kPa per unit of gripper closure
-        # where the two previous sessions both read 6.8, at identical closure.
-        # Re-sending is idempotent, so do it rather than try to detect it.
-        if not self._primed:
-            self._primed = True
-            self.get_logger().info(
-                'priming the piezense configuration for this link (~8 s, '
-                'includes the settling waits the sense calibration needs)')
-            send_configuration(self._cfg, self._sp, log=self.get_logger().info)
-            self._last_send_t = now
-            self._samples.clear()
-            return
         if self._samples[-1][0] - self._samples[0][0] < WINDOW_S - 0.5:
             return                                # window not full yet
         floor = min(v for _, v in self._samples)
@@ -197,15 +196,27 @@ class PiezenseWatch(Node):
             return
         if self._last_send_t and now - self._last_send_t < SEND_COOLDOWN_S:
             return
+        if not self._may_send:
+            self.get_logger().error(
+                '\n' + '!' * 68 +
+                f'\n  PIEZENSE IS IN THE WRONG MODE — ch{SENSE_CHANNELS} resting at '
+                f'{floor:.1f} kPa, want ~110.'
+                '\n  RESTART THE PIEZENSE DRIVER (relaunch data collection). Do not'
+                '\n  record until the resting level reads ~109: this script can no'
+                '\n  longer repair it, see the module docstring.'
+                '\n' + '!' * 68)
+            self._last_send_t = now
+            return
         if self._sends_this_link >= MAX_SENDS_PER_LINK:
             self.get_logger().error(
                 f'piezense STILL in wrong mode after {MAX_SENDS_PER_LINK} '
-                f'config sends (floor {floor:.1f} kPa) — relaunch the driver')
+                f'config sends (floor {floor:.1f} kPa) — restart the driver')
             self._last_send_t = now
             return
         self.get_logger().warn(
-            f'piezense ch{SENSE_CHANNELS} resting at {floor:.1f} kPa (wrong '
-            f'mode, want ~110) — re-sending configuration '
+            f'piezense ch{SENSE_CHANNELS} resting at {floor:.1f} kPa — sending '
+            f'configuration ANYWAY at your request (--send-anyway); the values '
+            f'arrive float-typed, see the docstring '
             f'[{self._sends_this_link + 1}/{MAX_SENDS_PER_LINK}]')
         send_configuration(self._cfg, self._sp, log=self.get_logger().info)
         self._last_send_t = now
@@ -217,7 +228,7 @@ class PiezenseWatch(Node):
 def main():
     rclpy.init()
     if '--watch' in sys.argv:
-        node = PiezenseWatch()
+        node = PiezenseWatch(may_send='--send-anyway' in sys.argv)
         try:
             rclpy.spin(node)
         except (KeyboardInterrupt, Exception):
@@ -231,6 +242,13 @@ def main():
                 pass
         return
     node = Node('piezense_reconfig_once')
+    print('!' * 68)
+    print('  DIAGNOSTIC ONLY. Values sent over /piezense/config are cast to')
+    print('  float by the driver, so integer parameters reach the firmware as')
+    print('  "set_sense_correction_value:15.0" instead of ":15". This leaves the')
+    print('  sense channels MISCALIBRATED (~25% low) while looking healthy.')
+    print('  To actually fix a wrong-mode piezense, RESTART THE DRIVER.')
+    print('!' * 68)
     cfg, sp = _publishers(node)
     time.sleep(1.0)               # discovery
     send_configuration(cfg, sp)
