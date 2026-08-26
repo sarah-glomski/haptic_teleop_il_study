@@ -98,6 +98,33 @@ class ArmLimits:
     stall_cmd_mps: float = 0.03
     stall_move_mps: float = 0.01
 
+    # ── Tilted-grip mode (opt-in) ─────────────────────────────────────────
+    # Normally roll/pitch are locked to +-3 deg because a downward tool sweeps
+    # its fingers BELOW the TCP as it tilts while the z floor is enforced on the
+    # TCP only. Tilting is nonetheless useful: with the fingers stacked rather
+    # than side by side, the lower pad carries the payload's weight on top of
+    # the grip force, so ch2-ch3 encodes mass — which side-by-side pads cannot
+    # sense at all (measured: weight separates at 0.3-0.7 SD, compliance at 4.5).
+    #
+    # allow_tilt() re-opens roll and pitch to `deg` and raises the z floor by
+    # the FULL gripper span times sin(deg) — twice the half-span the geometry
+    # implies — so the clearance the box guarantees survives the sweep.
+    # GRIPPER_SPAN_M is the assumption to check against the real hardware
+    # before trusting this; if the TCP is not at fingertip height the floor
+    # needs raising further.
+    GRIPPER_SPAN_M: float = 0.085          # Robotiq 2F-85 max opening
+
+    def allow_tilt(self, deg: float):
+        """Open roll/pitch to +-deg and raise the z floor to match. Returns self."""
+        if deg <= 0:
+            return self
+        sweep = self.GRIPPER_SPAN_M * math.sin(math.radians(min(deg, 90.0)))
+        self.max_roll_deg = float(deg)
+        self.pitch_min_deg = -float(deg)
+        self.pitch_max_deg = float(deg)
+        self.z = (self.z[0] + sweep, self.z[1])
+        return self
+
     def home_rotation(self, tx=-180.0, ty=0.0, tz=90.0) -> R:
         """Home orientation as a scipy Rotation (Kortex Euler XYZ, degrees)."""
         return R.from_euler('xyz', [math.radians(tx), math.radians(ty),

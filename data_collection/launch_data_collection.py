@@ -61,6 +61,7 @@ def generate_launch_description(
     no_rosbridge: bool = False,
     orientation: bool = True,
     zed_uvc: bool = False,
+    tilt_deg: float = 0.0,
     task: str = 'grape_pluck',
     operator: str = '',
 ) -> LaunchDescription:
@@ -110,6 +111,7 @@ def generate_launch_description(
                 _PYTHON, script('kinova_hand_controller.py'),
                 '--ros-args', '-p', f'robot_ip:={robot_ip}',
                 '-p', f'enable_orientation:={"true" if orientation else "false"}',
+                '-p', f'tilt_deg:={tilt_deg}',
             ],
             name='kinova_hand_controller',
             output='screen',
@@ -121,25 +123,13 @@ def generate_launch_description(
             name='piezense_driver',
             output='screen',
         ),
-        # The driver fires the device configuration the instant BLE connects;
-        # if the device is not ready those writes are lost and ch2/3 (the
-        # recorded gripper pads) stay in actuator mode, resting at ~117 kPa
-        # instead of 110 and regulating every grasp away. Episodes 0-61 of
-        # Task2Collection1 were recorded that way before anyone noticed.
-        #
-        # This watcher only DETECTS that state and says so loudly. It does not
-        # repair it: config sent over /piezense/config is cast to float by the
-        # driver, so integer parameters reach the firmware as
-        # "set_sense_correction_value:15.0" instead of ":15", which leaves the
-        # sense channels miscalibrated (~25% low) while the baseline looks
-        # healthy — a silent version of the same fault. The repair is to
-        # restart this driver, which re-runs ar_teleop.py's own native
-        # configuration. See piezense_reconfig.py.
-        ExecuteProcess(
-            cmd=[_PYTHON, script('piezense_reconfig.py'), '--watch'],
-            name='piezense_reconfig',
-            output='screen',
-        )] if not no_piezense else []),
+        # TEMPORARILY DISABLED 2026-08-25 to test whether anything of ours
+        # touching the piezense is involved in the low-pressure readings.
+        # Nothing in this repo now talks to the device: it is configured only
+        # by ar_teleop.py at driver start, exactly as it was before 2026-08-22.
+        # Restore with:  git checkout -- data_collection/launch_data_collection.py
+        #            and mv piezense_reconfig.py.DISABLED piezense_reconfig.py
+        ] if not no_piezense else []),
 
         # ── 7. HDF5 data collector (pygame UI runs here) ──────────────────────
         ExecuteProcess(
@@ -240,6 +230,13 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('--no-rosbridge', action='store_true',
                         help='Skip launching rosbridge (use when it is already running '
                              'so the HoloLens stays connected across pipeline restarts).')
+    parser.add_argument('--tilt-deg', type=float, default=0.0, metavar='DEG',
+                        help='Tilted-grip mode: re-open roll/pitch to +-DEG so the '
+                             'fingers can stack vertically and the lower pressure pad '
+                             'carries the payload weight. RAISES the workspace z floor '
+                             'by the full gripper span x sin(DEG) to keep table '
+                             'clearance, since tilting sweeps the lower finger below '
+                             'the TCP. Default 0 = the normal +-3 deg lock.')
     parser.add_argument('--task', default='grape_pluck',
                         help='Annotation task spec from tasks/<name>.yaml '
                              '(grape_pluck, block_sort, ...). Sets which questions '
@@ -263,6 +260,11 @@ def main(argv=sys.argv[1:]):
     print(f'  ZED serial:     {args.zed_serial or "(auto-detect first found)"}')
     print(f'  DJI wrist cam:  /dev/video{args.dji_device}')
     print(f'  Wrist orient.:  {"ON (hand-tracked, clamped)" if args.orientation else "LOCKED at home (--no-orientation)"}')
+    if args.tilt_deg:
+        import math as _m
+        _sweep = 0.085 * _m.sin(_m.radians(min(args.tilt_deg, 90.0)))
+        print(f'  TILTED GRIP:    roll/pitch ±{args.tilt_deg:.0f}°  '
+              f'(z floor raised {_sweep*1000:.0f} mm -> {(0.025+_sweep)*1000:.0f} mm)')
     print(f'  Task:           {args.task}' + (f'   Operator: {args.operator}' if args.operator else ''))
     print()
     print('HoloLens:')
@@ -326,6 +328,7 @@ def main(argv=sys.argv[1:]):
         no_rosbridge=args.no_rosbridge,
         orientation=args.orientation,
         zed_uvc=args.zed_uvc,
+        tilt_deg=args.tilt_deg,
         task=args.task,
         operator=args.operator,
     )

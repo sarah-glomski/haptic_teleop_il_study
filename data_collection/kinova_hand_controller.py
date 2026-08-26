@@ -145,6 +145,17 @@ class KinovaHandController(Node):
         # overridden at launch without editing code.
         _lim = ArmLimits()
 
+        # Tilted-grip mode. 0 keeps the normal +-3 deg roll/pitch lock. A
+        # positive value re-opens roll and pitch to that angle AND raises the
+        # workspace z floor by the full gripper span times sin(angle), because
+        # tilting sweeps the lower finger below the TCP and the floor is
+        # enforced on the TCP alone. Used to stack the fingers so the lower
+        # pressure pad carries the payload's weight — side-by-side pads cannot
+        # sense mass (0.3-0.7 SD) while they read compliance easily (4.5 SD).
+        self.tilt_deg              = self.declare_parameter('tilt_deg',                0.0).value
+        if self.tilt_deg:
+            _lim.allow_tilt(self.tilt_deg)
+
         self.control_rate          = self.declare_parameter('control_rate',            30.0).value
         self.max_linear_speed      = self.declare_parameter('max_linear_speed_mps',    _lim.max_linear_speed_mps).value
         self.max_angular_speed     = self.declare_parameter('max_angular_speed_dps',   _lim.max_angular_speed_dps).value
