@@ -132,13 +132,16 @@ def generate_launch_description(
             name='piezense_driver',
             output='screen',
         ),
-        # TEMPORARILY DISABLED 2026-08-25 to test whether anything of ours
-        # touching the piezense is involved in the low-pressure readings.
-        # Nothing in this repo now talks to the device: it is configured only
-        # by ar_teleop.py at driver start, exactly as it was before 2026-08-22.
-        # Restore with:  git checkout -- data_collection/launch_data_collection.py
-        #            and mv piezense_reconfig.py.DISABLED piezense_reconfig.py
-        ] if not no_piezense else []),
+        # Detects the wrong-mode piezense (ch2/3 resting ~117 instead of ~110)
+        # and says so loudly. It does NOT reconfigure: config sent over
+        # /piezense/config is float-cast by the driver, which miscalibrates the
+        # sense channels while leaving the baseline looking healthy. The repair
+        # is to restart the driver. See piezense_reconfig.py.
+        ExecuteProcess(
+            cmd=[_PYTHON, script('piezense_reconfig.py'), '--watch'],
+            name='piezense_reconfig',
+            output='screen',
+        )] if not no_piezense else []),
 
         # ── 7. HDF5 data collector (pygame UI runs here) ──────────────────────
         ExecuteProcess(
@@ -150,6 +153,9 @@ def generate_launch_description(
                 '-p', f'enable_piezense:={str(not no_piezense).lower()}',
                 '-p', f'task:={task}',
                 '-p', f'tilt_deg:={tilt_deg}',
+                '-p', f'tilt_roll:={tilt_roll}',
+                '-p', f'tilt_pitch:={tilt_pitch}',
+                '-p', f'tilt_yaw:={tilt_yaw}',
                 *(['-p', f'operator:={operator}'] if operator else []),
             ],
             name='hdf5_data_collector',

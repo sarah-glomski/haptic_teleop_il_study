@@ -288,7 +288,12 @@ class HDF5DataCollector(Node):
         # data, not just a launch flag someone has to remember. A grape episode
         # must always read 0 here; anything else means it was recorded with the
         # table-clearance lock lifted and should not be trusted or merged.
-        self._tilt_deg = float(self.declare_parameter('tilt_deg', 0.0).value)
+        from rcl_interfaces.msg import ParameterDescriptor as _PD
+        _t = lambda n: float(self.declare_parameter(n, 0.0, _PD(dynamic_typing=True)).value or 0.0)
+        self._tilt_deg   = _t('tilt_deg')
+        self._tilt_roll  = _t('tilt_roll')
+        self._tilt_pitch = _t('tilt_pitch')
+        self._tilt_yaw   = _t('tilt_yaw')
         self._store = None
         self._prompt = None
         if task_name:
@@ -935,7 +940,13 @@ class HDF5DataCollector(Node):
             f.attrs['episode_start_unix'] = getattr(
                 self, '_episode_start_unix', 0.0)
             f.attrs['episode_index']      = self.demo_count
+            # All four, not just tilt_deg: a run using --tilt-pitch leaves
+            # tilt_deg at 0 and the episode would otherwise claim it was
+            # recorded level when the clamps were wide open.
             f.attrs['tilt_deg']           = self._tilt_deg
+            f.attrs['tilt_roll']          = self._tilt_roll
+            f.attrs['tilt_pitch']         = self._tilt_pitch
+            f.attrs['tilt_yaw']           = self._tilt_yaw
 
         self.get_logger().info(f'Saved {filename}  ({len(action_pose)} frames)')
 
