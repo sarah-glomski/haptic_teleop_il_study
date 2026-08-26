@@ -177,6 +177,13 @@ def main(argv=sys.argv[1:]):
 
     if not os.path.isfile(args.model):
         parser.error(f"Checkpoint not found: {args.model}")
+    # ROS launch spawns ExecuteProcess children with their own working
+    # directory, so a path that resolves here does not resolve there: a
+    # relative --model died with FileNotFoundError inside inference.py while
+    # this process had just validated it. Resolve before handing it over.
+    args.model = os.path.abspath(args.model)
+    if args.record_dir:
+        args.record_dir = os.path.abspath(args.record_dir)
 
     print("=" * 60)
     print("Diffusion Policy Inference (UMI pipeline) — Kinova Gen3")
