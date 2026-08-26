@@ -117,6 +117,9 @@ def spring_reference_step(ref_pos, ref_vel, target, wn, dt):
 # them there and BOTH teleop and inference pick the new values up.
 
 
+TILT_ALLOWED_TASK = 'block_sort'   # the only task permitted to tilt
+
+
 class KinovaHandController(Node):
     """
     ROS2 teleoperation controller for the Kinova Gen3.
@@ -152,8 +155,27 @@ class KinovaHandController(Node):
         # enforced on the TCP alone. Used to stack the fingers so the lower
         # pressure pad carries the payload's weight — side-by-side pads cannot
         # sense mass (0.3-0.7 SD) while they read compliance easily (4.5 SD).
-        self.tilt_deg              = self.declare_parameter('tilt_deg',                0.0).value
+        # TASK 2 ONLY. Tilting trades away the table-clearance guarantee that
+        # the +-3 deg lock provides, and it exists solely so the stacked
+        # pressure pads can sense payload weight in the block task. Grape
+        # picking reaches to the table surface and must never run tilted, so
+        # the task name is required here as well as at the launcher: two
+        # independent refusals, because a wrong tilt puts the fingers into the
+        # table.
+        # dynamic_typing so `-p tilt_deg:=30` (INTEGER) works as well as 30.0;
+        # a type error here would otherwise crash the controller at launch.
+        from rcl_interfaces.msg import ParameterDescriptor as _PD
+        self.tilt_deg              = float(self.declare_parameter(
+            'tilt_deg', 0.0, _PD(dynamic_typing=True)).value or 0.0)
+        self.tilt_task             = self.declare_parameter('task',                    '').value
         if self.tilt_deg:
+            if self.tilt_task != TILT_ALLOWED_TASK:
+                raise SystemExit(
+                    f"REFUSING to start: tilt_deg={self.tilt_deg} requested but "
+                    f"task='{self.tilt_task}'. Tilted grip is only permitted for "
+                    f"'{TILT_ALLOWED_TASK}' — it raises the workspace floor and "
+                    f"removes the table-clearance guarantee that tasks reaching "
+                    f"the table surface depend on.")
             _lim.allow_tilt(self.tilt_deg)
 
         self.control_rate          = self.declare_parameter('control_rate',            30.0).value

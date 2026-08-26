@@ -112,6 +112,7 @@ def generate_launch_description(
                 '--ros-args', '-p', f'robot_ip:={robot_ip}',
                 '-p', f'enable_orientation:={"true" if orientation else "false"}',
                 '-p', f'tilt_deg:={tilt_deg}',
+                '-p', f'task:={task}',
             ],
             name='kinova_hand_controller',
             output='screen',
@@ -140,6 +141,7 @@ def generate_launch_description(
                 '-p', f'enable_dji:={str(not no_cameras).lower()}',
                 '-p', f'enable_piezense:={str(not no_piezense).lower()}',
                 '-p', f'task:={task}',
+                '-p', f'tilt_deg:={tilt_deg}',
                 *(['-p', f'operator:={operator}'] if operator else []),
             ],
             name='hdf5_data_collector',
@@ -252,6 +254,18 @@ def main(argv=sys.argv[1:]):
                              'kinova_hand_controller (clutched delta from the enable-time '
                              'reference, quaternion P-loop, roll/pitch/yaw clamped).')
     args, launch_argv = parser.parse_known_args(argv)
+
+    # Tilt is a task-2 mechanism and nothing else. Refuse before anything
+    # starts, so a grape session can never inherit a raised floor and a
+    # gripper free to swing its fingers into the table.
+    if args.tilt_deg and args.task != 'block_sort':
+        parser.error(
+            f"--tilt-deg is only allowed with --task block_sort (got "
+            f"'{args.task}'). Tilting raises the workspace z floor and lifts "
+            f"the roll/pitch lock that keeps the fingers clear of the table; "
+            f"tasks that reach the table surface must not run tilted.")
+    if args.tilt_deg < 0 or args.tilt_deg > 45:
+        parser.error('--tilt-deg must be between 0 and 45')
 
     print('=' * 60)
     print('Haptic Teleop IL — Data Collection System')

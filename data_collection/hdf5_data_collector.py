@@ -284,6 +284,11 @@ class HDF5DataCollector(Node):
         self._operator = self.declare_parameter(
             'operator', os.environ.get('USER', '')).value
         task_name = self.declare_parameter('task', 'grape_pluck').value
+        # Stamped into every episode so the recording geometry is part of the
+        # data, not just a launch flag someone has to remember. A grape episode
+        # must always read 0 here; anything else means it was recorded with the
+        # table-clearance lock lifted and should not be trusted or merged.
+        self._tilt_deg = float(self.declare_parameter('tilt_deg', 0.0).value)
         self._store = None
         self._prompt = None
         if task_name:
@@ -930,6 +935,7 @@ class HDF5DataCollector(Node):
             f.attrs['episode_start_unix'] = getattr(
                 self, '_episode_start_unix', 0.0)
             f.attrs['episode_index']      = self.demo_count
+            f.attrs['tilt_deg']           = self._tilt_deg
 
         self.get_logger().info(f'Saved {filename}  ({len(action_pose)} frames)')
 
