@@ -62,6 +62,9 @@ def generate_launch_description(
     orientation: bool = True,
     zed_uvc: bool = False,
     tilt_deg: float = 0.0,
+    tilt_roll: float = 0.0,
+    tilt_pitch: float = 0.0,
+    tilt_yaw: float = 0.0,
     task: str = 'grape_pluck',
     operator: str = '',
 ) -> LaunchDescription:
@@ -112,6 +115,9 @@ def generate_launch_description(
                 '--ros-args', '-p', f'robot_ip:={robot_ip}',
                 '-p', f'enable_orientation:={"true" if orientation else "false"}',
                 '-p', f'tilt_deg:={tilt_deg}',
+                '-p', f'tilt_roll:={tilt_roll}',
+                '-p', f'tilt_pitch:={tilt_pitch}',
+                '-p', f'tilt_yaw:={tilt_yaw}',
                 '-p', f'task:={task}',
             ],
             name='kinova_hand_controller',
@@ -239,6 +245,12 @@ def main(argv=sys.argv[1:]):
                              'by the full gripper span x sin(DEG) to keep table '
                              'clearance, since tilting sweeps the lower finger below '
                              'the TCP. Default 0 = the normal +-3 deg lock.')
+    parser.add_argument('--tilt-roll', type=float, default=0.0, metavar='DEG',
+                        help='Per-axis override for roll (0 = follow --tilt-deg).')
+    parser.add_argument('--tilt-pitch', type=float, default=0.0, metavar='DEG',
+                        help='Per-axis override for pitch (0 = follow --tilt-deg).')
+    parser.add_argument('--tilt-yaw', type=float, default=0.0, metavar='DEG',
+                        help='Symmetric yaw limit override (default keeps -3..+93).')
     parser.add_argument('--task', default='grape_pluck',
                         help='Annotation task spec from tasks/<name>.yaml '
                              '(grape_pluck, block_sort, ...). Sets which questions '
@@ -258,14 +270,17 @@ def main(argv=sys.argv[1:]):
     # Tilt is a task-2 mechanism and nothing else. Refuse before anything
     # starts, so a grape session can never inherit a raised floor and a
     # gripper free to swing its fingers into the table.
-    if args.tilt_deg and args.task != 'block_sort':
+    _any_tilt = args.tilt_deg or args.tilt_roll or args.tilt_pitch or args.tilt_yaw
+    if _any_tilt and args.task != 'block_sort':
         parser.error(
             f"--tilt-deg is only allowed with --task block_sort (got "
             f"'{args.task}'). Tilting raises the workspace z floor and lifts "
             f"the roll/pitch lock that keeps the fingers clear of the table; "
             f"tasks that reach the table surface must not run tilted.")
-    if args.tilt_deg < 0 or args.tilt_deg > 45:
-        parser.error('--tilt-deg must be between 0 and 45')
+    for _n, _v in (('--tilt-deg', args.tilt_deg), ('--tilt-roll', args.tilt_roll),
+                   ('--tilt-pitch', args.tilt_pitch), ('--tilt-yaw', args.tilt_yaw)):
+        if _v < 0 or _v > 90:
+            parser.error(f'{_n} must be between 0 and 90')
 
     print('=' * 60)
     print('Haptic Teleop IL — Data Collection System')
@@ -274,11 +289,16 @@ def main(argv=sys.argv[1:]):
     print(f'  ZED serial:     {args.zed_serial or "(auto-detect first found)"}')
     print(f'  DJI wrist cam:  /dev/video{args.dji_device}')
     print(f'  Wrist orient.:  {"ON (hand-tracked, clamped)" if args.orientation else "LOCKED at home (--no-orientation)"}')
-    if args.tilt_deg:
+    if _any_tilt:
         import math as _m
-        _sweep = 0.085 * _m.sin(_m.radians(min(args.tilt_deg, 90.0)))
-        print(f'  TILTED GRIP:    roll/pitch ±{args.tilt_deg:.0f}°  '
-              f'(z floor raised {_sweep*1000:.0f} mm -> {(0.025+_sweep)*1000:.0f} mm)')
+        _r = args.tilt_roll or args.tilt_deg
+        _p = args.tilt_pitch or args.tilt_deg
+        _w = _m.sin(_m.radians(min(max(_r, _p), 90.0)))
+        _sweep, _side = 0.085 * _w, 0.0425 * _w
+        print(f'  TILTED GRIP:    roll ±{_r:.0f}°  pitch ±{_p:.0f}°'
+              + (f'  yaw ±{args.tilt_yaw:.0f}°' if args.tilt_yaw else '  yaw -3..+93° (default)'))
+        print(f'                  z floor {(0.025+_sweep)*1000:.0f} mm (was 25)   '
+              f'x/y walls in {_side*1000:.0f} mm each side')
     print(f'  Task:           {args.task}' + (f'   Operator: {args.operator}' if args.operator else ''))
     print()
     print('HoloLens:')
@@ -343,6 +363,9 @@ def main(argv=sys.argv[1:]):
         orientation=args.orientation,
         zed_uvc=args.zed_uvc,
         tilt_deg=args.tilt_deg,
+        tilt_roll=args.tilt_roll,
+        tilt_pitch=args.tilt_pitch,
+        tilt_yaw=args.tilt_yaw,
         task=args.task,
         operator=args.operator,
     )

@@ -114,15 +114,47 @@ class ArmLimits:
     # needs raising further.
     GRIPPER_SPAN_M: float = 0.085          # Robotiq 2F-85 max opening
 
-    def allow_tilt(self, deg: float):
-        """Open roll/pitch to +-deg and raise the z floor to match. Returns self."""
-        if deg <= 0:
+    def allow_tilt(self, deg: float = 0.0, *, roll: float = None,
+                   pitch: float = None, yaw: float = None):
+        """Open the orientation clamps per axis and shrink the box to match.
+
+        `deg` sets roll and pitch together (the common case); `roll`/`pitch`/
+        `yaw` override individually, so one axis can stay locked at its current
+        value while another opens up — e.g. allow_tilt(roll=90, pitch=3) keeps
+        pitch pinned and lets the wrist roll the fingers into a vertical stack.
+
+        The compensation is geometric and applies to the WORST of roll/pitch:
+
+          z floor  += span * sin(theta)   the lower finger drops this far below
+                                          the TCP, and the floor is enforced on
+                                          the TCP alone.
+          x/y box  -= span/2 * sin(theta) at large tilt the fingers also swing
+                                          sideways past the TCP, so the walls
+                                          have to come in or the box stops
+                                          describing where the hardware is.
+
+        At 90 degrees that is +85 mm of floor and 43 mm off each wall, which is
+        a substantially smaller usable volume — check the objects are still
+        reachable before relying on it. Yaw is not compensated: it spins about
+        the vertical axis and does not move the fingers out of plane, but its
+        far side approaches the wrist joint's travel limit and a sustained
+        chase into that limit faults the arm.
+        """
+        r = float(roll if roll is not None else deg)
+        p = float(pitch if pitch is not None else deg)
+        if yaw is not None:
+            self.yaw_min_deg, self.yaw_max_deg = -float(yaw), float(yaw)
+        if r <= 0 and p <= 0:
             return self
-        sweep = self.GRIPPER_SPAN_M * math.sin(math.radians(min(deg, 90.0)))
-        self.max_roll_deg = float(deg)
-        self.pitch_min_deg = -float(deg)
-        self.pitch_max_deg = float(deg)
-        self.z = (self.z[0] + sweep, self.z[1])
+        if r > 0:
+            self.max_roll_deg = r
+        if p > 0:
+            self.pitch_min_deg, self.pitch_max_deg = -p, p
+        worst = math.radians(min(max(r, p), 90.0))
+        self.z = (self.z[0] + self.GRIPPER_SPAN_M * math.sin(worst), self.z[1])
+        side = 0.5 * self.GRIPPER_SPAN_M * math.sin(worst)
+        self.x = (self.x[0] + side, self.x[1] - side)
+        self.y = (self.y[0] + side, self.y[1] - side)
         return self
 
     def home_rotation(self, tx=-180.0, ty=0.0, tz=90.0) -> R:

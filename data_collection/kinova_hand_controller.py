@@ -165,18 +165,29 @@ class KinovaHandController(Node):
         # dynamic_typing so `-p tilt_deg:=30` (INTEGER) works as well as 30.0;
         # a type error here would otherwise crash the controller at launch.
         from rcl_interfaces.msg import ParameterDescriptor as _PD
-        self.tilt_deg              = float(self.declare_parameter(
-            'tilt_deg', 0.0, _PD(dynamic_typing=True)).value or 0.0)
+        _dyn = lambda n: float(self.declare_parameter(n, 0.0, _PD(dynamic_typing=True)).value or 0.0)
+        self.tilt_deg              = _dyn('tilt_deg')
+        # Per-axis overrides: 0 means "follow tilt_deg". Lets one axis stay
+        # locked while another opens, e.g. tilt_roll:=90 with tilt_pitch left
+        # at the +-3 deg default.
+        self.tilt_roll             = _dyn('tilt_roll')
+        self.tilt_pitch            = _dyn('tilt_pitch')
+        self.tilt_yaw              = _dyn('tilt_yaw')
         self.tilt_task             = self.declare_parameter('task',                    '').value
-        if self.tilt_deg:
+        if self.tilt_deg or self.tilt_roll or self.tilt_pitch or self.tilt_yaw:
             if self.tilt_task != TILT_ALLOWED_TASK:
                 raise SystemExit(
-                    f"REFUSING to start: tilt_deg={self.tilt_deg} requested but "
+                    f"REFUSING to start: tilt requested (deg={self.tilt_deg} "
+                    f"roll={self.tilt_roll} pitch={self.tilt_pitch} "
+                    f"yaw={self.tilt_yaw}) but "
                     f"task='{self.tilt_task}'. Tilted grip is only permitted for "
                     f"'{TILT_ALLOWED_TASK}' — it raises the workspace floor and "
                     f"removes the table-clearance guarantee that tasks reaching "
                     f"the table surface depend on.")
-            _lim.allow_tilt(self.tilt_deg)
+            _lim.allow_tilt(self.tilt_deg,
+                            roll=self.tilt_roll or None,
+                            pitch=self.tilt_pitch or None,
+                            yaw=self.tilt_yaw or None)
 
         self.control_rate          = self.declare_parameter('control_rate',            30.0).value
         self.max_linear_speed      = self.declare_parameter('max_linear_speed_mps',    _lim.max_linear_speed_mps).value
