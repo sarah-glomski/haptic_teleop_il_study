@@ -65,6 +65,7 @@ def generate_launch_description(
     tilt_roll: float = 0.0,
     tilt_pitch: float = 0.0,
     tilt_yaw: float = 0.0,
+    tilt_keep_box: bool = False,
     task: str = 'grape_pluck',
     operator: str = '',
 ) -> LaunchDescription:
@@ -118,6 +119,7 @@ def generate_launch_description(
                 '-p', f'tilt_roll:={tilt_roll}',
                 '-p', f'tilt_pitch:={tilt_pitch}',
                 '-p', f'tilt_yaw:={tilt_yaw}',
+                '-p', f'tilt_keep_box:={str(tilt_keep_box).lower()}',
                 '-p', f'task:={task}',
             ],
             name='kinova_hand_controller',
@@ -248,9 +250,19 @@ def main(argv=sys.argv[1:]):
     parser.add_argument('--tilt-roll', type=float, default=0.0, metavar='DEG',
                         help='Per-axis override for roll (0 = follow --tilt-deg).')
     parser.add_argument('--tilt-pitch', type=float, default=0.0, metavar='DEG',
-                        help='Per-axis override for pitch (0 = follow --tilt-deg).')
+                        help='Per-axis override for pitch, SIGNED: negative opens only '
+                             'the negative side, which is the direction that tips the '
+                             'tool toward +x (up toward the wall). e.g. -90 gives pitch '
+                             'in [-90, +3]. 0 = follow --tilt-deg.')
     parser.add_argument('--tilt-yaw', type=float, default=0.0, metavar='DEG',
                         help='Symmetric yaw limit override (default keeps -3..+93).')
+    parser.add_argument('--tilt-keep-box', action='store_true',
+                        help='Keep the ORIGINAL workspace box while tilted (z floor '
+                             '25 mm, full x/y). By default tilting raises the floor and '
+                             'pulls the walls in, because the fingers swing below and '
+                             'beside the TCP and the box only bounds the TCP. With this '
+                             'flag the arm will let you drive the fingers into the table '
+                             'if you tilt at low height — tilt after lifting.')
     parser.add_argument('--task', default='grape_pluck',
                         help='Annotation task spec from tasks/<name>.yaml '
                              '(grape_pluck, block_sort, ...). Sets which questions '
@@ -270,17 +282,24 @@ def main(argv=sys.argv[1:]):
     # Tilt is a task-2 mechanism and nothing else. Refuse before anything
     # starts, so a grape session can never inherit a raised floor and a
     # gripper free to swing its fingers into the table.
-    _any_tilt = args.tilt_deg or args.tilt_roll or args.tilt_pitch or args.tilt_yaw
+    _any_tilt = (args.tilt_deg or args.tilt_roll or args.tilt_pitch
+                 or args.tilt_yaw or args.tilt_keep_box)
     if _any_tilt and args.task != 'block_sort':
         parser.error(
             f"--tilt-deg is only allowed with --task block_sort (got "
             f"'{args.task}'). Tilting raises the workspace z floor and lifts "
             f"the roll/pitch lock that keeps the fingers clear of the table; "
             f"tasks that reach the table surface must not run tilted.")
+    # Signed on purpose: negative opens only the negative side. pitch is the
+    # axis that faces the wall and NEGATIVE pitch is the direction that tips
+    # the tool toward +x (verified against home_rotation), so --tilt-pitch -90
+    # means "free to swing up toward the wall, still locked the other way".
     for _n, _v in (('--tilt-deg', args.tilt_deg), ('--tilt-roll', args.tilt_roll),
                    ('--tilt-pitch', args.tilt_pitch), ('--tilt-yaw', args.tilt_yaw)):
-        if _v < 0 or _v > 90:
-            parser.error(f'{_n} must be between 0 and 90')
+        if abs(_v) > 90:
+            parser.error(f'{_n} must be between -90 and 90')
+    if args.tilt_deg < 0:
+        parser.error('--tilt-deg is symmetric; use --tilt-pitch/--tilt-roll for one-sided limits')
 
     print('=' * 60)
     print('Haptic Teleop IL — Data Collection System')
@@ -291,14 +310,22 @@ def main(argv=sys.argv[1:]):
     print(f'  Wrist orient.:  {"ON (hand-tracked, clamped)" if args.orientation else "LOCKED at home (--no-orientation)"}')
     if _any_tilt:
         import math as _m
-        _r = args.tilt_roll or args.tilt_deg
-        _p = args.tilt_pitch or args.tilt_deg
+        _r = abs(args.tilt_roll or args.tilt_deg) or 3.0
+        _p = abs(args.tilt_pitch or args.tilt_deg)
         _w = _m.sin(_m.radians(min(max(_r, _p), 90.0)))
         _sweep, _side = 0.085 * _w, 0.0425 * _w
-        print(f'  TILTED GRIP:    roll ±{_r:.0f}°  pitch ±{_p:.0f}°'
+        _pr = (f'[{-abs(args.tilt_pitch):.0f}, +3]' if args.tilt_pitch < 0 else
+               f'[-3, +{abs(args.tilt_pitch):.0f}]' if args.tilt_pitch > 0 else f'±{_p:.0f}')
+        print(f'  TILTED GRIP:    roll ±{_r:.0f}°  pitch {_pr}°'
               + (f'  yaw ±{args.tilt_yaw:.0f}°' if args.tilt_yaw else '  yaw -3..+93° (default)'))
-        print(f'                  z floor {(0.025+_sweep)*1000:.0f} mm (was 25)   '
-              f'x/y walls in {_side*1000:.0f} mm each side')
+        if args.tilt_keep_box:
+            print('                  z floor 25 mm — BOX NOT COMPENSATED. The floor '
+                  'bounds the TCP only;')
+            print('                  tilting near the table will put the fingers '
+                  'through it. Tilt after lifting.')
+        else:
+            print(f'                  z floor {(0.025+_sweep)*1000:.0f} mm (was 25)   '
+                  f'x/y walls in {_side*1000:.0f} mm each side')
     print(f'  Task:           {args.task}' + (f'   Operator: {args.operator}' if args.operator else ''))
     print()
     print('HoloLens:')
@@ -366,6 +393,7 @@ def main(argv=sys.argv[1:]):
         tilt_roll=args.tilt_roll,
         tilt_pitch=args.tilt_pitch,
         tilt_yaw=args.tilt_yaw,
+        tilt_keep_box=args.tilt_keep_box,
         task=args.task,
         operator=args.operator,
     )

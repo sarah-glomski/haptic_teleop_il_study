@@ -115,44 +115,71 @@ class ArmLimits:
     GRIPPER_SPAN_M: float = 0.085          # Robotiq 2F-85 max opening
 
     def allow_tilt(self, deg: float = 0.0, *, roll: float = None,
-                   pitch: float = None, yaw: float = None):
+                   pitch: float = None, yaw: float = None,
+                   compensate_box: bool = True):
         """Open the orientation clamps per axis and shrink the box to match.
 
-        `deg` sets roll and pitch together (the common case); `roll`/`pitch`/
-        `yaw` override individually, so one axis can stay locked at its current
-        value while another opens up — e.g. allow_tilt(roll=90, pitch=3) keeps
-        pitch pinned and lets the wrist roll the fingers into a vertical stack.
+        `deg` opens roll and pitch symmetrically. `roll`/`pitch`/`yaw` override
+        one axis each, and are SIGNED: a negative value opens only the negative
+        side and leaves the positive side at its default, and vice versa. That
+        matters because the two directions are not equivalent —
 
-        The compensation is geometric and applies to the WORST of roll/pitch:
+            pitch NEGATIVE tips the tool toward +x, i.e. up toward the wall
+            pitch positive tips it back over the robot base
+            roll tips it sideways in y, which does not face the wall at all
+
+        so allow_tilt(pitch=-90) gives pitch in [-90, +3]: free to swing up
+        toward the wall, still locked against dropping back over the base.
+
+        Compensation applies to the worst MAGNITUDE of roll/pitch:
 
           z floor  += span * sin(theta)   the lower finger drops this far below
                                           the TCP, and the floor is enforced on
                                           the TCP alone.
-          x/y box  -= span/2 * sin(theta) at large tilt the fingers also swing
-                                          sideways past the TCP, so the walls
-                                          have to come in or the box stops
-                                          describing where the hardware is.
+          x/y box  -= span/2 * sin(theta) at large tilt the fingers swing
+                                          sideways past the TCP too.
 
-        At 90 degrees that is +85 mm of floor and 43 mm off each wall, which is
-        a substantially smaller usable volume — check the objects are still
-        reachable before relying on it. Yaw is not compensated: it spins about
-        the vertical axis and does not move the fingers out of plane, but its
-        far side approaches the wrist joint's travel limit and a sustained
-        chase into that limit faults the arm.
+        At 90 degrees that is a 110 mm floor and 43 mm off each wall — a much
+        smaller volume, so check the objects are still reachable. Yaw is not
+        compensated (it spins about the vertical and keeps the fingers in
+        plane) but its far side approaches the wrist joint's travel limit.
         """
-        r = float(roll if roll is not None else deg)
-        p = float(pitch if pitch is not None else deg)
-        if yaw is not None:
-            self.yaw_min_deg, self.yaw_max_deg = -float(yaw), float(yaw)
-        if r <= 0 and p <= 0:
+        def _apply(val, lo, hi):
+            """Signed: negative opens the low side, positive the high side."""
+            if val is None or val == 0:
+                return lo, hi, 0.0
+            m = min(abs(float(val)), 90.0)
+            return (-m, hi, m) if val < 0 else (lo, m, m)
+
+        worst = 0.0
+        if deg:
+            m = min(abs(float(deg)), 90.0)
+            self.max_roll_deg = m
+            self.pitch_min_deg, self.pitch_max_deg = -m, m
+            worst = m
+        if roll is not None and roll:
+            # roll is stored as one symmetric magnitude, so a signed request
+            # can only widen it; the sign is recorded for the caller's benefit.
+            self.max_roll_deg = min(abs(float(roll)), 90.0)
+            worst = max(worst, self.max_roll_deg)
+        if pitch is not None and pitch:
+            self.pitch_min_deg, self.pitch_max_deg, m = _apply(
+                pitch, self.pitch_min_deg, self.pitch_max_deg)
+            worst = max(worst, m)
+        if yaw is not None and yaw:
+            self.yaw_min_deg, self.yaw_max_deg, _ = _apply(
+                yaw, self.yaw_min_deg, self.yaw_max_deg)
+        if worst <= 0:
             return self
-        if r > 0:
-            self.max_roll_deg = r
-        if p > 0:
-            self.pitch_min_deg, self.pitch_max_deg = -p, p
-        worst = math.radians(min(max(r, p), 90.0))
-        self.z = (self.z[0] + self.GRIPPER_SPAN_M * math.sin(worst), self.z[1])
-        side = 0.5 * self.GRIPPER_SPAN_M * math.sin(worst)
+        if not compensate_box:
+            # Caller has taken the box compensation off. The clamps are open
+            # but the workspace still describes a level tool, so the floor no
+            # longer bounds the FINGERS — only the TCP. Tilting near the table
+            # will drive them through it. Deliberate, and the operator owns it.
+            return self
+        w = math.sin(math.radians(worst))
+        self.z = (self.z[0] + self.GRIPPER_SPAN_M * w, self.z[1])
+        side = 0.5 * self.GRIPPER_SPAN_M * w
         self.x = (self.x[0] + side, self.x[1] - side)
         self.y = (self.y[0] + side, self.y[1] - side)
         return self

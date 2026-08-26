@@ -173,6 +173,7 @@ class KinovaHandController(Node):
         self.tilt_roll             = _dyn('tilt_roll')
         self.tilt_pitch            = _dyn('tilt_pitch')
         self.tilt_yaw              = _dyn('tilt_yaw')
+        self.tilt_keep_box         = bool(self.declare_parameter('tilt_keep_box', False).value)
         self.tilt_task             = self.declare_parameter('task',                    '').value
         if self.tilt_deg or self.tilt_roll or self.tilt_pitch or self.tilt_yaw:
             if self.tilt_task != TILT_ALLOWED_TASK:
@@ -187,7 +188,16 @@ class KinovaHandController(Node):
             _lim.allow_tilt(self.tilt_deg,
                             roll=self.tilt_roll or None,
                             pitch=self.tilt_pitch or None,
-                            yaw=self.tilt_yaw or None)
+                            yaw=self.tilt_yaw or None,
+                            compensate_box=not self.tilt_keep_box)
+            if self.tilt_keep_box:
+                self.get_logger().warn(
+                    '\n' + '!'*66 +
+                    '\n  TILT WITHOUT BOX COMPENSATION: the workspace floor stays at'
+                    f'\n  {_lim.z[0]*1000:.0f} mm but the clamps are open. The floor bounds the TCP'
+                    '\n  only, so tilting near the table WILL drive the fingers into it.'
+                    '\n  Tilt after lifting, not before.'
+                    '\n' + '!'*66)
 
         self.control_rate          = self.declare_parameter('control_rate',            30.0).value
         self.max_linear_speed      = self.declare_parameter('max_linear_speed_mps',    _lim.max_linear_speed_mps).value
