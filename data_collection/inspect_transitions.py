@@ -668,15 +668,38 @@ def suggest_end_crop(pos, grip, hz):
     return T, 'clean tail — no crop needed'
 
 
-def _plot_crop(name, pos, grip, hz, crop_end):
-    """Show gripper / Z / speed vs frame with the crop line and dropped tail shaded."""
+def _plot_crop(name, pos, grip, hz, crop_end, pressure=None):
+    """Show pressure / gripper / Z / speed vs frame with the crop line and tail shaded.
+
+    Pressure is first because the end-crops on this task exist to remove a
+    post-release spike on piezense ch3 — cropping on trajectory alone hides the
+    signal being cropped. Both channels are drawn baseline-subtracted; ch2
+    never shows the artifact and is the control.
+    """
     T = len(grip)
     x = np.arange(T)
     speed = np.linalg.norm(np.gradient(pos, 1.0 / hz, axis=0), axis=1)
-    fig, axes = plt.subplots(3, 1, figsize=(13, 8), sharex=True)
-    for ax, sig, lbl in ((axes[0], grip, 'gripper cmd'),
-                         (axes[1], pos[:, 2], 'Z (m)'),
-                         (axes[2], speed, 'speed (m/s)')):
+    n_rows = 4 if pressure is not None else 3
+    fig, axes = plt.subplots(n_rows, 1, figsize=(13, 2.6 * n_rows), sharex=True)
+    row = 0
+    if pressure is not None:
+        ax = axes[0]; row = 1
+        base = np.median(pressure[:24], axis=0)
+        d = pressure - base
+        ax.plot(x, d[:, 0], color='#1d4ed8', lw=1.1, label='ch2')
+        ax.plot(x, d[:, 1], color='#dc2626', lw=1.1, label='ch3')
+        ax.axhline(0, color='0.6', lw=0.8)
+        ax.set_ylabel('Δ kPa', fontsize=9)
+        ax.legend(fontsize=8, frameon=False, ncols=2, loc='upper left')
+        ax.grid(alpha=0.3)
+        if crop_end < T:
+            ax.axvspan(crop_end, T - 1, color='tomato', alpha=0.25)
+            ax.axvline(crop_end, color='red', lw=1.5)
+            tail = np.abs(d[crop_end:]).max() if crop_end < T else 0
+            ax.set_title(f'discarded tail reaches {tail:.1f} kPa', fontsize=9, loc='right')
+    for ax, sig, lbl in ((axes[row], grip, 'gripper cmd'),
+                         (axes[row + 1], pos[:, 2], 'Z (m)'),
+                         (axes[row + 2], speed, 'speed (m/s)')):
         ax.plot(x, sig, 'k-', lw=1)
         if crop_end < T:
             ax.axvspan(crop_end, T - 1, color='tomato', alpha=0.25)
@@ -684,8 +707,8 @@ def _plot_crop(name, pos, grip, hz, crop_end):
         ax.set_ylabel(lbl, fontsize=9)
         ax.grid(alpha=0.3)
     kept = crop_end if crop_end < T else T
-    axes[0].axhline(0.0, color='green', ls=':', lw=0.8, alpha=0.7)
-    axes[2].set_xlabel('frame', fontsize=9)
+    axes[row].axhline(0.0, color='green', ls=':', lw=0.8, alpha=0.7)
+    axes[-1].set_xlabel('frame', fontsize=9)
     fig.suptitle(f'{name}  —  keep [0:{kept}) of {T}   '
                  f'({"CROP " + str(T - kept) + " frames off end" if kept < T else "no crop"})',
                  fontsize=11)
@@ -712,6 +735,8 @@ def crop_review(collection_dir, exclude_file, targets):
             hz = float(f.attrs.get('collection_rate_hz', 30))
             pos = f['action/pose'][:, :3].astype(np.float64)
             grip = f['action/gripper'][()].astype(np.float64)
+            pressure = (f['piezense/pressure_input'][()].astype(np.float64) / 1000.0
+                        if 'piezense' in f else None)
         T = len(grip)
         existing = crops.get(name, (0, T))[1]
         suggested, reason = suggest_end_crop(pos, grip, hz)
@@ -723,7 +748,7 @@ def crop_review(collection_dir, exclude_file, targets):
         reviewed += 1
         print(f'\n── {name}  (T={T}) ──  suggestion: {reason}')
         while True:
-            _plot_crop(name, pos, grip, hz, crop_end)
+            _plot_crop(name, pos, grip, hz, crop_end, pressure)
             print(f'  crop_end = {crop_end}  (keeps [0:{crop_end}), drops {T - crop_end} frames)')
             try:
                 resp = input('  [Enter]=approve  e <frame>=set  f=full/no-crop  '

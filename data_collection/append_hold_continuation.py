@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Make a "hold-continuation" copy of a collection: for every episode, append
-N seconds of the FINAL resting frame so the terminal "gripper-open at place"
+N frames of the FINAL resting frame so the terminal "gripper-open at place"
 state becomes a stable attractor the policy can settle into.
 
 Motivation (see lab notes / transition inspection of Collection5): `release`
@@ -131,7 +131,7 @@ def append_hold(src_path: pathlib.Path, dst_path: pathlib.Path, n_hold: int,
                 fout.attrs[k] = v
             fout.attrs["num_frames"] = n_orig + n_hold
             fout.attrs["hold_frames_appended"] = n_hold
-            fout.attrs["hold_seconds_appended"] = n_hold / rate
+            fout.attrs["hold_frames_appended"] = n_hold
             if crop is not None:
                 fout.attrs["cropped_from"] = f"{crop[0]}:{crop[1]}"
     return n_orig, n_orig + n_hold
@@ -141,7 +141,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--seconds", type=float, default=1.0,
+    ap.add_argument("--frames", type=int, default=30,
+                    help="Number of held frames to append (default 30). Frames, not "
+                         "seconds: collection_rate_hz is a nominal 30 in every file "
+                         "while episodes actually record near 12 Hz, so a seconds "
+                         "argument silently produced ~2.5x the dwell asked for. "
+                         "Task1Collections1-4.5 and 1-5.5 were built with 30 frames.")
+    ap.add_argument("--seconds", type=float, default=None,
                     help="Seconds of held rest frame to append (default 1.0).")
     ap.add_argument("--ignore-exclude", action="store_true",
                     help="Process every episode as-is, ignoring the source "
@@ -168,12 +174,25 @@ def main():
 
     kept = [p for p in episodes if p.stem not in full]
 
-    # Determine hold length from the first kept episode's recorded rate.
+    # Hold length is a frame count. collection_rate_hz is nominal (30 in every
+    # file) while episodes actually land near 12 Hz, so deriving frames from
+    # seconds via that attribute overstates the dwell by ~2.5x.
     with h5py.File(kept[0], "r") as f0:
-        rate = int(f0.attrs.get("collection_rate_hz", 30))
-    n_hold = int(round(args.seconds * rate))
-    print(f"\nRate {rate} Hz -> appending {n_hold} frames ({args.seconds}s) "
-          f"per episode\n")
+        nominal = int(f0.attrs.get("collection_rate_hz", 30))
+        ts = f0["observation"].get("timestamp")
+        measured = (len(ts) - 1) / float(ts[-1]) if ts is not None and len(ts) > 1 else None
+    if args.seconds is not None:
+        n_hold = int(round(args.seconds * (measured or nominal)))
+        basis = f"{args.seconds}s x {measured or nominal:.2f} Hz"
+        if measured is None:
+            print("  ! no timestamps in this collection; --seconds fell back to the "
+                  f"nominal {nominal} Hz attribute, which is not the real rate")
+    else:
+        n_hold = int(args.frames)
+        basis = "--frames"
+    real = f"{n_hold / measured:.2f}s at the measured {measured:.2f} Hz" if measured \
+        else f"{n_hold / nominal:.2f}s at the nominal {nominal} Hz (unverified)"
+    print(f"\nAppending {n_hold} frames per episode ({basis}) -> {real}\n")
 
     for ep in kept:
         crop = crops.get(ep.stem)
